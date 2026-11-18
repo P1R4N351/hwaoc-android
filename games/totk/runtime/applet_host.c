@@ -70,6 +70,14 @@ static int nfp_device_state(const void *h) { (void)h; return 0; }
 static void show_error(uint32_t result) {
     fprintf(stderr, "[totk] game error dialog: %04u-%04u (result %#x)\n", 2000 + (result & 0x1ff), (result >> 9) & 0x1fff, result);
 }
+static void report_multimedia_error(uint32_t result, const void *report) {
+    (void)report;
+    fprintf(stderr, "[totk] multimedia telemetry error (result %#x)\n", result);
+}
+static uint32_t show_aoc_shop_v0(void) {
+    fprintf(stderr, "[totk] eShop DLC page: not available\n");
+    return 0;
+}
 
 #ifdef GAME_BOTW
 /* SDK 7 (Breath of the Wild 1.6.0, botw.md). Exit requests are handled by the window (the section brackets change nothing);
@@ -104,7 +112,10 @@ void *runtime_applet_override(const char *name) {
         {"_ZN2nn3nfp14StartDetectionERKNS0_12DeviceHandleE", nfp_no_device}, {"_ZN2nn3nfp13StopDetectionERKNS0_12DeviceHandleE", nfp_no_device},
         {"_ZN2nn3nfp10GetTagInfoEPNS0_7TagInfoERKNS0_12DeviceHandleE", nfp_no_device},
         {"_ZN2nn3nfp12GetModelInfoEPNS0_9ModelInfoERKNS0_12DeviceHandleE", nfp_no_device},
+        {"_ZN2nn3nfp7UnmountERKNS0_12DeviceHandleE", nfp_no_device},
         {"_ZN2nn3err9ShowErrorENS_6ResultE", show_error},
+        {"_ZN2nn3err21ReportMultimediaErrorENS_6ResultERKN5movie25MultimediaTelemetryReportE", report_multimedia_error},
+        {"_ZN2nn2ec24ShowShopAddOnContentListEv", show_aoc_shop_v0},
 #ifdef GAME_BOTW
         {"_ZN2nn2oe31EnterExitRequestHandlingSectionEv", exit_section}, {"_ZN2nn2oe31LeaveExitRequestHandlingSectionEv", exit_section},
         {"_ZN2nn2oe15EnableRecordingEv", enable_recording},

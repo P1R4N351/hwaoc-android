@@ -1,0 +1,3 @@
+# Age of Calamity shader list v1 for the Android / Vulkan seed (games/totk/scripts/shader_list.py).
+# Identifiers and pipeline descriptors only, no game data. Translation chain totk-native-v5-unverified.
+# Populated during M4 once KTGL G2S shader containers and live pipeline bind states are catalogued.

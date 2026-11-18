@@ -224,8 +224,8 @@ static jboolean JNICALL native_state(JNIEnv *env, jclass cls, jlongArray out) {
     if (!out || (*env)->GetArrayLength(env, out) < COMPANION_STATE_FIELDS || !native_enabled(env, cls)) return JNI_FALSE;
     CompanionState s; int64_t age = 0, words[COMPANION_STATE_FIELDS];
     int hosted = runtime_duo_state(&s, &age);
-#ifdef GAME_BOTW
-    if (!hosted) return JNI_FALSE;   /* Breath of the Wild's state is the host's alone (the runtime has no reader for that game) */
+#if defined(GAME_BOTW) || defined(GAME_HWAOC)
+    if (!hosted) return JNI_FALSE;   /* runtime has no companion reader for this game */
 #else
     if (!hosted || age > DUO_STATE_MAX_AGE_MS) {   /* none yet, or the host stopped: the MIT reader, read now */
         companion_state((uintptr_t)runtime_module_base("main"), guest_read, &s);

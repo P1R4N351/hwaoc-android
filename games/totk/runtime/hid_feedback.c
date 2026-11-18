@@ -134,25 +134,66 @@ int runtime_hid_feedback_flag(const char *name, int v) {
 }
 void runtime_hid_feedback_stats(uint64_t *values, uint64_t *motion_reads) { *values = atomic_load(&values_in); *motion_reads = atomic_load(&reads); }
 
+#ifdef GAME_HWAOC
+static uint32_t hwaoc_vib_noop(const void *h, const void *v, int n) { (void)h; (void)v; (void)n; return 0; }
+static uint32_t hwaoc_vib_actual(VibrationValue *out, const uint32_t *h) {
+    (void)h; if (!out) runtime_fail("vibration value output pointer");
+    *out = (VibrationValue){0, 160, 0, 320}; return 0;
+}
+static uint32_t hwaoc_vib_info(VibrationDeviceInfo *out, const uint32_t *h) {
+    (void)h; if (!out) runtime_fail("vibration device info pointer");
+    *out = (VibrationDeviceInfo){0, 0}; return 0;
+}
+static uint32_t hwaoc_vib_mounted(bool *out, const uint32_t *h) {
+    (void)h; if (!out) runtime_fail("vibration mounted pointer"); *out = false; return 0;
+}
+static uint32_t hwaoc_vib_permitted(bool *out) {
+    if (!out) runtime_fail("vibration permitted pointer"); *out = false; return 0;
+}
+static uint32_t hwaoc_six_noop(const uint32_t *h) { (void)h; return 0; }
+static uint32_t hwaoc_six_states(int *out, SixAxisState *s, int max, const uint32_t *h) {
+    (void)h; if (!out || (max > 0 && !s)) runtime_fail("six-axis state output");
+    if (max <= 0) { *out = 0; return 0; }
+    s[0] = (SixAxisState){.acc = {0, 0, -1}, .dir = {1, 0, 0, 0, 1, 0, 0, 0, 1}};
+    *out = 1; return 0;
+}
+static uint32_t hwaoc_six_state(SixAxisState *s, const uint32_t *h) { int n; return hwaoc_six_states(&n, s, 1, h); }
+#endif
+
 void *runtime_hid_feedback_override(const char *name) {
     const bool rumble = runtime_rumble_enabled(), gyro = runtime_gyro_enabled();
     if (!strcmp(name, "_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE"))
         return rumble ? NULL : (void *)no_handles;   /* on: the SDK's own (nn::hid::utility) */
     if (!strcmp(name, "_ZN2nn3hid23GetSixAxisSensorHandlesEPNS0_19SixAxisSensorHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE"))
         return gyro ? NULL : (void *)no_handles;
-    static const struct { const char *name; void *fn; bool gyro; } entries[] = {
-        {"_ZN2nn3hid6detail25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", (void *)vib_init, false},
-        {"_ZN2nn3hid6detail18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", (void *)vib_send, false},
-        {"_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", (void *)vib_send_many, false},
-        {"_ZN2nn3hid6detail23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE", (void *)vib_actual, false},
-        {"_ZN2nn3hid6detail22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", (void *)vib_info, false},
-        {"_ZN2nn3hid6detail24IsVibrationDeviceMountedEPbRKNS0_21VibrationDeviceHandleE", (void *)vib_mounted, false},
-        {"_ZN2nn3hid6detail20IsVibrationPermittedEPb", (void *)vib_permitted, false},
-        {"_ZN2nn3hid6detail18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_start, true},
-        {"_ZN2nn3hid6detail17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_stop, true},
-        {"_ZN2nn3hid6detail22GetSixAxisSensorStatesEPiPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", (void *)six_states, true},
-        {"_ZN2nn3hid6detail21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", (void *)six_state, true}};
+    static const struct { const char *name; void *fn; void *off_fn; bool gyro; } entries[] = {
+#ifdef GAME_HWAOC
+        {"_ZN2nn3hid6detail25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", (void *)vib_init, (void *)hwaoc_vib_noop, false},
+        {"_ZN2nn3hid6detail18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", (void *)vib_send, (void *)hwaoc_vib_noop, false},
+        {"_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", (void *)vib_send_many, (void *)hwaoc_vib_noop, false},
+        {"_ZN2nn3hid6detail23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE", (void *)vib_actual, (void *)hwaoc_vib_actual, false},
+        {"_ZN2nn3hid6detail22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", (void *)vib_info, (void *)hwaoc_vib_info, false},
+        {"_ZN2nn3hid6detail24IsVibrationDeviceMountedEPbRKNS0_21VibrationDeviceHandleE", (void *)vib_mounted, (void *)hwaoc_vib_mounted, false},
+        {"_ZN2nn3hid6detail20IsVibrationPermittedEPb", (void *)vib_permitted, (void *)hwaoc_vib_permitted, false},
+        {"_ZN2nn3hid6detail18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_start, (void *)hwaoc_six_noop, true},
+        {"_ZN2nn3hid6detail17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_stop, (void *)hwaoc_six_noop, true},
+        {"_ZN2nn3hid6detail22GetSixAxisSensorStatesEPiPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", (void *)six_states, (void *)hwaoc_six_states, true},
+        {"_ZN2nn3hid6detail21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", (void *)six_state, (void *)hwaoc_six_state, true}
+#else
+        {"_ZN2nn3hid6detail25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", (void *)vib_init, NULL, false},
+        {"_ZN2nn3hid6detail18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", (void *)vib_send, NULL, false},
+        {"_ZN2nn3hid6detail19SendVibrationValuesEPKNS0_21VibrationDeviceHandleEPKNS0_14VibrationValueEi", (void *)vib_send_many, NULL, false},
+        {"_ZN2nn3hid6detail23GetActualVibrationValueEPNS0_14VibrationValueERKNS0_21VibrationDeviceHandleE", (void *)vib_actual, NULL, false},
+        {"_ZN2nn3hid6detail22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", (void *)vib_info, NULL, false},
+        {"_ZN2nn3hid6detail24IsVibrationDeviceMountedEPbRKNS0_21VibrationDeviceHandleE", (void *)vib_mounted, NULL, false},
+        {"_ZN2nn3hid6detail20IsVibrationPermittedEPb", (void *)vib_permitted, NULL, false},
+        {"_ZN2nn3hid6detail18StartSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_start, NULL, true},
+        {"_ZN2nn3hid6detail17StopSixAxisSensorERKNS0_19SixAxisSensorHandleE", (void *)six_stop, NULL, true},
+        {"_ZN2nn3hid6detail22GetSixAxisSensorStatesEPiPNS0_18SixAxisSensorStateEiRKNS0_19SixAxisSensorHandleE", (void *)six_states, NULL, true},
+        {"_ZN2nn3hid6detail21GetSixAxisSensorStateEPNS0_18SixAxisSensorStateERKNS0_19SixAxisSensorHandleE", (void *)six_state, NULL, true}
+#endif
+    };
     for (unsigned i = 0; i < sizeof entries / sizeof *entries; i++)
-        if (!strcmp(name, entries[i].name)) return (entries[i].gyro ? gyro : rumble) ? entries[i].fn : NULL;
+        if (!strcmp(name, entries[i].name)) return (entries[i].gyro ? gyro : rumble) ? entries[i].fn : entries[i].off_fn;
     return NULL;
 }

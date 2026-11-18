@@ -23,7 +23,7 @@ class GameVariables(unittest.TestCase):
         cls.data = games.load()
 
     def test_every_variable_has_a_meaning_and_both_values(self):
-        self.assertEqual(self.data['games'], ['totk', 'botw'])
+        self.assertEqual(self.data['games'], ['totk', 'botw', 'hwaoc'])
         for name, spec in self.data['var'].items():
             self.assertTrue(spec['meaning'].strip(), name)
             for g in self.data['games']:
@@ -36,6 +36,7 @@ class GameVariables(unittest.TestCase):
     def test_version_tags_and_ids_resolve(self):
         self.assertEqual(games.game_id(self.data, 'v143'), 'totk')
         self.assertEqual(games.game_id(self.data, 'botw160'), 'botw')
+        self.assertEqual(games.game_id(self.data, 'hwaoc130'), 'hwaoc')
         with self.assertRaises(games.GameError):
             games.game_id(self.data, 'v0x')
 
@@ -51,7 +52,9 @@ class GameVariables(unittest.TestCase):
         self.assertFalse([f for f in tracked if f.endswith(('.p12', '.pfx', '.pass', '.jks', '.keystore'))])
         # Identities do not collide across games: each game's apps install side by side.
         packages = {g: {s['package'] for s in fl.values()} for g, fl in self.data['flavour'].items()}
-        self.assertFalse(packages['totk'] & packages['botw'])
+        for i, a in enumerate(self.data['games']):
+            for b in self.data['games'][i + 1:]:
+                self.assertFalse(packages[a] & packages[b], f'{a} and {b} share package names')
 
     def test_resources_named_by_variables_exist(self):
         for g in self.data['games']:
@@ -99,6 +102,9 @@ class GameVariables(unittest.TestCase):
         for needle in ('VERSION = "botw160"', 'COMPANION = "duo"', 'TABLET_CAN_BE_MISSING = true', 'SURFACE_HUE = 208',
                        'TITLE_ID = "01007EF00011E000"', 'MOD_MANAGER = "BCML"', 'ROMFS_SIZE = 15131979952L'):
             self.assertIn(needle, botw)
+        hwaoc = games.java('hwaoc', self.data)
+        for needle in ('VERSION = "hwaoc130"', 'TITLE_ID = "01002B00111A2000"', 'ROMFS_SIZE = 11719230892L'):
+            self.assertIn(needle, hwaoc)
 
     def test_no_per_game_file_overrides(self):
         self.assertEqual(games.overrides(), [], 'per-game whole-file overrides: declare the difference in games/games.toml instead')
@@ -115,7 +121,7 @@ class GameVariables(unittest.TestCase):
         self.assertEqual(gone, {}, 'declared branches no longer in the code: update games/games.toml [branches]')
 
     def test_the_guard_sees_each_kind_of_branch(self):
-        cases = [('c', '#ifdef GAME_BOTW'), ('c', '#if defined(TOTK_GAME_V143) && X'), ('c', 'if (!strcmp(version, "botw160"))'),
+        cases = [('c', '#ifdef GAME_BOTW'), ('c', '#ifdef GAME_HWAOC'), ('c', '#if defined(TOTK_GAME_V143) && X'), ('c', 'if (!strcmp(version, "botw160"))'),
                  ('make', 'ifeq ($(VERSION),botw160)'), ('py', "if version == 'botw160':"), ('py', "if game != 'totk':"),
                  ('sh', 'make VERSION=botw160'), ('java', 'if (GameBuild.GAME.equals("botw")) x();'),
                  ('java', 'if ("botw".equals(GameBuild.GAME)) x();'), ('java', 'boolean d = GameBuild.COMPANION.equals("duo");')]
@@ -137,7 +143,8 @@ class GameVariables(unittest.TestCase):
     def test_env_defaults_reach_the_code_and_fall_back_to_totk(self):
         sources = {p: p.read_text() for d in ('games/totk/runtime', 'games/totk/android/gfx') for p in (ROOT / d).glob('*.c')}
         totk = games.values('totk', self.data)['env_defaults']
-        self.assertEqual(set(totk), set(games.values('botw', self.data)['env_defaults']))
+        for g in ('botw', 'hwaoc'):
+            self.assertEqual(set(totk), set(games.values(g, self.data)['env_defaults']))
         for name, value in totk.items():
             macro = games.env_macro(name)
             users = [p for p, text in sources.items() if f'getenv("{name}")' in text and macro in text]

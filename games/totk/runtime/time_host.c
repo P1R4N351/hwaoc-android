@@ -110,6 +110,9 @@ static int64_t user_difference(const ClockSnapshot *a, const ClockSnapshot *b) {
     if (memcmp(a->user.point.source, b->user.point.source, 16)) return 0;
     return (b->user.offset - a->user.offset) * 1000000000LL;
 }
+static int claim_periodic_benefit(void *ctx, const ClockSnapshot *last, int64_t min_interval, int64_t grace, const void *cb) {
+    (void)ctx; (void)last; (void)min_interval; (void)grace; (void)cb; return 1;
+}
 
 void *runtime_time_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
@@ -128,6 +131,7 @@ void *runtime_time_override(const char *name) {
         {"_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_", snapshot_create},
         {"_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_", span_between},
         {"_ZN2nn4time48CalculateStandardUserSystemClockDifferenceByUserERKNS0_13ClockSnapshotES3_", user_difference},
+        {"_ZN2nn4time39ClaimPeriodicBenefitWithUserSystemClockEPNS0_27PeriodicBenefitClaimContextERKNS0_13ClockSnapshotERKNS_8TimeSpanES8_PKNS0_25CheckCalendarTimeCallbackE", claim_periodic_benefit},
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++) if (!strcmp(name, map[i].name)) return map[i].fn;
     return NULL;

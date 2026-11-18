@@ -131,6 +131,26 @@ static unsigned decode(void *guest, size_t *consumed, int *samples, int16_t *out
     *consumed = 8 + n; *samples = got; release(d); return 0;
 }
 
+#ifdef GAME_HWAOC
+/* SDK 9.6.0 HardwareOpusMultiStreamDecoder opens "hwopus" IPC, whereas SDK's software OpusMultiStreamDecoder
+   shares the identical 11-slot IOpusMultiStreamDecoder vtable (+0x10..+0x68) and fits within its 0x48-byte object. */
+static void hw_ms_ctor(void *self, int option) {
+    (void)option;
+    if (!self) runtime_fail("null HardwareOpusMultiStreamDecoder");
+    void (*ctor)(void *) = (void (*)(void *))runtime_symbol("_ZN2nn5codec22OpusMultiStreamDecoderC1Ev");
+    if (!ctor) runtime_fail("missing guest OpusMultiStreamDecoder::OpusMultiStreamDecoder()");
+    ctor(self);
+}
+static void hw_ms_dtor(void *self) { (void)self; }
+static size_t hw_ms_work_size(int rate, int ch, int total_streams, int stereo_streams) {
+    size_t (*fn)(int, int, int, int) = (size_t (*)(int, int, int, int))
+        runtime_symbol("_ZN2nn5codec39GetOpusMultiStreamDecoderWorkBufferSizeEiiii");
+    if (!fn) runtime_fail("missing guest GetOpusMultiStreamDecoderWorkBufferSize");
+    size_t sz = fn(rate, ch, total_streams, stereo_streams);
+    return (sz + 0xfffu) & ~(size_t)0xfffu;
+}
+#endif
+
 void *runtime_codec_override(const char *name) {
     static const struct { const char *name; void *fn; } map[] = {
         {"_ZN2nn5codec36GetHardwareOpusDecoderWorkBufferSizeEiii", work_size},
@@ -140,6 +160,11 @@ void *runtime_codec_override(const char *name) {
         {"_ZN2nn5codec34GetHardwareOpusDecoderChannelCountEPKNS0_23HardwareOpusDecoderTypeE", channel_count},
         {"_ZN2nn5codec24ResetHardwareOpusDecoderEPNS0_23HardwareOpusDecoderTypeE", reset},
         {"_ZN2nn5codec33DecodeOpusInterleavedWithHardwareEPNS0_23HardwareOpusDecoderTypeEPmPiPsmPKvm", decode},
+#ifdef GAME_HWAOC
+        {"_ZN2nn5codec30HardwareOpusMultiStreamDecoderC1Ei", hw_ms_ctor},
+        {"_ZN2nn5codec30HardwareOpusMultiStreamDecoderD1Ev", hw_ms_dtor},
+        {"_ZN2nn5codec47GetHardwareOpusMultiStreamDecoderWorkBufferSizeEiiii", hw_ms_work_size},
+#endif
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++) if (!strcmp(name, map[i].name)) return map[i].fn;
     return NULL;

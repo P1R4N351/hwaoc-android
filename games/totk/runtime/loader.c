@@ -449,7 +449,7 @@ static void signal_hex(const char *label,uint64_t value) {
 }
 /* CTR_EL0 for 128-byte host cache lines: DminLine=IminLine=5 (32 words), ERG=CWG=5, PIPT I-cache, IDC/DIC clear. */
 #define HOST_CTR_EL0 0x8555c005ULL
-#ifndef GAME_BOTW   /* TOTK addresses (GAME_ADDR) */
+#if !defined(GAME_BOTW) && !defined(GAME_HWAOC)   /* TOTK addresses (GAME_ADDR) */
 /* #57: the same optional reference as below (object+0x6b0, a holder whose first word is the target) can outlive its
    holder: after long play the freed holder's memory held other data (the low region's base, two floats 1.0), the caller
    at GAME_ADDR(0x15ecb0c) passed that word as the target, and the callee faulted reading the target's id (+0x10). The
@@ -493,7 +493,7 @@ static void crash(int num,siginfo_t *info,void *context) {
 #ifdef GAME_BOTW
  if(num==SIGTRAP){extern int botw_jq_hook(void *);if(botw_jq_hook(context))return;}   /* TOTK_JQ_CHECK diagnostics (game_patches_botw.c) */
 #endif
-#ifndef GAME_BOTW
+#if !defined(GAME_BOTW) && !defined(GAME_HWAOC)
 #if defined(TOTK_GAME_V143) && TARGET_OS_OSX
  if(num==SIGTRAP){extern int runtime_diag_watch_trap(void *);if(runtime_diag_watch_trap(context))return;}   /* #61 frmwatch (diagnostic) */
 #endif
@@ -613,8 +613,8 @@ int runtime_module_offset(uint64_t pc,const char **name,uint64_t *off) {
  return 0;
 }
 uintptr_t runtime_frame_controller_return_pc(void) {
-#ifdef GAME_BOTW
- return 0; /* no survey on Breath of the Wild */
+#if defined(GAME_BOTW) || defined(GAME_HWAOC)
+ return 0; /* no survey on this game */
 #elif defined(TOTK_GAME_V143)
  /* Always capture the system/controller for cheap FPS policy diagnostics.
     Saved x19 is at caller x29+0x38; v143 controller is sys+0x200. */
@@ -647,14 +647,14 @@ void runtime_startup_checkpoint(uintptr_t caller) {
  for(unsigned i=0;i<NM;i++){uint32_t state;memcpy(&state,modules[i].base+modules[i].ctor_flag,4);need(state==2,"constructor checkpoint state");}
  printf("{\"status\":\"pass\",\"phase\":4,\"original_nnMain_return_pc\":\"0x%x\",\"scope\":\"all DT_INIT constructor loops completed; original nnMain prefix executed; stops at focus setup\"}\n", GAME_ADDR(0xe995c4));fflush(stdout);_exit(0);
 }
-#ifndef GAME_BOTW
+#if !defined(GAME_BOTW) && !defined(GAME_HWAOC)
 static void module_finis(void) { runtime_fail("guest exited: module finalizers not yet implemented"); }
 #endif
 static void boot(void) {
  fprintf(stderr,"[totk] game version %s\n", TOTK_GAME_VERSION);
  runtime_boot_status(TOTK_UI("启动游戏运行环境","Starting the game runtime"),TOTK_UI("连接游戏代码与 macOS 系统服务","Connecting the game code to macOS system services"));
  runtime_thread_init();uint32_t main_handle=svc_thread_main_init();
-#ifdef GAME_BOTW
+#if defined(GAME_BOTW) || defined(GAME_HWAOC)
  /* SDK 7.3.2 (Breath of the Wild): Start(handle, arg, rtld callback, module initializers). The order inside is the one of
     TOTK's SDK 15 (libc0, nnosInitialize, callback, libc1, InitializeSdkModule, nninitStartup, libc2, callback, nnMain), but
     after nnMain it calls nninitFinalizeSdkModule and quick-exits itself instead of a third callback. */

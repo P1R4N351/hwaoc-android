@@ -61,6 +61,9 @@ static uint32_t vi_vsync(void *ev, void *display) {
     pthread_mutex_lock(&vsync_lock); if (vsync_count >= 16) runtime_fail("VI display event limit"); vsync_events[vsync_count++] = ev; pthread_mutex_unlock(&vsync_lock);
     return 0;
 }
+static void vi_destroy_layer(void *layer) { (void)layer; }
+static void vi_close_display(void *display) { (void)display; }
+static void vi_finalize(void) { vi_ready = 0; }
 #ifdef GAME_BOTW
 static uint32_t vi_scaling_mode(void *layer, int mode) { (void)layer; (void)mode; return 0; }
 #endif
@@ -69,6 +72,9 @@ void *runtime_front_override(const char *name) {
         {"_ZN2nn2vi10InitializeEv", (void *)vi_initialize}, {"_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", (void *)vi_open},
         {"_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", (void *)vi_layer}, {"_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", (void *)vi_window},
         {"_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", (void *)vi_vsync},
+        {"_ZN2nn2vi12DestroyLayerEPNS0_5LayerE", (void *)vi_destroy_layer},
+        {"_ZN2nn2vi12CloseDisplayEPNS0_7DisplayE", (void *)vi_close_display},
+        {"_ZN2nn2vi8FinalizeEv", (void *)vi_finalize},
 #ifdef GAME_BOTW
         {"_ZN2nn2vi19SetLayerScalingModeEPNS0_5LayerENS0_11ScalingModeE", (void *)vi_scaling_mode},
 #endif

@@ -160,6 +160,8 @@ NVN(nvnDeviceGetProcAddress, PFNNVNGENERICFUNCPTRPROC, const NVNdevice *d, const
 static const int g_devinfo[] = {
 #ifdef GAME_BOTW
     [0x00] = 53, [0x01] = 311,  // Breath of the Wild 1.6.0 main+0xe55304 requires major 53, minor >= 311 (botw.md).
+#elif defined(GAME_HWAOC)
+    [0x00] = 53, [0x01] = 312,  // Age of Calamity 1.3.0 main+0x9f94..0x9f9c requires major 53, minor >= 312.
 #else
     [0x00] = 55, [0x01] = 15,   // Experimental ABI target: TOTK main+e9d614 requires major 55, minor >= 15. Unsupported functions stop.
 #endif
@@ -209,7 +211,7 @@ NVN(nvnDeviceInstallDebugCallback, void, NVNdevice *d, const PFNNVNDEBUGCALLBACK
     dev_t_ *o = (dev_t_ *)d; o->dbg_cb = B(enable) ? (void *)cb : NULL; o->dbg_data = data;
 }
 NVN(nvnDeviceSetWindowOriginMode, void, NVNdevice *d, NVNwindowOriginMode m) { ((dev_t_ *)d)->origin = m; LOG("[nvn] 窗口原点 %s", m ? "左上（同 D3D / Metal）" : "左下（GL）"); }
-#ifdef GAME_BOTW
+#if defined(GAME_BOTW) || defined(GAME_HWAOC)
 /* NVN's default depth mode is NEAR_IS_MINUS_W (enum value 0, the OpenGL convention): a device the game never calls
    nvnDeviceSetDepthMode on keeps it. TOTK sets it explicitly; Breath of the Wild never does, and its full-screen copy
    to the swapchain has clip z = -1 (the near plane), which the 0..w convention clipped away: the window stayed magenta
@@ -369,8 +371,10 @@ static void size_chain(int w, int h) {
 NVN(nvnTextureBuilderSetSize3D, void, NVNtextureBuilder *b, int w, int h, int d) { TB(b)->d.width=w;TB(b)->d.height=h;TB(b)->d.depth=d; }
 NVN(nvnTextureBuilderSetLevels, void, NVNtextureBuilder *b, int v) { TB(b)->d.levels = v; }
 NVN(nvnTextureBuilderSetFormat, void, NVNtextureBuilder *b, NVNformat f) { TB(b)->d.format = f; }
-// This adapter currently samples the depth plane; stencil-only sampling stops.
-NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b,NVNtextureDepthStencilMode mode){(void)b;if(mode!=NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH)die("stencil-plane texture sampling is not implemented");}
+NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b, NVNtextureDepthStencilMode mode) {
+    if ((unsigned)mode > NVN_TEXTURE_DEPTH_STENCIL_MODE_STENCIL) die("invalid NVN texture depth-stencil mode");
+    TB(b)->d.dsmode = (unsigned)mode;
+}
 NVN(nvnTextureBuilderSetSwizzle, void, NVNtextureBuilder *b,NVNtextureSwizzle r,NVNtextureSwizzle g,NVNtextureSwizzle blue,NVNtextureSwizzle a){if((unsigned)r>5||(unsigned)g>5||(unsigned)blue>5||(unsigned)a>5)die("invalid NVN texture swizzle");TB(b)->d.swizzle_r=r;TB(b)->d.swizzle_g=g;TB(b)->d.swizzle_b=blue;TB(b)->d.swizzle_a=a;}
 NVN(nvnTextureBuilderSetSamples, void, NVNtextureBuilder *b, int s) { TB(b)->d.samples = s; }
 NVN(nvnTextureBuilderSetStride, void, NVNtextureBuilder *b, ptrdiff_t s) { TB(b)->d.stride = (uint32_t)s; }
@@ -820,6 +824,14 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     frame_fence_wait_end(&ft_wait, ok, 0);
     if (ok) survey_after_wait(s);
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+}
+/* All queues replay sequentially through the single host queue and WindowAcquireTexture synchronizes
+   host-side before returning, so GPU execution ordering is already satisfied at submission time. */
+NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
+    const queue_t *qo = (const queue_t *)q;
+    const sync_t *so = (const sync_t *)s;
+    if (!qo || qo->magic != MAGIC('Q', 'U', 'E', 'U') || !so || so->magic != MAGIC('S', 'Y', 'N', 'C')) return 0;
+    return 1;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }
@@ -3067,8 +3079,8 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     if (ft_begin) totk_ft_acquire(ft_frame, ft_begin, totk_ft_now());
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
-#ifdef GAME_BOTW
-/* NVN 53 (Breath of the Wild 1.6.0, botw.md): the queue-side acquire. The same wait as nvnWindowAcquireTexture without a
+#if defined(GAME_BOTW) || defined(GAME_HWAOC)
+/* NVN 53 (Breath of the Wild 1.6.0 / Age of Calamity 1.3.0): the queue-side acquire. The same wait as nvnWindowAcquireTexture without a
    sync: it returns once the texture may be drawn into, and every later GPU use of it is ordered after the present copy on
    the one Metal queue. */
 NVN(nvnQueueAcquireTexture, NVNqueueAcquireTextureResult, NVNqueue *q, NVNwindow *w, int *idx) {

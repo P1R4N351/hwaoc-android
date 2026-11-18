@@ -506,6 +506,8 @@ void runtime_fs_probe(void) {
  {
 #ifdef GAME_BOTW
   const char *name="Sound/Resource/Stream/BGM_Castle.bfstm";   /* Breath of the Wild's streams are .bfstm */
+#elif defined(GAME_HWAOC)
+  const char *name="asset/CharacterEditor.rdb";
 #else
   const char *name="Sound/Resource/Stream/Dm_OP_0001.bwav";
 #endif

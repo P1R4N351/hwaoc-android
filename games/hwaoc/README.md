@@ -1,6 +1,8 @@
 # Hyrule Warriors: Age of Calamity — M0 Inventory & M1 Rewriter Check
 
-Status: M0 dump/binary inventory complete on the owner's `v0` + `v327680` (`1.3.0`) dumps; M1 rewriter check complete (`subsdk0` and `sdk` green; `main` blocked at a single jump table `0x138216c`).
+[![Support with Bitcoin](https://img.shields.io/badge/Support_with-Bitcoin-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white)](#support)
+
+Status: M0 dump/binary inventory and M1 Android rewriter verification (`DM_HOST_TP=tpidr_el0`) complete on the owner's `v0` + `v327680` (`1.3.0`) dumps (`subsdk0`, `sdk`, `main` all pass `patch_nso.py`, `structck.py`, and `equiv.py`; merged BKTR `romfs.bin` + `runtime-index.bin` verified).
 
 ---
 
@@ -64,17 +66,19 @@ All `v327680` (`1.3.0`) file sizes, SHA-256 digests, build IDs, and uncompressed
 
 ---
 
-## 4. M1 Rewriter Results (`DM_HOST_TP=tpidr_el0` on `botw-android` `3bb123a`)
+## 4. M1 Rewriter & Merged RomFS Results (`DM_HOST_TP=tpidr_el0`)
 
-Ran `games/totk/third_party/d2r/{patch_nso.py,structck.py,equiv.py}` unmodified on `v327680`:
+With the `lr`/`fp` jump-table register index fix in `games/totk/third_party/d2r/patch_nso.py`, all three `v327680` modules pass `patch_nso.py`, `structck.py`, and `equiv.py`:
 
-| Module | `patch_nso.py` | `structck.py` | `equiv.py` (`--mutate 150 --min-eff 2`) |
-|---|---|---|---|
-| `subsdk0` | **PASS** — `10,201` sites (`plain=10025`, `cond=147`, `pcrel=25`, `br=4`), `0` gates, patch `1,245,204` B (`PATCH_OFF=0x720000`) | **PASS** (`STRUCT subsdk0 OK`, `violations=0`, `失败项=0`) | **PASS** (`EQUIV subsdk0 OK`, `10,201/10,201` sites, `31,197` trials, `27,464` effective, `0` divergent, `150/150` mutations caught) |
-| `sdk` | **PASS** — `11,455` sites (`window=3`, `plain=11130`, `cond=114`, `tpidrro_r=60`, `pcrel=45`, `br=5`, `cntpct=32`, `tpidr_w=3`, `svc=61`, `tpidr_r=2`), `93` gates, patch `519,580` B (`PATCH_OFF=0xcb0000`) | **PASS** (`STRUCT sdk OK`, `violations=0`, `失败项=0`) | **PASS** (`EQUIV sdk OK`, `11,362/11,362` sites + `93` structural gates, `34,777` trials, `30,392` effective, `0` divergent, `150/150` mutations caught) |
-| `main` | **FAIL** — `AssertionError: jump table 138216c` (`patch_nso.py:580`) | Not run (`main` emit aborted) | Not run |
+| Module | `patch_nso.py` | `structck.py` | `equiv.py` (`--min-eff 2 --max-extra 16`) | Patched SHA-256 |
+|---|---|---|---|---|
+| `subsdk0` | **PASS** — `10,201` sites (`plain=10025`, `cond=147`, `pcrel=25`, `br=4`), `0` gates, patch `1,245,204` B (`PATCH_OFF=0x720000`) | **PASS** (`STRUCT subsdk0 OK`, `violations=0`, `失败项=0`) | **PASS** (`10,201/10,201` sites, `31,197` trials, `27,464` effective, `0` divergent, `150/150` caught) | `146e4de3ef491bde117d1160df3aa10723b79b2a0fbaf0904239f77c10913961` |
+| `sdk` | **PASS** — `11,455` sites (`window=3`, `plain=11130`, `cond=114`, `tpidrro_r=60`, `pcrel=45`, `br=5`, `cntpct=32`, `tpidr_w=3`, `svc=61`, `tpidr_r=2`), `93` gates, patch `519,580` B (`PATCH_OFF=0xcb0000`) | **PASS** (`STRUCT sdk OK`, `violations=0`, `失败项=0`) | **PASS** (`11,362/11,362` sites + `93` gates, `34,777` trials, `30,392` effective, `0` divergent, `150/150` caught) | `b6cc413ad5854ab562a601dfe751c3ac588d6e3173893abd7b2bb4f8d828b573` |
+| `main` | **PASS** — `37,228` sites (`window=250`, `plain=35413`, `cond=1043`, `pcrel=519`, `br=3`), `0` gates, patch `1,658,032` B (`PATCH_OFF=0x2bc0000`) | **PASS** (`STRUCT main OK`, `violations=0`, `失败项=0`) | **PASS** (`37,228/37,228` sites, `113,367` trials, `103,731` effective, `0` divergent, `300/300` caught) | `9adf35712d6c2d58dd52c4fe6eba0970e04cf5efec8a6dcc7acc36977185d84b` |
 
-### Root cause of `main` rejection at `0x138216c`
+Merged `v327680` RomFS (`romfs.bin`, IVFC levels 0–5 `(GOOD)`): `11,719,230,892` B (`1,101` files), `ROMFS_IMAGE_SHA256 = 9006c2b8f752c27e2ca628507e45f871ea54d464945aa8d562266bc399f3f0e2`, `runtime-index.bin` (`55,652` B) `ROMFS_INDEX_SHA256 = 76628b10dabab48e1ce2dc37606c90ffcb2cb05f1edd641653fc278a8143c376`.
+
+### Root cause resolved in `patch_nso.py` for `0x138216c`
 
 Disassembly of `v327680` `main` `.text` at `0x138214c`–`0x138216c`:
 
@@ -90,7 +94,7 @@ Disassembly of `v327680` `main` `.text` at `0x138214c`–`0x138216c`:
 138216c: br   x18
 ```
 
-In `patch_nso.py:563`, `p.reg_name(p.operands[2].reg)` returns Capstone's alias `'lr'` for `x30` in `add x18, x18, x30, lsl #2`, whereas `num()` (`r'[xw](\d+)'`) returns `None` for `'lr'` (and `'fp'`), so `idx` stays `None` and the preceding `ldrb w30` is never matched. A full in-memory dry-run across `main` mapping `{'lr': 30, 'fp': 29}` at line 563 (matching `MacNativeGames/games/aoc/runtime/tools/patch_nso.py`, MIT) confirmed **`0x138216c` is the sole rejection in `main`**, emitting `37,228` sites (`window=250`, `plain=35413`, `cond=1043`, `pcrel=519`, `br=3`), `0` gates, `1,658,032` patch bytes (`PATCH_OFF=0x2bc0000`).
+In `patch_nso.py`, `p.reg_name(p.operands[2].reg)` returns Capstone's alias `'lr'` for `x30` in `add x18, x18, x30, lsl #2`, whereas `num()` (`r'[xw](\d+)'`) returned `None` for `'lr'` (and `'fp'`), leaving `idx` as `None`. Mapping `{'lr': 30, 'fp': 29}` and guarding `if idx is not None:` resolved `0x138216c`.
 
 ---
 
@@ -117,3 +121,11 @@ Inspected directly from `/sdcard/Games/Switch 2/Hyrule_Warriors_Age_of_Imprisonm
 | RomFS | `b6e28c40/`: `1,842` `.fdata` (`PDRK0000`/`IDRK0000`, `10.39 GB`); `ebc8c781/`: `106` `.bin` (EBML `.webm`, `23.85 GB`) | `b6e28c40/`: `1,930` `.fdata` (`10.59 GB`); `ebc8c781/`: `106` `.bin` (`23.85 GB`) |
 
 **Feasibility note**: `botw-android` / `totk-android` currently targets Switch 1 NVN 1, Maxwell shaders (`libtotk_xlate.so`), and Switch 1 Horizon services. Age of Imprisonment uses **NVN2**, **Ampere `sm86`** shaders, and **SDK 20.5.15** (`multimedia_compat_nx.nss`), so it remains a separate Switch 2 research track after Age of Calamity.
+
+
+## Support
+
+If this work is useful to you, donations are gratefully accepted:
+
+- Bitcoin: `bc1q4a3lqcg87rvw7vxulausdqhhuwkwwa6w6v4mxx`
+- VitaDB profile: [PiSCES](https://www.rinnegatamante.eu/vitadb/#/user/PiSCES)

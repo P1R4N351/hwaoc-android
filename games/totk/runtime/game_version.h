@@ -19,6 +19,19 @@
 #define GAME_ADDR_0xe995c4 0xe53f8c   /* return address of nnMain's only call to nn::oe::SetFocusHandlingMode */
 #define GAME_ADDR_0x2aa4fa0 0x2128690 /* nn::swkbd::ShowKeyboard: main's PLT stub */
 #define GAME_ADDR_0x453f648 0x2c7ef90 /* nn::swkbd::ShowKeyboard: main's GOT slot */
+#elif defined(GAME_HWAOC130)
+/* Hyrule Warriors: Age of Calamity 1.3.0 (v327680). */
+#ifndef GAME_HWAOC
+#define GAME_HWAOC 1
+#endif
+#define TOTK_GAME_VERSION "1.3.0"
+#define GAME_NAME "Hyrule Warriors: Age of Calamity"
+#define GAME_FOLDER "AoC"
+#define GAME_LOG "hwaoc"
+#define TOTK_GAME_DIR "hwaoc130"
+#define GAME_ADDR_0xe995c4 0x8ad9ec   /* return address of nnMain's first call (SetCpuBoostMode) */
+#define GAME_ADDR_0x2aa4fa0 0         /* nn::swkbd::ShowKeyboard is not imported */
+#define GAME_ADDR_0x453f648 0
 #elif defined(TOTK_GAME_V143)
 #define TOTK_GAME_VERSION "1.4.3"
 #define TOTK_GAME_DIR "v143"

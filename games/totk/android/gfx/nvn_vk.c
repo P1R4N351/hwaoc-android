@@ -888,7 +888,7 @@ static void vk_init_once(void) {
                          g_occl_on ? "on" : "off: required features missing", f12.hostQueryReset, f2.features.occlusionQueryPrecise); }
     vkGetDeviceQueue(V.dev, V.qfam, 0, &V.queue);
     int gpu_time_default_hardware = 0;
-#if defined(__ANDROID__) && !defined(GAME_BOTW)
+#if defined(__ANDROID__) && !defined(GAME_BOTW) && !defined(GAME_HWAOC)
     const char *fps60 = getenv("TOTK_FPS60");
     gpu_time_default_hardware = !fps60 || !strcmp(fps60, "0");
 #endif

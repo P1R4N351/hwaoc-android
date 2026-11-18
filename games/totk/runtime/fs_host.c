@@ -35,6 +35,8 @@
 #define R_APPEND_REQUIRED 0x2f5e02u
 #ifdef GAME_BOTW
 #define TOTK_APPLICATION_ID 0x01007ef00011e000ULL   /* Breath of the Wild: its own save data is the one that exists */
+#elif defined(GAME_HWAOC)
+#define TOTK_APPLICATION_ID 0x01002b00111a2000ULL   /* Hyrule Warriors: Age of Calamity */
 #else
 #define TOTK_APPLICATION_ID 0x0100f2c0115b6000ULL
 #endif
@@ -179,6 +181,12 @@ static unsigned mount_save(const char *name, const uint64_t *uid) {
 static unsigned char save_exists(uint64_t application, const uint64_t *uid) {
     ready(); uint64_t me[2]; runtime_account_uid(me);
     return application == TOTK_APPLICATION_ID && uid && uid[0] == me[0] && uid[1] == me[1];
+}
+static unsigned ensure_save(const uint64_t *uid) {
+    ready(); uint64_t me[2]; runtime_account_uid(me);
+    if (!uid || uid[0] != me[0] || uid[1] != me[1]) return R_TARGET_NOT_FOUND;
+    make_dir(save_root);
+    return 0;
 }
 /* Other titles' save data (e.g. data-link bonuses) is not present on this host. */
 static unsigned mount_save_ro(const char *name, uint64_t application, const uint64_t *uid) {
@@ -382,6 +390,30 @@ static void close_directory(uint64_t h) {
     if (h < DIR_BASE || h >= DIR_BASE + NDIRS || !dirs[h - DIR_BASE].dir) runtime_fail("close invalid directory handle");
     pthread_mutex_lock(&lock); closedir(dirs[h - DIR_BASE].dir); dirs[h - DIR_BASE].dir = NULL; pthread_mutex_unlock(&lock);
 }
+static unsigned dir_entry_count(int64_t *count, uint64_t h) {
+    enum { MAX_DIR_SCAN = 65536 };
+    if (h < DIR_BASE || h >= DIR_BASE + NDIRS || !count) return R_INVALID_ARGUMENT;
+    Dir *d = &dirs[h - DIR_BASE]; if (!d->dir) return R_INVALID_ARGUMENT;
+    DIR *scan = opendir(d->path); if (!scan) return errno_result();
+    int64_t n = 0; struct dirent *e = NULL;
+    for (unsigned guard = 0; guard < MAX_DIR_SCAN && (e = readdir(scan)) != NULL; guard++) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || strlen(e->d_name) > 768) continue;
+        char child[2048]; snprintf(child, sizeof child, "%s/%s", d->path, e->d_name);
+        struct stat st; if (stat(child, &st)) continue;
+        int is_dir = S_ISDIR(st.st_mode);
+        if (d->mode & (is_dir ? 1 : 2)) n++;
+    }
+    closedir(scan); *count = n; return 0;
+}
+static void fs_set_allocator(void *alloc, void *dealloc) { (void)alloc; (void)dealloc; }
+#ifdef GAME_HWAOC
+static unsigned hwaoc_aoc_cache_size(uint64_t *out, int index) {
+    (void)index; if (!out) return R_INVALID_ARGUMENT; *out = 8; return 0;
+}
+static unsigned hwaoc_aoc_mount(const char *name, int index, void *cache, uint64_t size) {
+    (void)name; (void)index; (void)cache; (void)size; return R_PATH_NOT_FOUND;
+}
+#endif
 /* The fs priority only orders I/O inside the system fs process; host I/O is unordered. */
 static void set_priority(int priority) { (void)priority; }
 
@@ -429,13 +461,19 @@ void *runtime_fs_host_override(const char *name) {
         {"_ZN2nn2fs15CreateDirectoryEPKc", create_directory}, {"_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc", delete_recursive},
         {"_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", open_directory},
         {"_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", read_directory},
+        {"_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", dir_entry_count},
         {"_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", close_directory},
+        {"_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", ensure_save},
         {"_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", mount_save},
         {"_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", mount_save_ro},
         {"_ZN2nn2fs18IsSaveDataExistingENS_13ApplicationIdERKNS_7account3UidE", save_exists},
         {"_ZN2nn2fs21MountTemporaryStorageEPKc", mount_temp}, {"_ZN2nn2fs7UnmountEPKc", unmount}, {"_ZN2nn2fs6CommitEPKc", commit},
 #ifdef GAME_BOTW
         {"_ZN2nn2fs14CommitSaveDataEPKc", commit},   /* SDK 7 (Breath of the Wild 1.6.0) */
+#endif
+#ifdef GAME_HWAOC
+        {"_ZN2nn2fs31QueryMountAddOnContentCacheSizeEPmi", hwaoc_aoc_cache_size},
+        {"_ZN2nn2fs17MountAddOnContentEPKciPvm", hwaoc_aoc_mount},
 #endif
        
         {"_ZN2nn2fs18CreateCacheStorageEill", create_cache}, {"_ZN2nn2fs18DeleteCacheStorageEi", delete_cache},
@@ -444,6 +482,7 @@ void *runtime_fs_host_override(const char *name) {
         {"_ZN2nn2fs20ReadCacheStorageListEPiPNS0_16CacheStorageInfoENS0_22CacheStorageListHandleEi", read_cache_list},
         {"_ZN2nn2fs21CloseCacheStorageListENS0_22CacheStorageListHandleE", close_cache_list},
         {"_ZN2nn2fs26SetPriorityOnCurrentThreadENS0_8PriorityE", set_priority},
+        {"_ZN2nn2fs12SetAllocatorEPFPvmEPFvS1_mE", fs_set_allocator},
     };
     for (size_t i = 0; i < sizeof map / sizeof *map; i++) if (!strcmp(name, map[i].name)) return map[i].fn;
     return NULL;

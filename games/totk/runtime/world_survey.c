@@ -17,11 +17,11 @@
 _Atomic int runtime_companion_pending;
 void (*_Atomic runtime_companion_tick)(uint64_t frame);
 
-#ifdef GAME_BOTW
+#if defined(GAME_BOTW) || defined(GAME_HWAOC)
 _Atomic int runtime_survey_pending;
 void runtime_survey_init(Module *m) {
     (void)m;
-    if (getenv("TOTK_SURVEY")) runtime_fail("Breath of the Wild has no survey");
+    if (getenv("TOTK_SURVEY")) runtime_fail("world survey is not ported to this game");
 }
 int runtime_survey_command(const char *line) { (void)line; return 0; }
 void runtime_survey_tick(uint64_t frame) { (void)frame; }
@@ -209,4 +209,4 @@ void runtime_survey_tick(uint64_t frame) {
     pthread_mutex_unlock(&survey_lock);
     in_tick = 0;
 }
-#endif   /* GAME_BOTW */
+#endif   /* GAME_BOTW || GAME_HWAOC */

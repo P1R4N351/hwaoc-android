@@ -195,6 +195,9 @@ void runtime_swkbd_selftest(void) {
 
 /* ---------- probe (make probe-swkbd): guest SDK arguments, main's PLT stub, no window ---------- */
 #include "game_version.h"
+#ifdef GAME_HWAOC
+void runtime_swkbd_probe(void) { runtime_fail("game does not import nn::swkbd::ShowKeyboard"); }
+#else
 enum { MAIN_PLT_SHOW_KEYBOARD = GAME_ADDR(0x2aa4fa0), MAIN_GOT_SHOW_KEYBOARD = GAME_ADDR(0x453f648) };   /* scripts/re/calls.py main <ShowKeyboard> */
 static unsigned checks;
 static void need(int ok, const char *what) { checks++; if (!ok) { fprintf(stderr, "swkbd probe: %s\n", what); runtime_fail("software keyboard probe failed"); } }
@@ -266,3 +269,4 @@ void runtime_swkbd_probe(void) {
     pthread_t t;
     if (pthread_create(&t, NULL, probe_thread, NULL) || pthread_join(t, NULL)) runtime_fail("software keyboard probe thread");
 }
+#endif

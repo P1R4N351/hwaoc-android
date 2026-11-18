@@ -991,7 +991,7 @@ static uint64_t settled_subs(void) {
 }
 static wb_hist_key wb_history_key(const tex_t *t, uint64_t pool) {
     wb_hist_key key = {.pool = pool, .mem = (uintptr_t)t->mem, .size = t->L.size, .desc = t->d};
-    key.desc.swizzle_r = key.desc.swizzle_g = key.desc.swizzle_b = key.desc.swizzle_a = key.desc.swizzle_pad = 0;
+    key.desc.swizzle_r = key.desc.swizzle_g = key.desc.swizzle_b = key.desc.swizzle_a = key.desc.dsmode = key.desc.swizzle_pad = 0;
     return key;
 }
 static void wb_history_empty(void) {
@@ -1739,7 +1739,9 @@ static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_tar
         if (vt == VK_IMAGE_VIEW_TYPE_CUBE) ns = 6;
         if (vt == VK_IMAGE_VIEW_TYPE_CUBE_ARRAY) ns -= ns % 6;
         if (s0 + ns > im->layers && im->type != VK_IMAGE_TYPE_3D) { RED(16, "texture view of %u layers from %u of %u (ser %llu)", ns, s0, im->layers, (unsigned long long)t->serial); return VK_NULL_HANDLE; }
-        if (aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) aspect = VK_IMAGE_ASPECT_DEPTH_BIT;   /* sampling a depth-stencil texture reads depth */
+        int stencil_mode = v && v->set_dsmode ? v->dsmode : t->d.dsmode;
+        if (aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
+            aspect = stencil_mode ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
         if (attach == 0) {   /* NVN swizzle selectors over the format's own remap (nvn_mtl.m tex_swizzle_sel) */
             unsigned sel[4] = {t->d.swizzle_r, t->d.swizzle_g, t->d.swizzle_b, t->d.swizzle_a};
             if (v && v->set_swizzle) for (unsigned i = 0; i < 4; i++) sel[i] = v->swz[i];
@@ -2105,6 +2107,11 @@ void mtl_set_tex_pool_n(int n) { atomic_store_explicit(&g_tpool_n, n, memory_ord
 static _Atomic uint32_t g_samp_epoch = 1;
 uint64_t vk_record_sampler_revision(void) { return atomic_load_explicit(&g_samp_epoch, memory_order_acquire); }
 static int texcache_on(void) { static int on = -1; if (on < 0) on = !vk_off("texcache"); return on; }
+static int eff_reg_format(const tex_t *t, const view_t *v) {
+    int format = v && v->set_format ? v->format : t->d.format;
+    int stencil = v && v->set_dsmode ? v->dsmode : t->d.dsmode;
+    return stencil && vk_fmt_has_stencil(format) ? 0x31 : format;
+}
 static _Atomic uint64_t g_treg_calls, g_treg_unchanged;   /* TOTK_VK_TEX_MEMO: registrations, of those identical */
 void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     if (tid < 0) return;
@@ -2127,7 +2134,7 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
         unsigned word = (unsigned)tid / 64; uint64_t bit = 1ull << (tid & 63);
         uint64_t ok = atomic_load_explicit(&g_treg_kind_ok[word], memory_order_relaxed);
         if (t) {
-            int format = v && v->set_format ? v->format : t->d.format;
+            int format = eff_reg_format(t, v);
             int target = v && v->set_target ? v->target : t->d.target;
             atomic_store_explicit(&g_treg_kind[tid], (uint32_t)format | (uint64_t)(uint32_t)target << 32, memory_order_release);
         }
@@ -2150,7 +2157,7 @@ int vk_treg_get(int tid, vk_treg *out) {   /* g_treg grows by realloc on the gam
    Pool bounds are independent of object lifetime: releasing a realized image changes
    neither its descriptor's kind nor this table. No TLS/hash/epoch validation is needed. */
 int vk_treg_kind(int tid, int *format, int *target) {
-    if (tid <= 0 || tid >= TID_GEN_N) { vk_treg r; if (!vk_treg_get(tid, &r)) return 0; *format = r.has_v && r.v.set_format ? r.v.format : r.t.d.format; *target = r.has_v && r.v.set_target ? r.v.target : r.t.d.target; return 1; }
+    if (tid <= 0 || tid >= TID_GEN_N) { vk_treg r; if (!vk_treg_get(tid, &r)) return 0; *format = eff_reg_format(&r.t, r.has_v ? &r.v : NULL); *target = r.has_v && r.v.set_target ? r.v.target : r.t.d.target; return 1; }
     int pool_n = atomic_load_explicit(&g_tpool_n, memory_order_acquire);
     if ((pool_n && tid >= pool_n) ||
         !(atomic_load_explicit(&g_treg_kind_ok[(unsigned)tid / 64], memory_order_acquire) >> (tid & 63) & 1)) return 0;

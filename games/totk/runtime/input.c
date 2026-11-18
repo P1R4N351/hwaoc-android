@@ -80,6 +80,21 @@ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_st
  if(ft_frame)totk_ft_input_read(ft_frame,ft_now,runtime_thread_current_handle(),(uint64_t)state.sampling);
  return 1;}
 static int disconnected_states(NpadState *out,int max,const uint32_t *id){if(id)input_log("joy-con state",*id);if(max<=0)return 0;if(!out)runtime_fail("controller output pointer");pthread_mutex_lock(&inputLock);*out=(NpadState){.sampling=++sample};pthread_mutex_unlock(&inputLock);return 1;}
+static void full_state(NpadState *out,const uint32_t *id){(void)pad_states(out,1,id,1);}
+static void handheld_state(NpadState *out,const uint32_t *id){(void)pad_states(out,1,id,2);}
+static void disconnected_state(NpadState *out,const uint32_t *id){(void)disconnected_states(out,1,id);}
+static int get_hold_type(void){pthread_mutex_lock(&inputLock);int t=holdType;pthread_mutex_unlock(&inputLock);return t;}
+static void handheld_activation(int mode){if(mode<0||mode>2)runtime_fail("invalid handheld activation mode");(void)mode;}
+typedef struct{int64_t sampling;int32_t count,reserved;uint8_t touches[40];} TouchScreenState1;
+_Static_assert(sizeof(TouchScreenState1)==0x38,"TouchScreenState<1> ABI");
+static bool touchReady;
+static void initialize_touch(void){pthread_mutex_lock(&inputLock);touchReady=true;pthread_mutex_unlock(&inputLock);(void)touchReady;}
+static void touch_state_1(TouchScreenState1 *out){
+ if(!out)runtime_fail("touch screen output pointer");
+ pthread_mutex_lock(&inputLock);
+ *out=(TouchScreenState1){.sampling=++sample,.count=0};
+ pthread_mutex_unlock(&inputLock);
+}
 static void hold_type(int type){if(type<0||type>1)runtime_fail("invalid joy hold type");holdType=type;(void)holdType;}
 static void disconnect(const uint32_t *id){if(!id)runtime_fail("disconnect id");input_log("disconnect",*id);if(*id==pad_id()){   /* only the pad in use: in handheld mode TOTK disconnects player 1 */pthread_mutex_lock(&inputLock);allowed=false;pthread_mutex_unlock(&inputLock);runtime_input_clear();}}
 /* Mouse and keyboard devices: the Mac keyboard drives the full-key controller, so the game sees no mouse
@@ -122,7 +137,13 @@ void *runtime_input_override(const char *name){
  {"_ZN2nn3hid15GetNpadStyleSetERKj",style},{"_ZN2nn3hid13GetNpadStatesEPNS0_16NpadFullKeyStateEiRKj",full_states},
  {"_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj",disconnected_states},{"_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj",disconnected_states},
  {"_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj",disconnected_states},{"_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj",handheld_states},
- {"_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE",hold_type},{"_ZN2nn3hid14DisconnectNpadERKj",disconnect},
+ {"_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj",full_state},{"_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyDualStateERKj",disconnected_state},
+ {"_ZN2nn3hid12GetNpadStateEPNS0_16NpadJoyLeftStateERKj",disconnected_state},{"_ZN2nn3hid12GetNpadStateEPNS0_17NpadJoyRightStateERKj",disconnected_state},
+ {"_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj",handheld_state},
+ {"_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE",hold_type},{"_ZN2nn3hid18GetNpadJoyHoldTypeEv",get_hold_type},
+ {"_ZN2nn3hid29SetNpadHandheldActivationModeENS0_26NpadHandheldActivationModeE",handheld_activation},
+ {"_ZN2nn3hid14DisconnectNpadERKj",disconnect},
+ {"_ZN2nn3hid21InitializeTouchScreenEv",initialize_touch},{"_ZN2nn3hid19GetTouchScreenStateILm1EEEvPNS0_16TouchScreenStateIXT_EEE",touch_state_1},
  {"_ZN2nn3hid21ShowControllerSupportEPNS0_27ControllerSupportResultInfoERKNS0_20ControllerSupportArgE",show_controller_support},
  {"_ZN2nn3hid15InitializeMouseEv",initialize_mouse},{"_ZN2nn3hid18InitializeKeyboardEv",initialize_keyboard},
  {"_ZN2nn3hid14GetMouseStatesEPNS0_10MouseStateEi",mouse_states},{"_ZN2nn3hid16GetKeyboardStateEPNS0_13KeyboardStateE",keyboard_state}

@@ -1,5 +1,6 @@
 /* Horizon services reached by the current TOTK startup. Unknown operations fail. */
 #include "runtime.h"
+#include "game_version.h"
 #include "platform.h"
 #include "ipc.h"
 #include "host_thread.h"
@@ -63,6 +64,8 @@ static uint8_t user_exception_context[0x1000] __attribute__((aligned(0x1000)));
 #define SYSTEM_RESOURCE_BUDGET (32ULL<<20)
 #ifdef GAME_BOTW
 #define GAME_PROGRAM_ID 0x01007ef00011e000ULL   /* GetInfo 18 (ProgramId): Breath of the Wild */
+#elif defined(GAME_HWAOC)
+#define GAME_PROGRAM_ID 0x01002b00111a2000ULL   /* GetInfo 18 (ProgramId): Hyrule Warriors: Age of Calamity */
 #else
 #define GAME_PROGRAM_ID 0x0100f2c0115b6000ULL
 #endif
@@ -295,7 +298,15 @@ static void observed_os_init(uint64_t h,uint64_t args) {
 static void observed_sdk_init(void) { fprintf(stderr,"[totk] ENTER nninitInitializeSdkModule\n");((void(*)(void))runtime_symbol("nninitInitializeSdkModule"))();fprintf(stderr,"[totk] RETURN nninitInitializeSdkModule\n"); }
 static void observed_startup(void) { fprintf(stderr,"[totk] ENTER nninitStartup\n");((void(*)(void))runtime_symbol("nninitStartup"))();fprintf(stderr,"[totk] RETURN nninitStartup\n"); }
 static void observed_main(void) { fprintf(stderr,"[totk] ENTER nnMain\n");((void(*)(void))runtime_symbol("nnMain"))();fprintf(stderr,"[totk] RETURN nnMain\n"); }
-static void cpu_boost(int mode) { if(mode<0||mode>2)runtime_fail("unknown CPU boost mode");fprintf(stderr,"[totk] CPU boost request %d: macOS manages CPU frequency\n",mode); }
+static void cpu_boost(int mode) { if(mode<0||mode>2)runtime_fail("unknown CPU boost mode");
+#ifdef GAME_HWAOC
+ runtime_startup_checkpoint((uintptr_t)__builtin_return_address(0));
+#endif
+ fprintf(stderr,"[totk] CPU boost request %d: macOS manages CPU frequency\n",mode); }
+static void oe_display_version(void *out) { if(!out)runtime_fail("null DisplayVersion"); memset(out,0,16); snprintf((char *)out,16,"%s",TOTK_GAME_VERSION); }
+static void oe_copyright_fb_init(void *buf,size_t size) { (void)buf;(void)size; }
+static void oe_copyright_image(const void *img,size_t size,int w,int h,int x,int y,int origin) { (void)img;(void)size;(void)w;(void)h;(void)x;(void)y;(void)origin; }
+static void oe_copyright_visibility(unsigned visible) { (void)visible; }
 /* TOTK_OPERATION_MODE=handheld reports the Switch handheld mode (oe OperationMode 0, PerformanceMode Normal 0) instead of
    docked (1, Boost 1): the game then uses its own handheld settings (1280x720 output, lower internal resolution), which
    Nintendo made for half the docked GPU clock. Read once; any other value stops the start. */
@@ -391,6 +402,10 @@ void *runtime_override(const char *name) {
   {"_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE",focus_mode},{"_ZN2nn2oe20GetCurrentFocusStateEv",focus_state},
   {"_ZN2nn2oe28SetResumeNotificationEnabledEb",resume_enabled},{"_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb",operation_enabled},{"_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb",performance_enabled},
   {"nndiagStartup",host_diag_init},{"_ZN2nn2oe10InitializeEv",host_oe_init},{"_ZN2nn3aoc10InitializeEv",host_aoc_init},
+  {"_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE",oe_display_version},
+  {"_ZN2nn2oe30InitializeCopyrightFrameBufferEPvm",oe_copyright_fb_init},
+  {"_ZN2nn2oe17SetCopyrightImageEPKvmiiiiNS0_16WindowOriginModeE",oe_copyright_image},
+  {"_ZN2nn2oe22SetCopyrightVisibilityEb",oe_copyright_visibility},
   {"_ZN2nn3aoc17CountAddOnContentEv",host_aoc_count},{"_ZN2nn3aoc16ListAddOnContentEPiii",host_aoc_list},
   {"_ZN2nn3err26InitializeContextWriterApiEv",host_error_init},{"_ZN2nn2fs24InitializeForApplicationEv",host_fs_init},
   {"_ZN2nn4pctl10InitializeEv",host_pctl_init},{"_ZN2nn4diag34InitializeApplicationAbortObserverEv",host_abort_init}};
@@ -409,6 +424,15 @@ uint64_t runtime_svc_inner(unsigned num,uint64_t *r,const char *module,uint64_t 
 uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset){uint64_t v=runtime_svc_inner(num,r,module,offset);runtime_core_checkpoint();return v;}
 #define runtime_svc runtime_svc_inner
 #endif
+static uint64_t startup_mem_reserve(void){
+#ifdef GAME_HWAOC
+ static int64_t cached=-1;
+ if(cached<0){const char *e=getenv("TOTK_MEM_RESERVE");cached=e&&*e?(int64_t)strtoull(e,NULL,0):(int64_t)(16ULL<<20);}
+ return (uint64_t)cached;
+#else
+ return 0;
+#endif
+}
 uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset) {
  runtime_core_checkpoint();
  // Successful SVCs occur several times per frame. Keep the detailed trace available
@@ -428,7 +452,7 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   case 0:value=7;break;case 1:value=0x0ffffffff0000000ULL;break;
   case 2:value=ALIAS_START;break;case 3:value=ALIAS_SIZE;break;
   case 4:value=(uintptr_t)heap;break;case 5:value=HEAP_CAP;break;
-  case 6:case 21:value=APP_POOL;break;case 7:case 22:value=runtime_image_bytes()+heap_size+alias_bytes;
+  case 6:case 21:value=APP_POOL;break;case 7:case 22:value=runtime_image_bytes()+heap_size+alias_bytes+(!heap_size?startup_mem_reserve():0);
    { static unsigned polls; if(mem_log_on()&&(polls++%600)==0) fprintf(stderr,"[totk-mem] GetInfo(%u) total=%#llx used=%#llx image=%#llx heap=%#llx alias=%#llx\n",id,(unsigned long long)APP_POOL,(unsigned long long)value,(unsigned long long)runtime_image_bytes(),(unsigned long long)heap_size,(unsigned long long)alias_bytes); }
    break;
   case 8:value=0;break;case 10:value=0;break;

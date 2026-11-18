@@ -79,6 +79,8 @@ static void seed_init(void) {
     g_seed_dir = g_seed_path;
 #if defined(TOTK_GAME_V143)
     const char *versioned_default = "shaders/v143";
+#elif defined(GAME_HWAOC)
+    const char *versioned_default = "shaders/hwaoc130";
 #else
     const char *versioned_default = "shaders/v0";
 #endif

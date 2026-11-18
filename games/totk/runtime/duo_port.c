@@ -59,6 +59,11 @@ int64_t runtime_aoc_read_rel(const char *rel, uint64_t offset, void *out, uint64
 /* 1.6.0's main (games.toml main_build_id), the value this file handed the host before it read main's note: used only
    when that read fails, so a main without a single note still gets the companion it always had. */
 #define DUO_KNOWN_BUILD_ID "\x8E\x99\x78\xD5\x0B\xDD\x20\xB4\xC8\x39\x5A\x10\x6C\x27\xFF\xDE"
+#elif defined(GAME_HWAOC)
+#define DUO_TITLE_ID 0x01002B00111A2000ull
+#define DUO_ITEM_ACTIONS 0
+#define DUO_GUEST_WRITES 0
+#define DUO_KNOWN_BUILD_ID "\xC3\xCF\x52\xBF\x2B\x05\xD7\x31\x08\x84\x97\x1B\x50\xBC\xCC\xB8"
 #else
 #define DUO_TITLE_ID 0x0100F2C0115B6000ull
 #define DUO_ITEM_ACTIONS 1   /* Tears of the Kingdom: companion_actions.c, in the app builds */

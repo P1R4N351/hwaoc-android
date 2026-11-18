@@ -560,11 +560,13 @@ for fa, fb in funcs:
                 if p.mnemonic == 'adr' and p.op_str.startswith('x18,'): base = p.operands[1].imm; break
             for p in reversed(ctx):
                 if p.mnemonic == 'add' and p.op_str.startswith('x18, x18,') and 'lsl #2' in p.op_str:
-                    idx = num(p.reg_name(p.operands[2].reg))
-                    for q in reversed(ctx):
-                        if q.mnemonic in ('ldrb', 'ldrsb') and num(q.reg_name(q.operands[0].reg)) == idx: width = 256
-                        if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = 65536
-                        if width: break
+                    rn = p.reg_name(p.operands[2].reg)
+                    idx = {'lr': 30, 'fp': 29}.get(rn, num(rn))
+                    if idx is not None:
+                        for q in reversed(ctx):
+                            if q.mnemonic in ('ldrb', 'ldrsb') and num(q.reg_name(q.operands[0].reg)) == idx: width = 256
+                            if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = 65536
+                            if width: break
                     break
             if not width and ins.address in SIGNED_TABLES.get(BUILD_ID, {}):
                 adrbase, table, n, dispatch_sha, table_sha = SIGNED_TABLES[BUILD_ID][ins.address]
