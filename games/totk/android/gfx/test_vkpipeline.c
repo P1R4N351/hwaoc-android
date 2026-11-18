@@ -526,10 +526,10 @@ static void prediction_probe(const tex_t *texture_object, uint8_t *pixel) {
     mtl_sub_begin(); mtl_exec(ops); used = 0;   /* leave the warm pass open for the explicit prediction cursor */
     vk_state saved = S, shadow = S;
     vk_shader *active[6], *predicted[6];
-    CHECK(!vk_prog_resolve(S.prog, active) && vk_prog_predict(&shadow, predicted) &&
+    CHECK(!vk_prog_resolve_gfx(S.prog, active) && vk_prog_predict(&shadow, predicted) &&
           !memcmp(active, predicted, sizeof active), "prediction borrows the exact ready shader stages");
     uint64_t io = vk_shader_io_cum_ns();
-    prog_t future = {.serial = UINT64_MAX - 17}; shadow.prog = &future;
+    prog_t future = {.serial = UINT64_MAX - 17}; shadow.prog[0] = &future;
     CHECK(!vk_prog_predict(&shadow, predicted), "an unknown future program is not loaded by prediction");
     shadow = saved; shadow.attr[0].fmt = 0x27;
     CHECK(!vk_prog_predict(&shadow, predicted), "an unresolved signature is not selected or loaded speculatively");

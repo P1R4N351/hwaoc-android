@@ -138,7 +138,7 @@ uint64_t vk_game_submit_serial(void);    /* walking thread only; GPU chunks do n
     X(vkCmdCopyBufferToImage) X(vkCmdCopyImageToBuffer) X(vkCmdCopyImage) X(vkCmdBlitImage) \
     X(vkCmdClearColorImage) X(vkCmdClearDepthStencilImage) X(vkCmdClearAttachments) \
     X(vkCmdPushConstants) X(vkCmdBeginRendering) X(vkCmdEndRendering) X(vkCmdBindPipeline) X(vkCmdBindDescriptorSets) \
-    X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDispatch) \
+    X(vkCmdBindVertexBuffers2) X(vkCmdBindIndexBuffer) X(vkCmdDraw) X(vkCmdDrawIndexed) X(vkCmdDrawIndirect) X(vkCmdDrawIndexedIndirect) X(vkCmdDispatch) \
     X(vkCmdSetViewport) X(vkCmdSetScissor) X(vkCmdSetDepthBias) X(vkCmdSetBlendConstants) \
     X(vkCmdSetStencilCompareMask) X(vkCmdSetStencilWriteMask) X(vkCmdSetStencilReference) \
     X(vkCmdSetCullMode) X(vkCmdSetFrontFace) X(vkCmdSetPrimitiveTopology) X(vkCmdSetDepthTestEnable) \
@@ -236,6 +236,7 @@ int vk_resolve(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off);
 void vk_ub_touch(uint64_t addr, uint64_t n);   /* a non-uniform GPU access of [addr, +n): logged uniform updates there reach memory first */
 void vk_ub_flush(void);
 void vk_gpu_write(uint64_t addr, uint64_t n);   /* the GPU writes [addr, +n) in this submission: no uniform snapshot of it (now or while in flight) */
+int vk_gpu_write_pending(uint64_t addr, uint64_t n);   /* 1 if a GPU write in flight (or pending un-logged write) overlaps [addr, +n) */
 /* TOTK_VK_OFF=<name>,<name>,...: turn individual optimisations off (to find which one misbehaves). Names: rename (uniform
    renaming), ds (descriptor-set reuse), dyn (dynamic-state skipping), block (driver bank / c1 reuse), ts (GPU
    timestamps), span (pool index; off = the old linear scan), all. */
@@ -652,6 +653,8 @@ void vk_gpuprof_test_background(uint64_t counts[3]); /* enqueued, processed, dro
 typedef struct vk_prog vk_prog;
 /* The program's shaders for the current bind state (variant per stage): 0 ok, -1 a variant is missing (draw skipped) */
 int vk_prog_resolve(const prog_t *p, vk_shader *out[6]);
+int vk_prog_resolve_gfx(const prog_t *const progs[6], vk_shader *out[6]);
+int vk_prog_resolve_compute(const prog_t *p, vk_shader *out[6]);
 void vk_stage_sig_invalidate(unsigned stages);   /* recording-thread state writes: one bit per NVN stage */
 void vk_prog_prepare(const prog_t *p); /* bind-time compute compilation, no variant selection or graphics seed IO */
 VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs);   /* vs->mod, or one with fs's missing varyings added */
@@ -697,7 +700,7 @@ void vk_end_rendering_at(vk_pass_end_kind reason, uint32_t detail);
 void vk_pass_merge_counters(uint64_t out[4]);   /* deferred, retained, hazard splits, avoided boundaries */
 /* the bound state the shader variants are chosen by (vk_shader.c reads it) */
 typedef struct {
-    const prog_t *prog;
+    const prog_t *prog[6];
     blend_st blend[8]; color_st color; chmask_st chmask; ms_st ms; poly_st poly; ds_st ds;
     va_st attr[16]; int nattr; vs_st stream[16]; int nstream;
     NVNbufferRange vbuf[16];
@@ -705,7 +708,7 @@ typedef struct {
     uint64_t tex[6][128], samp[6][128], img[6][32];
     uint32_t st_vmask[2], st_wmask[2], st_ref[2];
     p_poly_offset po; float vp[16][6]; float dr[2]; int has_vp; int depth_clamp, render_disabled, raster_discard;
-    float blend_color[4], alpha_ref; int64_t copy_stride;
+    float blend_color[4], alpha_ref; int64_t copy_stride, copy_image_stride;
     p_scissor sc; int has_sc;
     p_set_rt rt; int has_rt;
     int tex_hi[6];

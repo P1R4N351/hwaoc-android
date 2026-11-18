@@ -698,6 +698,7 @@ struct vk_prog {
     alt_t *alt[6]; int nalt[6], capalt[6];
     vk_shader *cur[6]; uint64_t cur_sig[6]; int cur_ok[6];
     struct { uint64_t registry, xlate_epoch, signature[6]; vk_shader *shader[6]; int ready, result; } record;
+    struct { uint64_t registry, xlate_epoch, signature; vk_shader *shader; int ready, result; } stage_record[6];
 };
 static nvn_hmap g_progs = {.klen = 8};   /* prog_t serial -> vk_prog */
 /* The game releases programs on its own threads (nvnProgramSetShaders / Finalize) while the replay thread looks them
@@ -792,84 +793,111 @@ VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
              vs->key, fs->key, missing, mod ? "added as (0, 0, 0, 1)" : "could not add them (old behaviour kept)");
     return mod ? mod : vs->mod;
 }
+static void prog_sync_epoch(vk_prog *pr, uint64_t epoch) {
+    if (pr->xlate_epoch == epoch) return;
+    /* Shader maps and negative program caches are owned here, never by the child/worker.
+       Ready variants remain valid; only misses must resolve again after publication. */
+    for (int st = 0; st < 6; st++) {
+        int n = 0;
+        for (int i = 0; i < pr->nalt[st]; i++) if (!pr->alt[st][i].missing) pr->alt[st][n++] = pr->alt[st][i];
+        pr->nalt[st] = n;
+        if (!pr->cur[st]) pr->cur_ok[st] = 0;
+    }
+    pr->xlate_epoch = epoch;
+}
+static int prog_resolve_stage(vk_prog *pr, int st, vk_shader **out_sh) {
+    if (!pr || !pr->has[st]) { *out_sh = NULL; return 0; }
+    uint64_t sg = stage_sig(st);
+    if (pr->cur_ok[st] && pr->cur_sig[st] == sg) { *out_sh = pr->cur[st]; return *out_sh ? 0 : -1; }
+    alt_t *hit = NULL;
+    for (int i = 0; i < pr->nalt[st]; i++) if (pr->alt[st][i].sig == sg) { hit = &pr->alt[st][i]; break; }
+    if (!hit) {
+        answers_t a; answers_of(st, &a);
+        variant_list *vl = variants_of(pr->key[st]);
+        vk_shader *sh = NULL;
+        for (int i = 0; i < vl->n && !sh; i++) if (deps_match(vl->v[i].deps, &a)) sh = shader_load(vl->v[i].name, vk_nvn_early_tests(pr->ctl[st], ctl_key_len(pr->ctl[st]), st));
+        if (!sh) {
+            request_miss(pr->key[st], st, pr->ctl[st], pr->code[st], &a);
+            /* TOTK_XLATE_WAIT_MS: wait for the on-device service instead of skipping the draw. */
+            long wait_ms = miss_wait_ms();
+            if (wait_ms > 0 && vk_shader_xlate_available()) {
+                uint64_t t0 = host_now_ns(), seen = vk_shader_xlate_epoch(); int tried = 0;
+                for (unsigned spins = 0; spins < 1000000u && !sh && (host_now_ns() - t0) / 1000000 < (uint64_t)wait_ms && !vk_shader_xlate_rejected(g_miss_variant) && vk_shader_xlate_available(); spins++) {
+                    uint64_t now = vk_shader_xlate_epoch();
+                    if (now == seen && tried) { usleep(500); continue; }
+                    seen = now; tried = 1;
+                    vl = variants_of(pr->key[st]);
+                    for (int i = 0; i < vl->n && !sh; i++) if (deps_match(vl->v[i].deps, &a)) sh = shader_load(vl->v[i].name, vk_nvn_early_tests(pr->ctl[st], ctl_key_len(pr->ctl[st]), st));
+                }
+                static uint64_t waits, lost; static double total; double ms = (double)(host_now_ns() - t0) / 1e6;
+                waits++; total += ms; if (!sh) lost++;
+                if (waits <= 10 || waits % 200 == 0 || !sh) LOGV("[shader-wait] %s %s after %.1f ms (%llu waits, %.0f ms in all, %llu not translated)", g_miss_variant, sh ? "ready" : "not translated: its draws are skipped", ms, (unsigned long long)waits, total, (unsigned long long)lost);
+            }
+        }
+        if (pr->nalt[st] == pr->capalt[st]) { pr->capalt[st] = pr->capalt[st] ? 2 * pr->capalt[st] : 2; pr->alt[st] = realloc(pr->alt[st], (size_t)pr->capalt[st] * sizeof *pr->alt[st]); }
+        pr->alt[st][pr->nalt[st]++] = (alt_t){sg, sh, !sh};
+        hit = &pr->alt[st][pr->nalt[st] - 1];
+    }
+    pr->cur[st] = hit->sh; pr->cur_sig[st] = sg; pr->cur_ok[st] = 1;
+    *out_sh = hit->sh;
+    return hit->sh ? 0 : -1;
+}
 int vk_prog_resolve(const prog_t *p, vk_shader *out[6]) {
     memset(out, 0, 6 * sizeof *out);
     if (!vk_shaders_ready()) return -1;
     vk_prog *pr = prog_of(p);
     if (!pr) return -1;
-    uint64_t epoch = vk_shader_xlate_epoch();
-    if (pr->xlate_epoch != epoch) {
-        /* Shader maps and negative program caches are owned here, never by the child/worker.
-           Ready variants remain valid; only misses must resolve again after publication. */
-        for (int st = 0; st < 6; st++) {
-            int n = 0;
-            for (int i = 0; i < pr->nalt[st]; i++) if (!pr->alt[st][i].missing) pr->alt[st][n++] = pr->alt[st][i];
-            pr->nalt[st] = n;
-            if (!pr->cur[st]) pr->cur_ok[st] = 0;
-        }
-        pr->xlate_epoch = epoch;
-    }
+    prog_sync_epoch(pr, vk_shader_xlate_epoch());
     int missing = 0;
-    for (int st = 0; st < 6; st++) {
-        if (!pr->has[st]) continue;
-        uint64_t sg = stage_sig(st);
-        if (pr->cur_ok[st] && pr->cur_sig[st] == sg) { out[st] = pr->cur[st]; if (!out[st]) missing = 1; continue; }
-        alt_t *hit = NULL;
-        for (int i = 0; i < pr->nalt[st]; i++) if (pr->alt[st][i].sig == sg) { hit = &pr->alt[st][i]; break; }
-        if (!hit) {
-            answers_t a; answers_of(st, &a);
-            variant_list *vl = variants_of(pr->key[st]);
-            vk_shader *sh = NULL;
-            for (int i = 0; i < vl->n && !sh; i++) if (deps_match(vl->v[i].deps, &a)) sh = shader_load(vl->v[i].name, vk_nvn_early_tests(pr->ctl[st], ctl_key_len(pr->ctl[st]), st));
-            if (!sh) {
-                request_miss(pr->key[st], st, pr->ctl[st], pr->code[st], &a);
-                /* TOTK_XLATE_WAIT_MS: wait for the on-device service instead of skipping the draw. A skipped draw is
-                   harmless in a scene drawn again every frame, but Breath of the Wild also draws things once and keeps
-                   them (the pause menu's captured background, images its water and lighting read): skipped there, they
-                   stayed black or held another image until the game was restarted with the shader in the seed. */
-                long wait_ms = miss_wait_ms();
-                if (wait_ms > 0 && vk_shader_xlate_available()) {
-                    uint64_t t0 = host_now_ns(), seen = vk_shader_xlate_epoch(); int tried = 0;
-                    while (!sh && (host_now_ns() - t0) / 1000000 < (uint64_t)wait_ms && !vk_shader_xlate_rejected(g_miss_variant) && vk_shader_xlate_available()) {
-                        uint64_t now = vk_shader_xlate_epoch();
-                        if (now == seen && tried) { usleep(500); continue; }
-                        seen = now; tried = 1;
-                        vl = variants_of(pr->key[st]);
-                        for (int i = 0; i < vl->n && !sh; i++) if (deps_match(vl->v[i].deps, &a)) sh = shader_load(vl->v[i].name, vk_nvn_early_tests(pr->ctl[st], ctl_key_len(pr->ctl[st]), st));
-                    }
-                    static uint64_t waits, lost; static double total; double ms = (double)(host_now_ns() - t0) / 1e6;
-                    waits++; total += ms; if (!sh) lost++;
-                    if (waits <= 10 || waits % 200 == 0 || !sh) LOGV("[shader-wait] %s %s after %.1f ms (%llu waits, %.0f ms in all, %llu not translated)", g_miss_variant, sh ? "ready" : "not translated: its draws are skipped", ms, (unsigned long long)waits, total, (unsigned long long)lost);
-                }
-            }
-            if (pr->nalt[st] == pr->capalt[st]) { pr->capalt[st] = pr->capalt[st] ? 2 * pr->capalt[st] : 2; pr->alt[st] = realloc(pr->alt[st], (size_t)pr->capalt[st] * sizeof *pr->alt[st]); }
-            pr->alt[st][pr->nalt[st]++] = (alt_t){sg, sh, !sh};
-            hit = &pr->alt[st][pr->nalt[st] - 1];
-        }
-        pr->cur[st] = hit->sh; pr->cur_sig[st] = sg; pr->cur_ok[st] = 1;
-        out[st] = hit->sh; if (!hit->sh) missing = 1;
-    }
+    for (int st = 0; st < 6; st++) if (prog_resolve_stage(pr, st, &out[st])) missing = 1;
     return missing ? -1 : 0;
+}
+int vk_prog_resolve_compute(const prog_t *p, vk_shader *out[6]) {
+    memset(out, 0, 6 * sizeof *out);
+    if (!vk_shaders_ready()) return -1;
+    vk_prog *pr = prog_of(p);
+    if (!pr || !pr->has[5]) return -1;
+    prog_sync_epoch(pr, vk_shader_xlate_epoch());
+    return prog_resolve_stage(pr, 5, &out[5]);
+}
+int vk_prog_resolve_gfx(const prog_t *const progs[6], vk_shader *out[6]) {
+    memset(out, 0, 6 * sizeof *out);
+    if (!progs || !progs[0] || !vk_shaders_ready()) return -1;
+    uint64_t epoch = vk_shader_xlate_epoch(); int missing = 0;
+    for (int st = 0; st < 5; st++) {
+        if (!progs[st]) continue;
+        vk_prog *pr = prog_of(progs[st]);
+        if (!pr) { missing = 1; continue; }
+        prog_sync_epoch(pr, epoch);
+        if (prog_resolve_stage(pr, st, &out[st])) missing = 1;
+    }
+    return (missing || !out[0]) ? -1 : 0;
+}
+static vk_prog *prog_lookup_ready(const prog_t *p) {
+    if (!p || !p->serial) return NULL;
+    unsigned h = (unsigned)(p->serial % PROGC_N);
+    if (g_progc[h].serial == p->serial) return g_progc[h].pr;
+    pthread_mutex_lock(&g_progs_mu); vk_prog *pr = nvn_hm_get(&g_progs, &p->serial); pthread_mutex_unlock(&g_progs_mu);
+    return pr;
 }
 /* Prediction only borrows an already-resolved variant. It never loads a shader, caches a miss,
    or changes the active program/signature/recorder memo. Programs and shader objects never move or die. */
 int vk_prog_predict(const vk_state *state, vk_shader *out[6]) {
     memset(out, 0, 6 * sizeof *out);
-    const prog_t *p = state->prog; if (!p || !p->serial) return 0;
-    unsigned h = (unsigned)(p->serial % PROGC_N);
-    vk_prog *pr = g_progc[h].serial == p->serial ? g_progc[h].pr : NULL;
-    if (!pr) {
-        pthread_mutex_lock(&g_progs_mu); pr = nvn_hm_get(&g_progs, &p->serial); pthread_mutex_unlock(&g_progs_mu);
-    }
-    if (!pr || !pr->has[0] || pr->has[5]) return 0;
+    if (!state->prog[0] || !state->prog[0]->serial) return 0;
     uint64_t revision = vk_treg_revision();
-    for (int st = 0; st < 2; st++) if (pr->has[st]) {
+    for (int st = 0; st < 5; st++) {
+        vk_prog *pr = prog_lookup_ready(state->prog[st]);
+        if (!state->prog[st]) continue;
+        if (!pr) return 0;
+        if (!pr->has[st]) continue;
+        if (st >= 2) return 0;
         uint64_t sig = stage_sig_for(state, st);
         if (pr->cur_ok[st] && pr->cur_sig[st] == sig) out[st] = pr->cur[st];
         else for (int i = 0; i < pr->nalt[st]; i++) if (pr->alt[st][i].sig == sig) { out[st] = pr->alt[st][i].sh; break; }
         if (!out[st]) return 0;
     }
-    return revision == vk_treg_revision();
+    return out[0] != NULL && revision == vk_treg_revision();
 }
 /* Recorder memo compares the active program's semantic signatures, not invalidation flags or unrelated stages.
    Recomputing a dirty signature can prove an NVN rebind did not change the variant selected by the ordinary resolver.
@@ -908,6 +936,50 @@ int vk_prog_resolve_record(const prog_t *p, vk_shader *out[6]) {
     }
     memcpy(m->shader, out, sizeof m->shader);
     return result;
+}
+static int prog_resolve_stage_record(vk_prog *pr, int st, uint64_t registry, uint64_t epoch, int *any_miss, int *any_refreshed, unsigned *causes, vk_shader **out_sh) {
+    if (!pr->has[st]) return 0;
+    __typeof__(pr->stage_record[0]) *sr = &pr->stage_record[st];
+    int refreshed = !(g_stage_sig_valid & (1u << st)) || g_stage_sig_revision[st] != registry;
+    uint64_t sig = stage_sig_at(st, registry);
+    if (sr->ready && sr->xlate_epoch == epoch && sr->signature == sig) {
+        *any_refreshed |= refreshed || sr->registry != registry;
+        sr->registry = registry;
+        *out_sh = sr->shader;
+        return sr->result;
+    }
+    *any_miss = 1;
+    if (!sr->ready || sr->xlate_epoch != epoch) *causes |= (1u << VK_REC_M_COLD) | (1u << VK_REC_M_PROGRAM);
+    if (sr->ready && sr->signature != sig) *causes |= 1u << VK_REC_M_SIGNATURE;
+    if (sr->ready && sr->registry != registry) *causes |= 1u << VK_REC_M_REGISTRY;
+    prog_sync_epoch(pr, epoch);
+    int r = prog_resolve_stage(pr, st, out_sh);
+    sr->ready = 1; sr->registry = registry; sr->xlate_epoch = epoch; sr->signature = sig; sr->shader = *out_sh; sr->result = r;
+    return r;
+}
+int vk_prog_resolve_gfx_record(const prog_t *const progs[6], vk_shader *out[6]) {
+    if (!progs || !progs[0] || !progs[0]->serial || !vk_shaders_ready()) return vk_prog_resolve_gfx(progs, out);
+    if (progs[1] == progs[0] && (!progs[2] || progs[2] == progs[0]) && (!progs[3] || progs[3] == progs[0]) && (!progs[4] || progs[4] == progs[0])) {
+        int r = vk_prog_resolve_record(progs[0], out);
+        return (r || !out[0]) ? -1 : 0;
+    }
+    memset(out, 0, 6 * sizeof *out);
+    uint64_t registry = vk_treg_revision(), epoch = vk_shader_xlate_epoch();
+    int any_miss = 0, any_refreshed = 0, result = 0; unsigned causes = 0;
+    for (int st = 0; st < 5; st++) {
+        if (!progs[st]) continue;
+        vk_prog *pr = prog_of(progs[st]);
+        if (!pr) return -1;
+        if (prog_resolve_stage_record(pr, st, registry, epoch, &any_miss, &any_refreshed, &causes, &out[st])) result = -1;
+    }
+    if (!any_miss) {
+        if (any_refreshed) vk_record_memo_saved(VK_REC_M_SIGNATURE);
+        g_record_prog_hits++;
+    } else {
+        vk_record_memo_miss(1, causes);
+        g_record_prog_misses++;
+    }
+    return (result || !out[0]) ? -1 : 0;
 }
 void vk_prog_record_cache_take(uint64_t *hits, uint64_t *misses) {
     *hits = g_record_prog_hits; *misses = g_record_prog_misses; g_record_prog_hits = g_record_prog_misses = 0;

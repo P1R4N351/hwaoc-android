@@ -84,7 +84,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, a + 8, 8); mtl_sub_counter(ad, (uint32_t)t); break; }
             case OP_COPY_B2B: { uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, a + 8, 8); memcpy(&n, a + 16, 8); mtl_sub_copy(s, d, n); break; }
             case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, a + 8, 8); memcpy((void *)(uintptr_t)d, a + 16, (size_t)n); break; }
-            case OP_DRAW: case OP_DRAW_IDX: case OP_DISPATCH: g_stat_draw++; break;
+            case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_INDIRECT: case OP_DRAW_IDX_INDIRECT: case OP_DISPATCH: g_stat_draw++; break;
             case OP_COPY_B2T: case OP_COPY_T2B: case OP_COPY_T2T: case OP_CLEAR_TEX: g_stat_skip_copy++; break;
             default: break;   /* state, targets, clears, barriers */
         }

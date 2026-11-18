@@ -1,8 +1,8 @@
-# Hyrule Warriors: Age of Calamity — M0 Inventory & M1 Rewriter Check
+# Hyrule Warriors: Age of Calamity — M0–M6 Android Bring-Up & Verification
 
 [![Support with Bitcoin](https://img.shields.io/badge/Support_with-Bitcoin-F7931A?style=for-the-badge&logo=bitcoin&logoColor=white)](#support)
 
-Status: M0 dump/binary inventory and M1 Android rewriter verification (`DM_HOST_TP=tpidr_el0`) complete on the owner's `v0` + `v327680` (`1.3.0`) dumps (`subsdk0`, `sdk`, `main` all pass `patch_nso.py`, `structck.py`, and `equiv.py`; merged BKTR `romfs.bin` + `runtime-index.bin` verified).
+Status: **M0–M6 verified** on `1.3.0` (`v327680`): all three modules (`subsdk0`, `sdk`, `main`) pass `patch_nso.py`, `structck.py`, and `equiv.py`; Vulkan graphics verified through VP9 cutscenes and 3D battle rendering (`Pass 3b` to frame `1702`, `0` unimplemented NVN symbols) with separable `nvnCommandBufferBindProgram`, `nvnCommandBufferSetCopyImageStride`, `nvnTexturePoolRegisterImage`, and `nvnCommandBufferDrawArraysIndirect` (`QUADS` compute rewrite); `53` canonical `V` rows harvested into [`assets/shader_list.tsv`](assets/shader_list.tsv) (`0` warm misses); flat `1 MiB` `svdt` save management wired (`SaveManager.FLAT_SAVE`); and `AoC Native` (`0.1.0-pre.1` / `0.1.0-dev`) APK packaging configured via [`tools/build_app.sh`](../../tools/build_app.sh).
 
 ---
 

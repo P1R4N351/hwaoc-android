@@ -22,8 +22,8 @@ opening, the Great Plateau and the menus. Setup on the device is not ported yet:
 (see [Install and first setup](#install-and-first-setup)).
 
 The same code base also builds **TotK Native (fork)**, the Tears of the Kingdom app with this fork's additions
-([docs/totk-native.md](docs/totk-native.md)), and **AoC Native** for *Hyrule Warriors: Age of Calamity* 1.3.0
-([P1R4N351/hwaoc-android](https://github.com/P1R4N351/hwaoc-android), [games/hwaoc/README.md](games/hwaoc/README.md)).
+([docs/totk-native.md](docs/totk-native.md)), and **AoC Native** (`io.github.p1r4n351.hwaoc`, `0.1.0-pre.1`) for *Hyrule Warriors: Age of Calamity* 1.3.0
+([P1R4N351/hwaoc-android](https://github.com/P1R4N351/hwaoc-android), [games/hwaoc/README.md](games/hwaoc/README.md), [ANDROID.md](games/hwaoc/ANDROID.md)).
 
 - [Nintendo, if you're reading this](#nintendo-if-youre-reading-this)
 - [Features](#features)

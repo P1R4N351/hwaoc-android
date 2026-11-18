@@ -2980,7 +2980,10 @@ void vk_fg_replay_draw(VkCommandBuffer cb, const vk_record_draw *d, const VkDesc
     }
     if (d->index) {
         vkCmdBindIndexBuffer(cb,d->index,d->index_offset,d->index_type);
-        vkCmdDrawIndexed(cb,d->count,d->instances,d->first,d->vertex_offset,d->base_instance);
+        if (d->indirect) vkCmdDrawIndexedIndirect(cb,d->indirect,d->indirect_offset,1,20);
+        else vkCmdDrawIndexed(cb,d->count,d->instances,d->first,d->vertex_offset,d->base_instance);
+    } else if (d->indirect) {
+        vkCmdDrawIndirect(cb,d->indirect,d->indirect_offset,1,16);
     } else vkCmdDraw(cb,d->count,d->instances,d->first,d->base_instance);
 }
 void vk_fg_adaptive_terminal(const vk_record_draw *draw, const VkDescriptorSet sets[2],

@@ -18,7 +18,7 @@ Generated from `games/games.toml` (`python3 tools/games.py table`; the test chec
 | `title` | The game's name in the menu and About | `Tears of the Kingdom` | `Breath of the Wild` | `Hyrule Warriors: Age of Calamity` |
 | `version_label` | The game version the app runs, as shown (Home chip, About, setup details) | `1.4.3` | `1.6.0` | `1.3.0` |
 | `title_id` | The game's title id (saves export/import in SaveManager; android/Makefile hands it to duo/CMakeLists.txt as DUO_TITLE, which picks the title module; the runtime's own copies are under [branches]: fs_host.c, services.c, duo_port.c) | `0100F2C0115B6000` | `01007EF00011E000` | `01002B00111A2000` |
-| `save_slots` | The game's save layout under the save root (SaveManager: the slot list, import detection, export and backups): dir = a slot folder's name (regex, group 1 = the slot number), file = the file that makes the folder a slot, picture = the slot's picture (a JPEG, or a file with one inside), names = how the menu's texts name the slot folders. option.sav at the save root is common | `{"dir": "slot_(\\d\\d)", "file": "progress.sav", "picture": "caption.sav", "names": "slot_00 … slot_05"}` | `{"dir": "(\\d)", "file": "game_data.sav", "picture": "caption.jpg", "names": "0 … 5"}` | `{"dir": "(\\d)", "file": "save.dat", "picture": "caption.jpg", "names": "0 … 5"}` |
+| `save_slots` | The game's save layout under the save root (SaveManager: the slot list, import detection, export and backups): dir = a slot folder's name (regex, group 1 = the slot number), file = the file that makes the folder a slot, picture = the slot's picture (a JPEG, or a file with one inside), names = how the menu's texts name the slot folders. option.sav at the save root is common | `{"dir": "slot_(\\d\\d)", "file": "progress.sav", "picture": "caption.sav", "names": "slot_00 … slot_05"}` | `{"dir": "(\\d)", "file": "game_data.sav", "picture": "caption.jpg", "names": "0 … 5"}` | `{"dir": "", "file": "svdt", "picture": "", "names": "svdt"}` |
 | `main_build_id` | Build id of the supported main (mods: exefs/<build id>.ips is applied only when it names this main; the runtime reads it from main itself, this is for docs and mod authors). TotK's 1.4.3 files are pinned by sha256 instead | `pinned by games/totk/assets/expected-v1.4.3.json` | `8E9978D50BDD20B4C8395A106C27FFDE` | `C3CF52BF2B05D7310884971B50BCCCB8` |
 | `romfs_size` | Size of the merged RomFS image extracted/<tag>/romfs/romfs.bin (InstallState's install check) | `17052625232` | `15131979952` | `11719230892` |
 | `ondevice_setup` | Whether the app's own setup can import this game from a dump (false: the game folder is filled by hand, BOTW.md) | `true` | `false` | `false` |
@@ -88,6 +88,8 @@ python3 games/totk/android/build_release.py --game <game> --flavour <flavour> --
 | TotK Native (dev), debuggable, installs beside the fork | `build-app.sh totk dev` | `/dev/shm/app-totk-dev/...` |
 | BotW Native, pre-release | `build-app.sh botw release` | `/dev/shm/app-botw-release/BotW-Native-<version>.apk` |
 | BotW Native, debuggable | `build-app.sh botw dev` | `/dev/shm/app-botw-dev/...` |
+| AoC Native, pre-release | `build-app.sh hwaoc release` | `/dev/shm/app-hwaoc-release/AoC-Native-<version>.apk` |
+| AoC Native, debuggable | `build-app.sh hwaoc dev` | `/dev/shm/app-hwaoc-dev/...` |
 
 The keys stay in `/root/totk-work/keys` (`TOTK_KEYS_DIR`) on the build machine and never enter git; a release flavour
 refuses to build without its key, and a signing key is never changed (users would have to reinstall and lose data).

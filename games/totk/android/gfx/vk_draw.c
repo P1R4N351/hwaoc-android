@@ -145,6 +145,14 @@ static struct {
     int feedback_on, feedback_unknown, feedback_armed, feedback_restore;
 } R;
 static VkPipeline g_bound_pipe; static int g_dyn_dirty = 1;
+enum { MAX_INDIRECT_QUADS = 262144 };
+static struct {
+    int on, indexed, quad_ib;
+    uint32_t itype;
+    uint64_t ibuf;
+    VkBuffer cmd_buf;
+    VkDeviceSize cmd_off;
+} g_indirect;
 static vk_record_draw *g_record_draw;  /* walking-only packet under construction, NULL on original path */
 static int g_native_draw_1x;
 static vk_tex *g_native_sample;                 /* only the verified terminal normalized transfer */
@@ -1224,7 +1232,7 @@ static uint32_t store_clear_mask(void) {
                     if (b->stage < 2) memcpy(&slots[b->stage][base + b->first], b->h, (size_t)b->n * 8);
                     break;
                 }
-                case OP_DRAW: case OP_DRAW_IDX: {
+                case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_INDIRECT: case OP_DRAW_IDX_INDIRECT: {
                     uint32_t need = 0;
                     for (int k = 0; k < 9; k++) {
                         uint32_t bit = k < 8 ? 1u << k : 3u << 8; if (!(live & ~mask & bit)) continue;
@@ -1254,7 +1262,7 @@ static uint32_t store_clear_mask(void) {
                 case OP_BEGIN: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE:
                 case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO:
                 case OP_BIND_SAMP: case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_DEPTH_CLAMP:
-                case OP_RASTER_DISCARD: case OP_COPY_STRIDE: case OP_BARRIER: break;
+                case OP_RASTER_DISCARD: case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE: case OP_BARRIER: break;
                 default: goto scanned;
             }
             p += h.size;
@@ -1382,7 +1390,7 @@ static int g_load_override;
 static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLayout layout);
 static uint32_t load_coverage_mask(void) {
     vk_shader *vs = g_load_sh ? g_load_sh[0] : NULL, *fs = g_load_sh ? g_load_sh[1] : NULL;
-    if (!vs || !fs || !vs->load_position_attr || !fs->load_full_outputs ||
+    if (g_indirect.on || !vs || !fs || !vs->load_position_attr || !fs->load_full_outputs ||
         vs->has_storage_writes || fs->has_storage_writes || S.ds.dt || S.ds.st ||
         S.color.blend_en || S.color.logic_op != NVN_LOGIC_OP_COPY || (S.ms.a2c & 1) ||
         S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS || S.poly.mode != NVN_POLYGON_MODE_FILL ||
@@ -1399,6 +1407,7 @@ static uint32_t load_coverage_mask(void) {
     unsigned vertex_bytes = format == VK_FORMAT_R32G32_SFLOAT ? 8 : 4;
     unsigned stream = S.attr[attr].stream;
     if (stream >= 16 || S.stream[stream].divisor) return 0;
+    if (!g_load_draw && !g_load_indexed) return 0;
     int prim = g_load_draw ? g_load_draw->prim : g_load_indexed->prim;
     unsigned count = g_load_draw ? g_load_draw->count : g_load_indexed->count;
     if (prim != 4 || (count != 3 && count != 6)) return 0; /* triangle list only */
@@ -4171,6 +4180,16 @@ static int compile_threads(void) {
     }
     return n;
 }
+static int bind_stage_programs(const prog_t *dst[6], const p_bind_program *b) {
+    uint32_t mask = (uint32_t)b->stages & 0x3fu;
+    int gfx_changed = 0;
+    for (int st = 0; st < 6; st++) {
+        if (!((mask >> st) & 1u)) continue;
+        if (st < 5 && dst[st] != b->prog) gfx_changed = 1;
+        dst[st] = b->prog;
+    }
+    return gfx_changed;
+}
 /* A Vulkan pass already has exact attachment formats. Predict only within that target set:
    crossing an attachment change would require speculative resource/view realization. Calls, jumps,
    conditions, transfers, updates and registry changes are boundaries, never executed by this scan.
@@ -4213,7 +4232,7 @@ static void pipe_predict_maybe(const uint8_t *next) {
         ops++;
 #define PP_NEED(type) do { if (h.size < sizeof h + sizeof(type)) goto predicted_done; } while (0)
         switch (h.op) {
-            case OP_BIND_PROGRAM: PP_NEED(p_bind_program); predicted.prog = ((const p_bind_program *)a)->prog; break;
+            case OP_BIND_PROGRAM: PP_NEED(p_bind_program); (void)bind_stage_programs(predicted.prog, a); break;
             case OP_BIND_STATE: {
                 PP_NEED(p_bind_state); const p_bind_state *b = a; blend_st bs;
                 switch (b->kind) {
@@ -4257,11 +4276,13 @@ static void pipe_predict_maybe(const uint8_t *next) {
                 PP_NEED(p_set_rt);
                 if (!rt_same(&predicted.rt, a)) goto predicted_done;
                 break;
-            case OP_DRAW: case OP_DRAW_IDX: {
+            case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_INDIRECT: case OP_DRAW_IDX_INDIRECT: {
                 int prim, count;
                 if (h.op == OP_DRAW) { PP_NEED(p_draw); prim = ((const p_draw *)a)->prim; count = ((const p_draw *)a)->count; }
-                else { PP_NEED(p_draw_idx); prim = ((const p_draw_idx *)a)->prim; count = ((const p_draw_idx *)a)->count; }
-                if (!count || prim < 0 || prim == 2 || prim >= 8 || (h.op == OP_DRAW_IDX && prim == 7) ||
+                else if (h.op == OP_DRAW_IDX) { PP_NEED(p_draw_idx); prim = ((const p_draw_idx *)a)->prim; count = ((const p_draw_idx *)a)->count; }
+                else if (h.op == OP_DRAW_INDIRECT) { PP_NEED(p_draw_indirect); prim = ((const p_draw_indirect *)a)->prim; count = 1; }
+                else { PP_NEED(p_draw_idx_indirect); prim = ((const p_draw_idx_indirect *)a)->prim; count = 1; }
+                if (!count || prim < 0 || prim == 2 || prim >= 8 || ((h.op == OP_DRAW_IDX || h.op == OP_DRAW_IDX_INDIRECT) && prim == 7) ||
                     predicted.render_disabled || predicted.raster_discard || predicted.poly.cull == NVN_FACE_FRONT_AND_BACK) break;
                 /* Prediction never loads modules. Alpha variants are demand-created;
                  * do not speculate the base module's (wrong) pipeline for this draw. */
@@ -4278,7 +4299,7 @@ static void pipe_predict_maybe(const uint8_t *next) {
             }
             case OP_BEGIN: case OP_CLEAR_COLOR: case OP_CLEAR_DS: case OP_SCISSOR: case OP_VIEWPORTS:
             case OP_DEPTH_RANGE: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO: case OP_BIND_SAMP:
-            case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
+            case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE:
                 break;   /* these do not select Vulkan shader variants or fixed pipeline state */
             default: goto predicted_done;
         }
@@ -5144,6 +5165,65 @@ static void quad_indices(uint32_t quads) {
     vkUnmapMemory(V.dev, a.mem);
     g_quad_ib = b; g_quad_max = n;   /* the old buffer (if any) is left alive: it may be in flight */
 }
+#include "vk_quad_indirect_spv.h"
+static VkDescriptorSetLayout g_qi_dsl;
+static VkPipelineLayout g_qi_layout;
+static VkShaderModule g_qi_mod;
+static VkPipeline g_qi_pipe;
+static VkPipeline quad_indirect_pipeline(void) {
+    if (g_qi_pipe) return g_qi_pipe;
+    if (!g_qi_dsl) {
+        VkDescriptorSetLayoutBinding b = {.binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                          .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT};
+        VkDescriptorSetLayoutCreateInfo dci = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
+        if (vkCreateDescriptorSetLayout(V.dev, &dci, NULL, &g_qi_dsl)) return VK_NULL_HANDLE;
+    }
+    if (!g_qi_layout) {
+        VkPushConstantRange pc = {.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .size = 4};
+        VkPipelineLayoutCreateInfo lci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
+                                          .pSetLayouts = &g_qi_dsl, .pushConstantRangeCount = 1, .pPushConstantRanges = &pc};
+        if (vkCreatePipelineLayout(V.dev, &lci, NULL, &g_qi_layout)) return VK_NULL_HANDLE;
+    }
+    if (!g_qi_mod) {
+        VkShaderModuleCreateInfo sm = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = sizeof quad_indirect_spv, .pCode = quad_indirect_spv};
+        if (vkCreateShaderModule(V.dev, &sm, NULL, &g_qi_mod)) return VK_NULL_HANDLE;
+    }
+    VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
+        .stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_COMPUTE_BIT, .module = g_qi_mod, .pName = "main"},
+        .layout = g_qi_layout};
+    if (vk_pcache_compute(&ci, &g_qi_pipe)) { g_qi_pipe = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
+    return g_qi_pipe;
+}
+static int quad_indirect_convert(VkBuffer ind_buf, VkDeviceSize ind_off, VkBuffer *out_buf, VkDeviceSize *out_off) {
+    VkPipeline pipe = quad_indirect_pipeline();
+    if (!pipe) return 0;
+    VkDeviceSize align = V.props.limits.minStorageBufferOffsetAlignment;
+    if (align < 64) align = 64;
+    VkBuffer sb; VkDeviceSize so;
+    void *zero = vk_transient(48, (size_t)align, &sb, &so);
+    memset(zero, 0, 48);
+    vk_end_rendering_at(VK_PASS_END_COMPUTE, 0);
+    VkCommandBuffer cb = vk_cb();
+    vk_barrier_all(cb);
+    VkBufferCopy cp = {ind_off, so, 16};
+    vkCmdCopyBuffer(cb, ind_buf, sb, 1, &cp);
+    vk_barrier_all(cb);
+    VkDescriptorSet set = vk_alloc_set(g_qi_dsl);
+    VkDescriptorBufferInfo bi = {sb, so, 48};
+    VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
+                              .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bi};
+    vkUpdateDescriptorSets(V.dev, 1, &w, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_qi_layout, 0, 1, &set, 0, NULL);
+    uint32_t max_quads = MAX_INDIRECT_QUADS;
+    vkCmdPushConstants(cb, g_qi_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof max_quads, &max_quads);
+    vkCmdDispatch(cb, 1, 1, 1);
+    vk_barrier_all(cb);
+    g_bound_pipe = VK_NULL_HANDLE;
+    memset(g_bound_set[1], 0, sizeof g_bound_set[1]);
+    *out_buf = sb; *out_off = so + 32;
+    return 1;
+}
 static void dynamic_state(VkCommandBuffer cb, int prim) {
     /* everything the draw sets dynamically, compared with what this command buffer last set (unchanged: nothing issued) */
     vk_record_dynamic D;
@@ -5502,6 +5582,22 @@ static int record_buffer_resolve(const vk_record_spans *spans, uint64_t address,
     return 1;
 }
 /* Command-call blocks are separate from CPU setup; D remains included, not separately timed. */
+static int record_indirect_buffers(vk_record_draw *d) {
+    d->count = 0; d->instances = 1; d->base_instance = 0; d->first = 0;
+    d->indirect = g_indirect.cmd_buf; d->indirect_offset = g_indirect.cmd_off;
+    if (g_indirect.quad_ib) {
+        d->index = g_quad_ib; d->index_type = VK_INDEX_TYPE_UINT32; d->vertex_offset = 0;
+        return 1;
+    }
+    if (!g_indirect.indexed) return 1;
+    if (g_indirect.itype == 0 && !V.has_index_u8) { RED(4, "indirect indexed u8 without VK_EXT_index_type_uint8"); return 0; }
+    uint32_t stride = g_indirect.itype == 0 ? 1 : g_indirect.itype == 1 ? 2 : 4;
+    VkBuffer buffer; uint64_t offset;
+    if (!record_buffer_resolve(d->spans, g_indirect.ibuf, stride, 1, &buffer, &offset, NULL)) { g_stat_skips[8]++; return 0; }
+    d->index_type = g_indirect.itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : g_indirect.itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+    d->index = buffer; d->index_offset = offset; d->vertex_offset = 0;
+    return 1;
+}
 static int record_buffers(vk_shader *sh, const p_draw *dw, const p_draw_idx *di, int prim, uint32_t count, uint32_t instances, uint32_t base_instance) {
     vk_record_draw *d = g_record_draw;
     for (int a = 0; a < 16; a++) if ((sh->vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) d->vertex_mask |= 1u << (S.attr[a].stream & 15);
@@ -5531,6 +5627,7 @@ static int record_buffers(vk_shader *sh, const p_draw *dw, const p_draw_idx *di,
         d->vertex_mask |= 1u << ZERO_BINDING; d->vertex[ZERO_BINDING].address = 0; d->vertex[ZERO_BINDING].size = 64; d->vertex[ZERO_BINDING].stride = 0;
         d->vertex[ZERO_BINDING].buffer = VK_NULL_HANDLE; d->vertex[ZERO_BINDING].offset = 0; d->vertex[ZERO_BINDING].lag_reason = 0;
     }
+    if (g_indirect.on) return record_indirect_buffers(d);
     d->count = count; d->instances = instances; d->base_instance = base_instance;
     if (dw && prim == 7) {
         if (count < 4) d->count = 0;
@@ -5591,6 +5688,32 @@ static int fg_terminal_geometry_read(unsigned role,unsigned stream,uint64_t addr
     } else *out=source;
     return 1;
 }
+static int draw_indirect_buffers(VkCommandBuffer cb) {
+    if (g_indirect.quad_ib) {
+        VK_REC_DO(VK_REC_CMD,
+            vkCmdBindIndexBuffer(cb, g_quad_ib, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdDrawIndexedIndirect(cb, g_indirect.cmd_buf, g_indirect.cmd_off, 1, 20));
+        totk_ft_count(FT_COUNT_DRAWS, 1);
+        return 1;
+    }
+    if (!g_indirect.indexed) {
+        VK_REC_DO(VK_REC_CMD, vkCmdDrawIndirect(cb, g_indirect.cmd_buf, g_indirect.cmd_off, 1, 16));
+        totk_ft_count(FT_COUNT_DRAWS, 1);
+        return 1;
+    }
+    if (g_indirect.itype == 0 && !V.has_index_u8) { RED(4, "indirect indexed u8 without VK_EXT_index_type_uint8"); g_stat_skips[8]++; return 0; }
+    VkBuffer ib; uint64_t io; uint32_t isz = g_indirect.itype == 0 ? 1 : g_indirect.itype == 1 ? 2 : 4;
+    if (!vk_resolve_for(g_indirect.ibuf, isz, &ib, &io, NULL, VK_LOOKUP_VERTEX)) {
+        RED(4, "indirect index buffer %#llx not in a memory pool", (unsigned long long)g_indirect.ibuf);
+        g_stat_skips[8]++; return 0;
+    }
+    VkIndexType it = g_indirect.itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : g_indirect.itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+    VK_REC_DO(VK_REC_CMD,
+        vkCmdBindIndexBuffer(cb, ib, io, it);
+        vkCmdDrawIndexedIndirect(cb, g_indirect.cmd_buf, g_indirect.cmd_off, 1, 20));
+    totk_ft_count(FT_COUNT_DRAWS, 1);
+    return 1;
+}
 static inline __attribute__((always_inline)) int draw_buffers(VkCommandBuffer cb, vk_shader *sh, const p_draw *dw, const p_draw_idx *di, int prim, uint32_t count, uint32_t inst, uint32_t base_inst) {
     if (g_record_draw) return record_buffers(sh, dw, di, prim, count, inst, base_inst);
     VkBuffer vb[17]; VkDeviceSize vo[17], vsz[17], vst[17]; uint32_t used = 0;
@@ -5643,6 +5766,7 @@ static inline __attribute__((always_inline)) int draw_buffers(VkCommandBuffer cb
         }
     }
     VK_REC_DO(VK_REC_S, vk_occlusion_draw(cb)); pd_pre_draw(cb);
+    if (g_indirect.on) return draw_indirect_buffers(cb);
     if (dw && prim == 7) {
         if (count >= 4) {
             quad_indices(count / 4);
@@ -5769,7 +5893,7 @@ static void split_pass_check(vk_shader *const sh[6], int canvas_transfer) {
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     g_load_override = 0;
     int prim = dw ? dw->prim : di->prim;
-    if (!S.prog) { g_stat_skips[0]++; return; }
+    if (!S.prog[0]) { g_stat_skips[0]++; return; }
     if (S.render_disabled || S.raster_discard) { g_stat_skips[1]++; pd_draw_note("      draw skipped: %s", S.render_disabled ? "conditional rendering off" : "rasterizer discard"); return; }
     if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) { g_stat_skips[2]++; pd_draw_note("      draw skipped: cull front and back"); return; }
     if (prim == 2 || prim >= 8) { RED(4, "primitive type %d not drawn", prim); g_stat_skips[3]++; return; }
@@ -5780,7 +5904,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         if (!totk_live_cached(&g_alpha_live,"TOTK_VK_ALPHA_TEST",g_alpha_launch)) g_alpha_ignored++;
     }
     vk_shader *sh[6];
-    if (VK_REC_VALUE(VK_REC_PROG, vk_record_enabled() ? vk_prog_resolve_record(S.prog, sh) : vk_prog_resolve(S.prog, sh)) || !sh[0]) { g_stat_skips[4]++; return; }
+    if (VK_REC_VALUE(VK_REC_PROG, vk_record_enabled() ? vk_prog_resolve_gfx_record(S.prog, sh) : vk_prog_resolve_gfx(S.prog, sh)) || !sh[0]) { g_stat_skips[4]++; return; }
     if (sh[1] && S.color.alpha_func && S.color.alpha_func!=NVN_ALPHA_FUNC_ALWAYS &&
         totk_live_cached(&g_alpha_live,"TOTK_VK_ALPHA_TEST",g_alpha_launch)) {
         sh[1]=vk_shader_alpha(sh[1],S.color.alpha_func);
@@ -5844,6 +5968,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         if (fg_extract_canvas(R.ctex[0],R.clevel[0],R.clayer[0]) && vk_canvas_ui_shader(sh[0]->key,1)) FGX.draw_kind = 1;
         else if (canvas_transfer || (sh[1] && vk_canvas_transfer_shader(sh[1]->key) && vk_tex_canvas_window(R.ctex[0])))
             FGX.draw_kind = 2;
+        if (g_indirect.on) FGX.draw_kind = 0;
         if (FGX.draw_kind && vk_fg_canvas_view()) {
             if (R.ncolor != 1 || R.samples != VK_SAMPLE_COUNT_1_BIT ||
                 (FGX.draw_kind == 1 && !fg_extract_ui_depth(R.dtex,R.dlevel,R.dlayer)) ||
@@ -5899,7 +6024,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     { static const char *vt = (const char *)1; if (vt == (const char *)1) vt = getenv("TOTK_VK_PASS_DUMP_VSTEX");
       g_pd_cap = PD.active && !g_pd_vstex_done && vt && *vt && !strncmp(sh[0]->key, vt, strlen(vt)); }
     g_ui_aspect_on = 0;
-    if (vk_canvas_on && sh[0]->canvas_ui && count == 6 && R.ncolor && R.ctex[0]) {   /* vk_ui_aspect.h: a HUD quad */
+    if (vk_canvas_on && !g_indirect.on && sh[0]->canvas_ui && count == 6 && R.ncolor && R.ctex[0]) {   /* vk_ui_aspect.h: a HUD quad */
         float shown = pres_shown_aspect();
         if (shown > 0) {
             vk_canvas_image target = vk_tex_canvas_identity(R.ctex[0], R.clevel[0], R.clayer[0]);
@@ -5988,11 +6113,60 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (vk_fg_extract_active) FGX.record = NULL;
     g_record_draw = NULL;
 }
+static void draw_indirect(const p_draw_indirect *iw, const p_draw_idx_indirect *ii) {
+    uint64_t ind_addr = iw ? iw->buf : ii->buf;
+    uint64_t ind_sz = iw ? 16 : 20;
+    int prim = iw ? iw->prim : ii->prim;
+    if (!vk_gpu_write_pending(ind_addr, ind_sz)) {
+        uint32_t cmd[5] = {0};
+        vk_ub_read(ind_addr, cmd, (size_t)ind_sz);
+        if (!cmd[0] || !cmd[1]) return;
+        if (iw) {
+            p_draw d = {prim, (int32_t)cmd[2], (int32_t)cmd[0], (int32_t)cmd[3], (int32_t)cmd[1]};
+            draw(&d, NULL);
+        } else {
+            if (ii->itype < 0 || ii->itype > 2) { RED(4, "indirect invalid index type %d", ii->itype); return; }
+            uint32_t isz = ii->itype == 0 ? 1 : ii->itype == 1 ? 2 : 4;
+            p_draw_idx d = {prim, ii->itype, (int32_t)cmd[0], (int32_t)cmd[3], (int32_t)cmd[4],
+                            (int32_t)cmd[1], ii->ibuf + (uint64_t)cmd[2] * isz};
+            draw(NULL, &d);
+        }
+        return;
+    }
+    if (!S.prog[0] || S.render_disabled || S.raster_discard || S.poly.cull == NVN_FACE_FRONT_AND_BACK) {
+        if (!S.prog[0]) g_stat_skips[0]++; else if (S.poly.cull == NVN_FACE_FRONT_AND_BACK) g_stat_skips[2]++; else g_stat_skips[1]++;
+        return;
+    }
+    if (prim < 0 || prim == 2 || prim >= 8 || (ii && prim == 7)) { RED(4, "indirect primitive type %d not drawn", prim); g_stat_skips[3]++; return; }
+    if (ii && (ii->itype < 0 || ii->itype > 2)) { RED(4, "indirect invalid index type %d", ii->itype); return; }
+    vk_ub_touch(ind_addr, ind_sz);
+    if (ii) {
+        VkBuffer ib_tmp; uint64_t io_tmp, avail = 0;
+        if (vk_resolve_for(ii->ibuf, 1, &ib_tmp, &io_tmp, &avail, VK_LOOKUP_VERTEX) && avail) vk_ub_touch(ii->ibuf, avail);
+    }
+    VkBuffer ind_buf; uint64_t ind_off;
+    if (!vk_resolve_for(ind_addr, ind_sz, &ind_buf, &ind_off, NULL, VK_LOOKUP_VERTEX)) {
+        RED(4, "indirect buffer %#llx not in a memory pool", (unsigned long long)ind_addr);
+        g_stat_skips[8]++; return;
+    }
+    VkBuffer cmd_buf = ind_buf; VkDeviceSize cmd_off = ind_off;
+    if (iw && prim == 7) {
+        quad_indices(MAX_INDIRECT_QUADS);
+        if (!quad_indirect_convert(ind_buf, ind_off, &cmd_buf, &cmd_off)) return;
+    }
+    memset(&g_indirect, 0, sizeof g_indirect);
+    g_indirect.on = 1; g_indirect.indexed = ii != NULL; g_indirect.quad_ib = iw && prim == 7;
+    g_indirect.itype = ii ? (uint32_t)ii->itype : 0; g_indirect.ibuf = ii ? ii->ibuf : 0;
+    g_indirect.cmd_buf = cmd_buf; g_indirect.cmd_off = cmd_off;
+    p_draw synth = {prim == 7 ? 4 : prim, 0, 4, 0, 1};
+    draw(&synth, NULL);
+    g_indirect.on = 0;
+}
 static void dispatch(const p_dispatch *dp) {
     if (!vk_lag_uniform_private()) vk_ub_flush();   /* private UBOs materialize only for actual non-UBO consumers */
-    if (!S.prog) return;
+    if (!S.prog[5]) return;
     vk_shader *sh[6];
-    if (vk_prog_resolve(S.prog, sh) || !sh[5]) { g_stat_skips[9]++; return; }
+    if (vk_prog_resolve_compute(S.prog[5], sh) || !sh[5]) { g_stat_skips[9]++; return; }
     VkPipelineLayout layout; VkPipeline p = vk_compute_pipeline(sh[5], &layout);
     if (!p) return;
     if (vk_lag_capture_on()) { storage_touch(5, sh[5], 1); storage_touch(5, sh[5], 0); }
@@ -6038,27 +6212,32 @@ static void texcopy_region(const char *op, const char *side, const tex_t *t, con
         vlevel(v, has), vlayer(v, has), r->xoffset, r->yoffset, r->zoffset, r->width, r->height, r->depth);
 }
 static int texcopy_buffer_attempt(const p_copy_b2t *c, const char *op, int upload) {
-    size_t bytes = (size_t)totk_texcopy_buffer_size(c->tex, &c->r, S.copy_stride, 0);
+    size_t bytes = (size_t)totk_texcopy_buffer_size(c->tex, &c->r, S.copy_stride, S.copy_image_stride);
     int texture_match = totk_texcopy_match(c->tex);
     totk_texcopy_track(c->tex);
     tex_t overlap;
     int buffer_match = totk_texcopy_overlap(c->src, bytes ? bytes : 1, &overlap);
     if (!texture_match && !buffer_match) return 0;
     totk_texcopy_log(vk_submit_serial(),
-        "phase=replay op=%s result=attempt texture_side=%s serial=%llu buffer_side=%s buffer=%#llx bytes=%zu bytes_known=%d copy_stride=%lld flags=%#x match_texture=%d match_buffer=%d",
+        "phase=replay op=%s result=attempt texture_side=%s serial=%llu buffer_side=%s buffer=%#llx bytes=%zu bytes_known=%d copy_stride=%lld copy_image_stride=%lld flags=%#x match_texture=%d match_buffer=%d",
         op, upload ? "dst" : "src", (unsigned long long)c->tex->serial, upload ? "src" : "dst",
-        (unsigned long long)c->src, bytes, bytes != 0, (long long)S.copy_stride, c->flags, texture_match, buffer_match);
+        (unsigned long long)c->src, bytes, bytes != 0, (long long)S.copy_stride, (long long)S.copy_image_stride, c->flags, texture_match, buffer_match);
     texcopy_region(op, upload ? "dst" : "src", c->tex, &c->view, c->has_view, &c->r);
     if (buffer_match) totk_texcopy_log(vk_submit_serial(),
         "phase=replay op=%s buffer_side=%s overlap_serial=%llu overlap_mem=%p overlap_size=%zu",
         op, upload ? "src" : "dst", (unsigned long long)overlap.serial, overlap.mem, (size_t)overlap.L.size);
     return 1;
 }
-static void texcopy_buffer_resolved(const char *op, const char *side, const p_copy_b2t *c, VkBuffer b, uint64_t o, size_t row, size_t rows, size_t img, int nz) {
+typedef struct {
+    unsigned level, layer0;
+    int bw, bh, bpb, nz, is3d;
+    size_t row, rows, img, span;
+} texcopy_layout;
+static void texcopy_buffer_resolved(const char *op, const char *side, const p_copy_b2t *c, VkBuffer b, uint64_t o, const texcopy_layout *L) {
     totk_texcopy_log(vk_submit_serial(),
         "phase=replay op=%s buffer_side=%s buffer=%#llx bytes=%zu vk_buffer=%#llx offset=%#llx row=%zu rows=%zu image_stride=%zu depth=%d",
-        op, side, (unsigned long long)c->src, img * nz, (unsigned long long)(uintptr_t)b,
-        (unsigned long long)o, row, rows, img, nz);
+        op, side, (unsigned long long)c->src, L->span, (unsigned long long)(uintptr_t)b,
+        (unsigned long long)o, L->row, L->rows, L->img, L->nz);
 }
 static void texcopy_guest_source(const p_copy_b2t *c, size_t row, size_t img) {
     static unsigned samples;
@@ -6080,7 +6259,71 @@ static void texcopy_guest_source(const p_copy_b2t *c, size_t row, size_t img) {
         s.valid ? "sampled" : "invalid", (unsigned long long)c->src, bytes, s.bytes, s.nonzero, s.bytes - s.nonzero,
         s.rg, s.min[0], s.max[0], s.min[1], s.max[1]);
 }
-static void copy_b2t(const p_copy_b2t *c) {   /* buffer -> texture (row stride from SetCopyRowStride, 0 = packed) */
+static int texcopy_prepare(const p_copy_b2t *c, vk_tex *x, const char *op, int trace, texcopy_layout *out) {
+    if (c->r.width <= 0 || c->r.height <= 0 || c->r.depth < 0 || c->r.depth > 16384) return 0;
+    int bw = 0, bh = 0, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
+    if (!bpb || bw <= 0 || bh <= 0) {
+        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=%s result=skip reason=unsupported-format", op);
+        return 0;
+    }
+    int nz = c->r.depth ? c->r.depth : 1;
+    size_t min_row = ((size_t)c->r.width + (size_t)bw - 1) / (size_t)bw * (size_t)bpb;
+    if (S.copy_stride < 0 || S.copy_image_stride < 0 || (S.copy_stride > 0 && (size_t)S.copy_stride < min_row)) {
+        RED(4, "%s: invalid copy stride row=%lld image=%lld", op, (long long)S.copy_stride, (long long)S.copy_image_stride);
+        return 0;
+    }
+    size_t row = S.copy_stride ? (size_t)S.copy_stride : min_row;
+    size_t rows = ((size_t)c->r.height + (size_t)bh - 1) / (size_t)bh;
+    if (!rows || row > SIZE_MAX / rows) { RED(4, "%s: copy slice overflow", op); return 0; }
+    size_t slice = row * rows, img = S.copy_image_stride ? (size_t)S.copy_image_stride : slice;
+    if (nz > 1 && (img < slice || img > (SIZE_MAX - slice) / (size_t)(nz - 1))) {
+        RED(4, "%s: invalid copy image stride %zu (slice %zu depth %d)", op, img, slice, nz);
+        return 0;
+    }
+    *out = (texcopy_layout){
+        .level = vlevel(&c->view, c->has_view), .layer0 = vlayer(&c->view, c->has_view),
+        .bw = bw, .bh = bh, .bpb = bpb, .nz = nz, .is3d = vk_tex_is3d(x),
+        .row = row, .rows = rows, .img = img,
+        .span = nz > 1 ? img * (size_t)(nz - 1) + slice : slice,
+    };
+    return 1;
+}
+static int texcopy_layout_ok(const texcopy_layout *L, uint64_t o, const char *op, int trace) {
+    if (L->row % (size_t)L->bpb || o % 4 || (L->nz > 1 && L->img % L->row != 0 && (L->img % 4 || L->img % (size_t)L->bpb))) {
+        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=%s result=skip reason=buffer-layout-unexpressible row=%zu img=%zu offset=%#llx", L->row, L->img, (unsigned long long)o);
+        RED(4, "%s: copy with stride %zu/%zu / offset %#llx not expressible", op, L->row, L->img, (unsigned long long)o);
+        return 0;
+    }
+    return 1;
+}
+static void texcopy_issue(VkCommandBuffer cb, int upload, VkBuffer b, uint64_t o, vk_tex *x,
+                          const p_copy_b2t *c, const texcopy_layout *L) {
+    VkImageAspectFlags aspect = copy_aspect(x);
+    uint32_t row_len = (uint32_t)(L->row / (size_t)L->bpb * (size_t)L->bw);
+    if (L->nz == 1 || (L->row > 0 && L->img % L->row == 0)) {
+        uint32_t img_h = L->nz > 1 ? (uint32_t)(L->img / L->row * (size_t)L->bh) : (uint32_t)(L->rows * (size_t)L->bh);
+        VkBufferImageCopy r = {
+            .bufferOffset = o, .bufferRowLength = row_len, .bufferImageHeight = img_h,
+            .imageSubresource = {aspect, L->level, L->is3d ? 0 : L->layer0 + (unsigned)c->r.zoffset, L->is3d ? 1 : (uint32_t)L->nz},
+            .imageOffset = {c->r.xoffset, c->r.yoffset, L->is3d ? c->r.zoffset : 0},
+            .imageExtent = {(uint32_t)c->r.width, (uint32_t)c->r.height, L->is3d ? (uint32_t)L->nz : 1},
+        };
+        if (upload) vkCmdCopyBufferToImage(cb, b, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        else vkCmdCopyImageToBuffer(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
+        return;
+    }
+    for (int z = 0; z < L->nz && z < 16384; z++) {
+        VkBufferImageCopy r = {
+            .bufferOffset = o + (uint64_t)z * L->img, .bufferRowLength = row_len, .bufferImageHeight = (uint32_t)(L->rows * (size_t)L->bh),
+            .imageSubresource = {aspect, L->level, L->is3d ? 0 : L->layer0 + (unsigned)(c->r.zoffset + z), 1},
+            .imageOffset = {c->r.xoffset, c->r.yoffset, L->is3d ? c->r.zoffset + z : 0},
+            .imageExtent = {(uint32_t)c->r.width, (uint32_t)c->r.height, 1},
+        };
+        if (upload) vkCmdCopyBufferToImage(cb, b, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+        else vkCmdCopyImageToBuffer(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
+    }
+}
+static void copy_b2t(const p_copy_b2t *c) {   /* buffer -> texture (strides from SetCopyRowStride/SetCopyImageStride, 0 = packed) */
     int trace = totk_texcopy_on() && texcopy_buffer_attempt(c, "CopyBufferToTexture", 1);
     if (!vk_lag_uniform_private()) vk_ub_flush();
     else vk_ub_touch((uint64_t)(uintptr_t)c->tex->mem, c->tex->L.size);
@@ -6090,53 +6333,40 @@ static void copy_b2t(const p_copy_b2t *c) {   /* buffer -> texture (row stride f
         if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyBufferToTexture result=skip reason=texture-unavailable");
         return;
     }
-    int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
-    if (!bpb) {
-        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyBufferToTexture result=skip reason=unsupported-format");
-        return;
-    }
-    unsigned level = vlevel(&c->view, c->has_view), layer0 = vlayer(&c->view, c->has_view);
-    size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb, rows = (c->r.height + bh - 1) / bh, img = row * rows;
-    int nz = c->r.depth ? c->r.depth : 1, is3d = vk_tex_is3d(x);
-    if (vk_lag_uniform_private()) vk_ub_touch(c->src, img * nz);
+    texcopy_layout L; if (!texcopy_prepare(c, x, "CopyBufferToTexture", trace, &L)) return;
+    if (vk_lag_uniform_private()) vk_ub_touch(c->src, L.span);
     VkBuffer b; uint64_t o;
-    if (!vk_resolve(c->src, img * nz, &b, &o)) {
-        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyBufferToTexture result=skip reason=buffer-unresolved buffer=%#llx bytes=%zu", (unsigned long long)c->src, img * nz);
+    if (!vk_resolve(c->src, L.span, &b, &o)) {
+        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyBufferToTexture result=skip reason=buffer-unresolved buffer=%#llx bytes=%zu", (unsigned long long)c->src, L.span);
         RED(4, "buffer-to-texture copy: the source is not in a memory pool"); return;
     }
     VkDescriptorBufferInfo frozen;
-    if (vk_lag_read(c->src, img * nz, 16, &frozen, VK_LAG_COPY)) {
+    if (vk_lag_read(c->src, L.span, 16, &frozen, VK_LAG_COPY)) {
         b = frozen.buffer; o = frozen.offset;
         if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyBufferToTexture buffer_side=src source=lag-snapshot");
     }
-    if (trace) texcopy_buffer_resolved("CopyBufferToTexture", "src", c, b, o, row, rows, img, nz);
-    if (row % bpb || o % 4) {
-        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyBufferToTexture result=skip reason=buffer-layout-unexpressible row=%zu offset=%#llx", row, (unsigned long long)o);
-        RED(4, "buffer-to-texture copy with stride %zu / offset %#llx not expressible", row, (unsigned long long)o); return;
-    }
-    if (trace) texcopy_guest_source(c, row, img);
+    if (trace) texcopy_buffer_resolved("CopyBufferToTexture", "src", c, b, o, &L);
+    if (!texcopy_layout_ok(&L, o, "CopyBufferToTexture", trace)) return;
+    if (trace) texcopy_guest_source(c, L.row, L.img);
     vk_end_rendering_at(VK_PASS_END_COPY, OP_COPY_B2T);
     vk_tex_native_read(x);
     if (trace) vk_texcopy_image("CopyBufferToTexture", "dst", c->tex, x);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "upload");
-    VkBufferImageCopy r = {.bufferOffset = o, .bufferRowLength = (uint32_t)(row / bpb * bw), .bufferImageHeight = (uint32_t)(rows * bh),
-        .imageSubresource = {copy_aspect(x), level, is3d ? 0 : layer0 + c->r.zoffset, is3d ? 1 : (uint32_t)nz},
-        .imageOffset = {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset : 0}, .imageExtent = {(uint32_t)c->r.width, (uint32_t)c->r.height, is3d ? (uint32_t)nz : 1}};
-    vkCmdCopyBufferToImage(cb, b, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, 1, &r);
+    texcopy_issue(cb, 1, b, o, x, c, &L);
     totk_ft_count(FT_COUNT_TEX_UPLOADS, 1);
     vk_barrier_all(cb);
     if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
-    vk_tex_native_patch(x, level, layer0, &c->r);
-    if (vk_fg_extract_active) fg_extract_texture_write(c->tex, level, is3d ? 0 : layer0 + c->r.zoffset,
-        is3d ? 1 : (unsigned)nz, copy_aspect(x),
-        !c->r.xoffset && !c->r.yoffset && (unsigned)c->r.width == vk_tex_width(x, level) &&
-        (unsigned)c->r.height == vk_tex_height(x, level), 0, 0);
+    vk_tex_native_patch(x, L.level, L.layer0, &c->r);
+    if (vk_fg_extract_active) fg_extract_texture_write(c->tex, L.level, L.is3d ? 0 : L.layer0 + (unsigned)c->r.zoffset,
+        L.is3d ? 1 : (unsigned)L.nz, copy_aspect(x),
+        !c->r.xoffset && !c->r.yoffset && (unsigned)c->r.width == vk_tex_width(x, L.level) &&
+        (unsigned)c->r.height == vk_tex_height(x, L.level), 0, 0);
     vk_tex_mark_gpu_written(x); probe_write_note('B', x, NULL, 0);
-    vk_pso_life_external_write(x, level, r.imageSubresource.baseArrayLayer, r.imageSubresource.layerCount, "buffer-copy");
+    vk_pso_life_external_write(x, L.level, L.is3d ? 0 : L.layer0 + (unsigned)c->r.zoffset, L.is3d ? 1 : (uint32_t)L.nz, "buffer-copy");
     if (trace) {
-        totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyBufferToTexture result=success encoded=1 dst_serial=%llu bytes=%zu", (unsigned long long)c->tex->serial, img * nz);
-        vk_texcopy_readback("CopyBufferToTexture", "dst", c->tex, x, level, layer0, &c->r);
+        totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyBufferToTexture result=success encoded=1 dst_serial=%llu bytes=%zu", (unsigned long long)c->tex->serial, L.span);
+        vk_texcopy_readback("CopyBufferToTexture", "dst", c->tex, x, L.level, L.layer0, &c->r);
     }
 }
 static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
@@ -6149,41 +6379,28 @@ static void copy_t2b(const p_copy_b2t *c) {   /* texture -> buffer */
         if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyTextureToBuffer result=skip reason=texture-unavailable");
         return;
     }
-    int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
-    if (!bpb) {
-        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyTextureToBuffer result=skip reason=unsupported-format");
-        return;
-    }
-    unsigned level = vlevel(&c->view, c->has_view), layer0 = vlayer(&c->view, c->has_view);
-    size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * bpb, rows = (c->r.height + bh - 1) / bh, img = row * rows;
-    int nz = c->r.depth ? c->r.depth : 1, is3d = vk_tex_is3d(x);
+    texcopy_layout L; if (!texcopy_prepare(c, x, "CopyTextureToBuffer", trace, &L)) return;
     VkBuffer b; uint64_t o;
-    if (!vk_resolve(c->src, img * nz, &b, &o)) {
-        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyTextureToBuffer result=skip reason=buffer-unresolved buffer=%#llx bytes=%zu", (unsigned long long)c->src, img * nz);
+    if (!vk_resolve(c->src, L.span, &b, &o)) {
+        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyTextureToBuffer result=skip reason=buffer-unresolved buffer=%#llx bytes=%zu", (unsigned long long)c->src, L.span);
         RED(4, "texture-to-buffer copy: the destination is not in a memory pool"); return;
     }
-    if (trace) texcopy_buffer_resolved("CopyTextureToBuffer", "dst", c, b, o, row, rows, img, nz);
-    vk_gpu_write(c->src, img * nz);
-    if (row % bpb || o % 4) {
-        if (trace) totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyTextureToBuffer result=skip reason=buffer-layout-unexpressible row=%zu offset=%#llx", row, (unsigned long long)o);
-        RED(4, "texture-to-buffer copy with stride %zu / offset %#llx not expressible", row, (unsigned long long)o); return;
-    }
+    if (trace) texcopy_buffer_resolved("CopyTextureToBuffer", "dst", c, b, o, &L);
+    vk_gpu_write(c->src, L.span);
+    if (!texcopy_layout_ok(&L, o, "CopyTextureToBuffer", trace)) return;
     vk_end_rendering_at(VK_PASS_END_COPY, OP_COPY_T2B);
     vk_tex_native_read(x);
     if (trace) vk_texcopy_image("CopyTextureToBuffer", "src", c->tex, x);
     VkCommandBuffer cb = vk_cb(); vk_barrier_all(cb);
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
-    VkBufferImageCopy r = {.bufferOffset = o, .bufferRowLength = (uint32_t)(row / bpb * bw), .bufferImageHeight = (uint32_t)(rows * bh),
-        .imageSubresource = {copy_aspect(x), level, is3d ? 0 : layer0 + c->r.zoffset, is3d ? 1 : (uint32_t)nz},
-        .imageOffset = {c->r.xoffset, c->r.yoffset, is3d ? c->r.zoffset : 0}, .imageExtent = {(uint32_t)c->r.width, (uint32_t)c->r.height, is3d ? (uint32_t)nz : 1}};
-    vkCmdCopyImageToBuffer(cb, vk_tex_image(x), VK_IMAGE_LAYOUT_GENERAL, b, 1, &r);
-    vk_pso_life_external_read(vk_tex_width(x, level), vk_tex_height(x, level), "texture-to-buffer-read");
-    vk_fg_extract_memory_write(c->src, img * nz);
+    texcopy_issue(cb, 0, b, o, x, c, &L);
+    vk_pso_life_external_read(vk_tex_width(x, L.level), vk_tex_height(x, L.level), "texture-to-buffer-read");
+    vk_fg_extract_memory_write(c->src, L.span);
     vk_barrier_all(cb);
     if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     if (trace) {
-        totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyTextureToBuffer result=success encoded=1 src_serial=%llu bytes=%zu", (unsigned long long)c->tex->serial, img * nz);
-        vk_texcopy_readback("CopyTextureToBuffer", "src", c->tex, x, level, layer0, &c->r);
+        totk_texcopy_log(vk_submit_serial(), "phase=replay op=CopyTextureToBuffer result=success encoded=1 src_serial=%llu bytes=%zu", (unsigned long long)c->tex->serial, L.span);
+        vk_texcopy_readback("CopyTextureToBuffer", "src", c->tex, x, L.level, L.layer0, &c->r);
     }
 }
 static void copy_t2t(const p_copy_t2t *c) {   /* texture -> texture: same size as a copy, scaled as a blit */
@@ -6455,6 +6672,8 @@ void vk_draw_exec(uint32_t op, const void *a) {
         }
         case OP_DRAW: draw(a, NULL); if (serial_draws()) vk_end_rendering_at(VK_PASS_END_DIAGNOSTIC, 3); break;
         case OP_DRAW_IDX: draw(NULL, a); if (serial_draws()) vk_end_rendering_at(VK_PASS_END_DIAGNOSTIC, 3); break;
+        case OP_DRAW_INDIRECT: draw_indirect(a, NULL); if (serial_draws()) vk_end_rendering_at(VK_PASS_END_DIAGNOSTIC, 3); break;
+        case OP_DRAW_IDX_INDIRECT: draw_indirect(NULL, a); if (serial_draws()) vk_end_rendering_at(VK_PASS_END_DIAGNOSTIC, 3); break;
         case OP_DISPATCH: VK_REC_DO(VK_REC_O_DISPATCH, dispatch(a)); break;
         case OP_COPY_B2T: VK_REC_DO(VK_REC_O_TRANSFER, copy_b2t(a)); break;
         case OP_COPY_T2B: VK_REC_DO(VK_REC_O_TRANSFER, copy_t2b(a)); break;
@@ -6473,11 +6692,11 @@ void vk_draw_exec(uint32_t op, const void *a) {
         case OP_SCISSOR: S.sc = *(const p_scissor *)a; S.has_sc = 1; break;
         case OP_BIND_PROGRAM: {
             const p_bind_program *b = a;
-            if (vk_fg_extract_active && R.open && S.prog != b->prog) {
-                fg_extract_state_change(1);
+            if (bind_stage_programs(S.prog, b)) {
+                if (vk_fg_extract_active && R.open) fg_extract_state_change(1);
+                g_pipe_dirty = 1;
             }
-            S.prog = b->prog; g_pipe_dirty = 1;
-            vk_prog_prepare(S.prog);
+            if (b->prog) vk_prog_prepare(b->prog);
             break;
         }
         case OP_BIND_STATE: {
@@ -6576,6 +6795,7 @@ void vk_draw_exec(uint32_t op, const void *a) {
             S.alpha_ref=value; break;
         }
         case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
+        case OP_COPY_IMAGE_STRIDE: S.copy_image_stride = ((const p_copy_stride *)a)->stride; break;
         case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_flag *)a)->value; g_pipe_dirty = 1; break;
         case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value;
             if (PD.active) { char l[64]; pd_note(l, snprintf(l, sizeof l, "  render enable %d\n", !S.render_disabled)); }

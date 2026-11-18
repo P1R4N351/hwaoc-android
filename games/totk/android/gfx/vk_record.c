@@ -1139,7 +1139,11 @@ static void record_job(rec_job *j, unsigned worker) {
             if (index_buffer != buffer || index_offset != offset || index_type != d->index_type) {
                 (vkCmdBindIndexBuffer)(j->cb, buffer, offset, d->index_type); index_buffer = buffer; index_offset = offset; index_type = d->index_type;
             }
-            (vkCmdDrawIndexed)(j->cb, d->count, d->instances, d->first, d->vertex_offset, d->base_instance);
+            if (d->indirect) (vkCmdDrawIndexedIndirect)(j->cb, d->indirect, d->indirect_offset, 1, 20);
+            else (vkCmdDrawIndexed)(j->cb, d->count, d->instances, d->first, d->vertex_offset, d->base_instance);
+            draws++;
+        } else if (d->indirect) {
+            (vkCmdDrawIndirect)(j->cb, d->indirect, d->indirect_offset, 1, 16);
             draws++;
         } else if (d->count) { (vkCmdDraw)(j->cb, d->count, d->instances, d->first, d->base_instance); draws++; }
     }
@@ -1375,6 +1379,7 @@ vk_record_draw *vk_record_draw_begin(VkPipeline pipeline, VkPipelineLayout layou
     vk_record_draw *d = &building->draw[building->count];
     d->pipeline = pipeline; d->layout = layout; memset(d->sets, 0, sizeof d->sets);
     d->vertex_mask = 0; d->index = VK_NULL_HANDLE; d->index_address = d->index_offset = 0;
+    d->indirect = VK_NULL_HANDLE; d->indirect_offset = 0;
     d->index_type = VK_INDEX_TYPE_UINT32; d->first = 0; d->vertex_offset = 0;
     d->index_lag_reason = 0; d->index_bytes = 0;
     d->lag_ticket = vk_record_lag_enabled() ? vk_record_lag_ticket() : 0;

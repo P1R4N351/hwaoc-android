@@ -48,7 +48,7 @@ hwaoc = "01002B00111A2000"
 meaning = "The game's save layout under the save root (SaveManager: the slot list, import detection, export and backups): dir = a slot folder's name (regex, group 1 = the slot number), file = the file that makes the folder a slot, picture = the slot's picture (a JPEG, or a file with one inside), names = how the menu's texts name the slot folders. option.sav at the save root is common"
 totk = { dir = 'slot_(\d\d)', file = "progress.sav", picture = "caption.sav", names = "slot_00 … slot_05" }
 botw = { dir = '(\d)', file = "game_data.sav", picture = "caption.jpg", names = "0 … 5" }
-hwaoc = { dir = '(\d)', file = "save.dat", picture = "caption.jpg", names = "0 … 5" }
+hwaoc = { dir = "", file = "svdt", picture = "", names = "svdt" }
 
 [var.main_build_id]
 meaning = "Build id of the supported main (mods: exefs/<build id>.ips is applied only when it names this main; the runtime reads it from main itself, this is for docs and mod authors). TotK's 1.4.3 files are pinned by sha256 instead"

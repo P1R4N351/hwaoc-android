@@ -54,6 +54,7 @@ typedef struct {
     const vk_record_spans *spans;
     uint32_t vertex_mask;
     VkBuffer index; VkDeviceSize index_offset; VkIndexType index_type;
+    VkBuffer indirect; VkDeviceSize indirect_offset;
     uint64_t index_address; /* optional unresolved index range; walk-selected handles need no worker lookup */
     uint64_t lag_ticket, index_bytes; uint32_t index_lag_reason;
     uint32_t count, instances, first, base_instance; int32_t vertex_offset;
@@ -63,6 +64,7 @@ typedef struct {
 } vk_record_draw;
 
 int vk_prog_resolve_record(const prog_t *program, vk_shader *out[6]);
+int vk_prog_resolve_gfx_record(const prog_t *const progs[6], vk_shader *out[6]);
 void vk_prog_record_cache_take(uint64_t *hits, uint64_t *misses);
 uint64_t vk_record_uniform_revision(void);
 int vk_record_uniform_unchanged(uint64_t revision, uint64_t address, uint64_t size);

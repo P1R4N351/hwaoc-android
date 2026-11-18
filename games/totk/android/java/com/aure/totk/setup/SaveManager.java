@@ -51,9 +51,10 @@ final class SaveManager {
     /** The game's slot layout (games/games.toml save_slots): TotK slot_00..slot_05/progress.sav, BotW 0..5/game_data.sav;
      * option.sav sits at the save root in both. SLOT_DIR's group 1 is the slot number. */
     static final String SLOT_FILE = GameBuild.SAVE_SLOT_FILE, PICTURE = GameBuild.SAVE_PICTURE;
-    private static final Pattern SLOT_DIR = Pattern.compile(GameBuild.SAVE_SLOT_DIR);
-    private static final Pattern SLOT_ENTRY = Pattern.compile("(" + GameBuild.SAVE_SLOT_DIR + ")/" + Pattern.quote(SLOT_FILE));
-    private static final Pattern SLOT_PROGRESS = Pattern.compile("(?:.*/)?" + SLOT_ENTRY.pattern());
+    static final boolean FLAT_SAVE = GameBuild.SAVE_SLOT_DIR.isEmpty();
+    private static final Pattern SLOT_DIR = FLAT_SAVE ? null : Pattern.compile(GameBuild.SAVE_SLOT_DIR);
+    private static final Pattern SLOT_ENTRY = FLAT_SAVE ? null : Pattern.compile("(" + GameBuild.SAVE_SLOT_DIR + ")/" + Pattern.quote(SLOT_FILE));
+    private static final Pattern SLOT_PROGRESS = FLAT_SAVE ? null : Pattern.compile("(?:.*/)?" + SLOT_ENTRY.pattern());
     private static final Pattern KNOWN = Pattern.compile("(?i).*\\.(sav|dat|jpg|jpeg|bin)");
 
     // ---------- errors ----------
@@ -336,6 +337,14 @@ final class SaveManager {
     /** The slot folders (SLOT_DIR) holding their SLOT_FILE, by slot number. */
     static List<Slot> slots(File root) {
         List<Slot> out = new ArrayList<>();
+        if (FLAT_SAVE) {
+            File save = root == null ? null : new File(root, SLOT_FILE);
+            if (save != null && save.isFile()) {
+                long m = save.lastModified();
+                out.add(new Slot(0, m, m, null));
+            }
+            return out;
+        }
         File[] children = root == null ? null : root.listFiles();
         if (children == null) return out;
         for (File child : children) {
@@ -444,6 +453,11 @@ final class SaveManager {
     /** Root directory prefix of a save set: "" or "dir/sub/". */
     private static String rootOf(String path) {
         if (path.equals("option.sav") || path.endsWith("/option.sav")) return path.substring(0, path.length() - "option.sav".length());
+        if (FLAT_SAVE) {
+            if (path.equals(SLOT_FILE)) return "";
+            if (path.endsWith("/" + SLOT_FILE)) return path.substring(0, path.length() - SLOT_FILE.length());
+            return null;
+        }
         if (SLOT_PROGRESS.matcher(path).matches()) {
             String slotDir = path.substring(0, path.length() - SLOT_FILE.length() - 1);
             int cut = slotDir.lastIndexOf('/');
@@ -466,7 +480,8 @@ final class SaveManager {
         Map<String, Long> roots = new LinkedHashMap<>();
         for (Candidate c : clean) {
             String root = rootOf(c.path);
-            if (root != null) roots.merge(root, c.path.endsWith("/" + SLOT_FILE) ? c.mtime : Long.MIN_VALUE, Math::max);
+            boolean slotHit = c.path.endsWith("/" + SLOT_FILE) || (FLAT_SAVE && c.path.equals(SLOT_FILE));
+            if (root != null) roots.merge(root, slotHit ? c.mtime : Long.MIN_VALUE, Math::max);
         }
         if (roots.isEmpty()) throw new Invalid("no_saves", null);
         String best = null;
@@ -480,7 +495,7 @@ final class SaveManager {
             if (!c.path.startsWith(best)) continue;
             String relative = c.path.substring(best.length());
             if (relative.equals(MANIFEST)) { selection.manifestSource = c.path; continue; }
-            long limit = KNOWN.matcher(relative).matches() ? MAX_KNOWN_FILE : MAX_OTHER_FILE;
+            long limit = KNOWN.matcher(relative).matches() || relative.equals(SLOT_FILE) ? MAX_KNOWN_FILE : MAX_OTHER_FILE;
             if (c.size > limit) throw new Invalid("huge_file", relative + " (" + c.size + " bytes)");
             if (c.size < 0) throw new Invalid("corrupt", relative + " has no size");
             selection.total += c.size;
@@ -998,6 +1013,10 @@ final class SaveManager {
         List<Slot> out = new ArrayList<>();
         if (m == null) return out;
         for (FileEntry e : m.files) {
+            if (FLAT_SAVE) {
+                if (e.path.equals(SLOT_FILE)) out.add(new Slot(0, e.mtime, e.mtime, null));
+                continue;
+            }
             java.util.regex.Matcher slot = SLOT_ENTRY.matcher(e.path);
             if (slot.matches()) out.add(new Slot(Integer.parseInt(slot.group(2)), e.mtime, e.mtime, null));
         }

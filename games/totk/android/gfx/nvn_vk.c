@@ -208,6 +208,8 @@ static int xlate_address_fields(unsigned op, const uint8_t *a, size_t size, xlat
         case OP_BIND_TEX: case OP_BIND_IMG: case OP_BIND_SAMP:
             XLATE_ARRAY(p_bind_handles, h, 32); XLATE_FIELD(p_bind_handles, src); break;
         case OP_DRAW_IDX: XLATE_NEED(p_draw_idx); XLATE_FIELD(p_draw_idx, ibuf); break;
+        case OP_DRAW_INDIRECT: XLATE_NEED(p_draw_indirect); XLATE_FIELD(p_draw_indirect, buf); break;
+        case OP_DRAW_IDX_INDIRECT: XLATE_NEED(p_draw_idx_indirect); XLATE_FIELD(p_draw_idx_indirect, ibuf); XLATE_FIELD(p_draw_idx_indirect, buf); break;
         case OP_DISPATCH: XLATE_NEED(p_dispatch); XLATE_FIELD(p_dispatch, caller); break;
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: XLATE_NEED(p_set_pool); XLATE_FIELD(p_set_pool, pool); break;
         case OP_COPY_B2T: case OP_COPY_T2B:
@@ -228,7 +230,7 @@ static int xlate_address_fields(unsigned op, const uint8_t *a, size_t size, xlat
         case OP_POLY_OFFSET: XLATE_NEED(p_poly_offset); break;
         case OP_DRAW: XLATE_NEED(p_draw); break;
         case OP_BARRIER: XLATE_NEED(int32_t); break;
-        case OP_COPY_STRIDE: XLATE_NEED(p_copy_stride); break;
+        case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE: XLATE_NEED(p_copy_stride); break;
         case OP_BLEND_COLOR: XLATE_NEED(p_blend_color); break;
         case OP_RESET_COUNTER: XLATE_NEED(uint64_t); break;
         case OP_DEPTH_CLAMP: case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: XLATE_NEED(p_flag); break;
@@ -385,7 +387,7 @@ static int rec_stream_begin(void) {
 static void rec_sample_begin(unsigned op) {
     if (!T_rec.active) return;
     if (T_rec.rate == 1) { if (T_rec.timeline) totk_ft_count(FT_COUNT_REC_SAMPLES, 1); return; }
-    if (op == OP_DRAW_IDX) op = OP_DRAW; /* sample graphics attempts together, not one index type's phase */
+    if (op == OP_DRAW_IDX || op == OP_DRAW_INDIRECT || op == OP_DRAW_IDX_INDIRECT) op = OP_DRAW; /* sample graphics attempts together */
     uint64_t seq = ++g_rec_sample_seq[op], hash = seq * 0x9e3779b97f4a7c15ull;
     hash ^= hash >> 32;
     if (!(hash & (T_rec.rate - 1))) {
@@ -4178,6 +4180,16 @@ static void gpu_write_inner(uint64_t a, uint64_t n, int guard) {
     pthread_mutex_unlock(&g_gw_mu);
 }
 void vk_gpu_write(uint64_t a, uint64_t n) { VK_REC_DO(VK_REC_S_WRITE, gpu_write_inner(a, n, 1)); }
+int vk_gpu_write_pending(uint64_t addr, uint64_t n) {
+    if (!n) return 0;
+    uint64_t a = ub_address(addr, n);
+    if (!a || a + n < a) return 1;
+    pthread_mutex_lock(&g_gw_mu);
+    int gpu = gw_pending(a, a + n, atomic_load_explicit(&g_done, memory_order_acquire));
+    pthread_mutex_unlock(&g_gw_mu);
+    if (!gpu && ub_private_on()) gpu = ub_original_pending(a, n);
+    return gpu;
+}
 void vk_gpu_write_record(uint64_t a, uint64_t n) { VK_REC_DO(VK_REC_S_WRITE, gpu_write_inner(a, n, 0)); }
 typedef struct { uint64_t lo, hi; } rng_t;
 enum { UBO_SEEN = 1024 }; /* shared across recursive command lists, allocated once per capture */
@@ -5823,7 +5835,7 @@ static void ub_seal(uint64_t fence) { for (int i = 0; i < g_nub; i++) if (g_ub[i
 
 /* A bounded draw-side lookahead never escapes the current recording or follows calls. Restored on recursive return. */
 static const uint8_t *g_exec_next; static uint32_t g_exec_op;
-const uint8_t *vk_exec_draw_next(void) { return g_exec_op == OP_DRAW || g_exec_op == OP_DRAW_IDX ? g_exec_next : NULL; }
+const uint8_t *vk_exec_draw_next(void) { return g_exec_op == OP_DRAW || g_exec_op == OP_DRAW_IDX || g_exec_op == OP_DRAW_INDIRECT || g_exec_op == OP_DRAW_IDX_INDIRECT ? g_exec_next : NULL; }
 /* Constant specialization removes all diagnostic work from the disabled opcode loop, including bind checks. */
 static __attribute__((always_inline)) inline void mtl_exec_impl(const uint8_t *p, int diagnostics) {
     const uint8_t *saved_next = g_exec_next; uint32_t saved_op = g_exec_op;
@@ -5850,7 +5862,7 @@ static __attribute__((always_inline)) inline void mtl_exec_impl(const uint8_t *p
         g_exec_next = next; g_exec_op = h.op;
         if (diagnostics) {
             if (h.op == OP_BIND_TEX || h.op == OP_BIND_IMG || h.op == OP_BIND_SAMP) xlate_deferred_bind(h.op, a);
-            if (h.op == OP_DRAW || h.op == OP_DRAW_IDX) {
+            if (h.op == OP_DRAW || h.op == OP_DRAW_IDX || h.op == OP_DRAW_INDIRECT || h.op == OP_DRAW_IDX_INDIRECT) {
                 g_xlate->counts.draws++;
                 for (unsigned lane = 0; lane < 2; lane++) {
                     g_xlate->counts.repeated_draws[lane] += g_xlate->repeated[lane];
@@ -5873,7 +5885,7 @@ static __attribute__((always_inline)) inline void mtl_exec_impl(const uint8_t *p
                 if (__builtin_expect(vk_rec_timing_on, 0)) {
                     int category = h.op == OP_RESET_COUNTER || h.op == OP_RENDER_COND ? VK_REC_S_COUNTER :
                         h.op == OP_SET_RT || h.op == OP_CLEAR_COLOR || h.op == OP_CLEAR_DS || h.op == OP_BARRIER ? VK_REC_S_PASS :
-                        h.op == OP_DRAW || h.op == OP_DRAW_IDX ? VK_REC_S_TOUCH : VK_REC_S_STATE;
+                        h.op == OP_DRAW || h.op == OP_DRAW_IDX || h.op == OP_DRAW_INDIRECT || h.op == OP_DRAW_IDX_INDIRECT ? VK_REC_S_TOUCH : VK_REC_S_STATE;
                     VK_REC_DO(category, vk_draw_exec(h.op, a));
                 } else vk_draw_exec(h.op, a);
                 break;

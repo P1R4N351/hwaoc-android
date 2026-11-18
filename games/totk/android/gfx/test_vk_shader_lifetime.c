@@ -54,6 +54,8 @@ int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t c
     (void)bindings; (void)why; (void)size;
     assert(!count); return 1;
 }
+void vk_record_memo_saved(unsigned cause) { (void)cause; }
+void vk_record_memo_miss(unsigned program, unsigned causes) { (void)program; (void)causes; }
 void vk_compute_prepare(vk_shader *shader) {
     shader_key key = {0}; memcpy(key.variant, shader->key, sizeof key.variant);
     key.early_tests = shader->early_tests | shader->alpha_func << 1;
@@ -90,6 +92,44 @@ static void variant_list_write(const char *key, const char *name) {
     assert(fprintf(file, "%s\t\n", name) > 0); assert(!fclose(file));
 }
 static gp_compact compact;
+
+static void verify_separable_programs(prog_t *vs_prog, vk_shader *vs, vk_shader *fs, vk_shader *cs) {
+    uint8_t fctl[0x880] = {0}, cctl[0x880] = {0}, code[64] = {0};
+    uint32_t len = sizeof code, fst = 1, cst = 5;
+    memcpy(fctl + 0x704, &len, 4); memcpy(fctl + 0x714, &fst, 4);
+    memcpy(cctl + 0x704, &len, 4); memcpy(cctl + 0x714, &cst, 4);
+    prog_t fs_prog = {.serial = 72, .nstage = 1}, cs_prog = {.serial = 73, .nstage = 1};
+    fs_prog.sd[0].control = fctl; fs_prog.sd[0].data = (uintptr_t)code;
+    cs_prog.sd[0].control = cctl; cs_prog.sd[0].data = (uintptr_t)code;
+    vk_prog *pr_fs = prog_of(&fs_prog), *pr_cs = prog_of(&cs_prog);
+    assert(pr_fs && pr_fs->has[1] && !pr_fs->has[0]);
+    assert(pr_cs && pr_cs->has[5] && !pr_cs->has[0]);
+    variant_list_write(pr_fs->key[1], fs->key);
+    variant_list_write(pr_cs->key[5], cs->key);
+    if (vk_seed_io_active()) { vk_seed_io_published(pr_fs->key[1]); vk_seed_io_published(pr_cs->key[5]); }
+
+    vk_shader *bound[6], *pred[6];
+    memset(&S, 0, sizeof S); S.prog[0] = vs_prog; S.prog[1] = &fs_prog;
+    assert(!vk_prog_resolve_gfx(S.prog, bound) && bound[0] == vs && bound[1] == fs);
+    uint64_t hits0 = g_record_prog_hits;
+    assert(!vk_prog_resolve_gfx_record(S.prog, bound) && bound[0] == vs && bound[1] == fs);
+    assert(!vk_prog_resolve_gfx_record(S.prog, bound) && g_record_prog_hits == hits0 + 1);
+    assert(vk_prog_predict(&S, pred) && pred[0] == vs && pred[1] == fs);
+
+    S.prog[1] = NULL;
+    assert(!vk_prog_resolve_gfx_record(S.prog, bound) && bound[0] == vs && !bound[1]);
+    S.prog[5] = &cs_prog;
+    assert(!vk_prog_resolve_compute(S.prog[5], bound) && bound[5] == cs);
+    S.prog[5] = NULL;
+    assert(!vk_prog_resolve_gfx_record(S.prog, bound) && bound[0] == vs && !bound[1]);
+
+    S.prog[0] = NULL; S.prog[1] = &fs_prog;
+    assert(vk_prog_resolve_gfx(S.prog, bound) == -1);
+    assert(vk_prog_resolve_gfx_record(S.prog, bound) == -1);
+    assert(!vk_prog_predict(&S, pred));
+    memset(&S, 0, sizeof S);
+    mtl_prog_release(&fs_prog); mtl_prog_release(&cs_prog);
+}
 
 int main(void) {
     /* Freeze precision to the ordinary arm before the production pthread_once. */
@@ -152,6 +192,7 @@ int main(void) {
         memset(name, 'x', sizeof name); /* caller scratch never owns the cached name */
     }
     assert(g_shaders.cap > capacity);
+    verify_separable_programs(&program, vs, fs, cs);
     mtl_prog_release(&program);
     assert(!nvn_hm_get(&g_progs, &program.serial));
     vk_seed_io_stop(); assert(!vk_seed_io_active()); /* frees index/warmed file buffers */

@@ -13,6 +13,7 @@
 #include <time.h>
 
 // ---------- Debug labels, markers, groups, checkpoints: meaningful only to NVN debugging tools ----------
+NVN_NOPROTO(nvnDeviceBuilderGetFlags, int, const NVNdeviceBuilder *b) { return (int)((const dev_builder_t *)b)->flags; }
 NVN(nvnDeviceSetDebugLabel, void, NVNdevice *o, const char *s) { (void)o; (void)s; }
 NVN(nvnQueueSetDebugLabel, void, NVNqueue *o, const char *s) { (void)o; (void)s; }
 NVN(nvnWindowSetDebugLabel, void, NVNwindow *o, const char *s) { (void)o; (void)s; }
@@ -20,6 +21,12 @@ NVN(nvnProgramSetDebugLabel, void, NVNprogram *o, const char *s) { (void)o; (voi
 NVN(nvnMemoryPoolSetDebugLabel, void, NVNmemoryPool *o, const char *s) { (void)o; (void)s; }
 NVN(nvnTexturePoolSetDebugLabel, void, NVNtexturePool *o, const char *s) { (void)o; (void)s; }
 NVN(nvnSamplerPoolSetDebugLabel, void, NVNsamplerPool *o, const char *s) { (void)o; (void)s; }
+NVN(nvnTexturePoolGetMemoryPool, const NVNmemoryPool *, const NVNtexturePool *p) { return (const NVNmemoryPool *)(const void *)((const dpool_t *)p)->pool; }
+NVN(nvnTexturePoolGetMemoryOffset, ptrdiff_t, const NVNtexturePool *p) { return (ptrdiff_t)((const dpool_t *)p)->off; }
+NVN(nvnTexturePoolGetSize, int, const NVNtexturePool *p) { return ((const dpool_t *)p)->n; }
+NVN(nvnSamplerPoolGetMemoryPool, const NVNmemoryPool *, const NVNsamplerPool *p) { return (const NVNmemoryPool *)(const void *)((const dpool_t *)p)->pool; }
+NVN(nvnSamplerPoolGetMemoryOffset, ptrdiff_t, const NVNsamplerPool *p) { return (ptrdiff_t)((const dpool_t *)p)->off; }
+NVN(nvnSamplerPoolGetSize, int, const NVNsamplerPool *p) { return ((const dpool_t *)p)->n; }
 NVN(nvnBufferSetDebugLabel, void, NVNbuffer *o, const char *s) { (void)o; (void)s; }
 NVN(nvnTextureSetDebugLabel, void, NVNtexture *o, const char *s) { (void)o; (void)s; }
 NVN(nvnSamplerSetDebugLabel, void, NVNsampler *o, const char *s) { (void)o; (void)s; }

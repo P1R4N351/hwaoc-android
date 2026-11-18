@@ -337,6 +337,9 @@ NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const
                 vv ? "yes" : "no", vv && vv->set_format ? vv->format : 0, vv && vv->set_levels ? vv->base_level : -1, vv && vv->set_levels ? vv->nlevels : 0); } }
     totk_life_reg(id, (const tex_t *)t);
     mtl_reg_tex(id, (const tex_t *)t, (const view_t *)v); }
+NVN(nvnTexturePoolRegisterImage, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) {
+    h_nvnTexturePoolRegisterTexture(tp, id, t, v);
+}
 
 NVN(nvnSamplerPoolInitialize, NVNboolean, NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
     *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n); return 1;
@@ -1370,7 +1373,7 @@ static int call_stats_on(void) { static int v = -1; if (v < 0) v = getenv("TOTK_
 #define CS_TAB 16384
 static struct { const void *cb; uint64_t inl; } g_cs_inl[CS_TAB];
 static struct { uint64_t handle, own; } g_cs_own[CS_TAB];
-static uint64_t list_draws(const uint8_t *q) { uint64_t d = 0; for (;;) { op_hdr x; memcpy(&x, q, sizeof x); if (x.op == OP_END || x.size < 8) break; if (x.op == OP_DRAW || x.op == OP_DRAW_IDX) d++; q += x.size; } return d; }
+static uint64_t list_draws(const uint8_t *q) { uint64_t d = 0; for (;;) { op_hdr x; memcpy(&x, q, sizeof x); if (x.op == OP_END || x.size < 8) break; if (x.op == OP_DRAW || x.op == OP_DRAW_IDX || x.op == OP_DRAW_INDIRECT || x.op == OP_DRAW_IDX_INDIRECT) d++; q += x.size; } return d; }
 static void call_stats_end(const void *cb, const uint8_t *copy) {
     unsigned i = (unsigned)(((uintptr_t)cb >> 4) % CS_TAB); uint64_t inl = g_cs_inl[i].cb == cb ? g_cs_inl[i].inl : 0; g_cs_inl[i].cb = NULL; g_cs_inl[i].inl = 0;
     uint64_t all = list_draws(copy); unsigned j = (unsigned)(((uintptr_t)copy >> 4) % CS_TAB);
@@ -1379,7 +1382,7 @@ static void call_stats_end(const void *cb, const uint8_t *copy) {
 static void call_stats_note(const void *cb, uint64_t hd, const uint8_t *p) {
     uint64_t h = 1469598103934665603ull, draws = 0, alld = 0, bytes = 0;
     for (const uint8_t *q = p;;) { op_hdr x; memcpy(&x, q, sizeof x); if (x.op == OP_END || x.size < 8) break;
-        if (x.op == OP_DRAW || x.op == OP_DRAW_IDX) alld++;
+        if (x.op == OP_DRAW || x.op == OP_DRAW_IDX || x.op == OP_DRAW_INDIRECT || x.op == OP_DRAW_IDX_INDIRECT) alld++;
         for (uint32_t i = 0; i < x.size; i += 8) { uint64_t w; memcpy(&w, q + i, 8); h = (h ^ w) * 1099511628211ull; }
         bytes += x.size; q += x.size; }
     { unsigned j = (unsigned)((hd >> 4) % CS_TAB); draws = g_cs_own[j].handle == hd ? g_cs_own[j].own : alld; }
@@ -2222,6 +2225,12 @@ NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPri
     int bv, int bi, int inst) {
     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, bi, inst, ib}; hw_fix(CB(c), 44);   /* assumed: same 6-parameter draw macro as the base-vertex form (unverified) */
 }
+NVN(nvnCommandBufferDrawArraysIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNbufferAddress buf) {
+    *REC(c, OP_DRAW_INDIRECT, p_draw_indirect) = (p_draw_indirect){pr, buf}; hw_fix(CB(c), 24);
+}
+NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress buf) {
+    *REC(c, OP_DRAW_IDX_INDIRECT, p_draw_idx_indirect) = (p_draw_idx_indirect){pr, it, ib, buf}; hw_fix(CB(c), 32);
+}
 NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, int z) {
     // 跳板是尾跳（br），这里的返回地址就是游戏里的调用点
     // The thunk is a tail jump (br), so the return address here is the call site in the game
@@ -2233,10 +2242,10 @@ NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerP
 
 // Recording-time local stride, including called lists already flattened by inline_recording.
 // A list without an explicit stride can inherit replay state; replay logs that authoritative value.
-static ptrdiff_t texcopy_recorded_row(const NVNcommandBuffer *c, int *known) {
+static ptrdiff_t recorded_copy_stride(const NVNcommandBuffer *c, uint32_t want_op, int *known) {
     const cmd_t *b = (const cmd_t *)c;
-    ptrdiff_t row = 0; *known = 0;
-    if (!b->seg) return row;
+    ptrdiff_t val = 0; *known = 0;
+    if (!b || !b->seg) return val;
     for (const uint8_t *p = b->seg; p < b->cur; ) {
         size_t left = (size_t)(b->cur - p);
         if (left < sizeof(op_hdr)) { *known = -1; break; }
@@ -2247,25 +2256,26 @@ static ptrdiff_t texcopy_recorded_row(const NVNcommandBuffer *c, int *known) {
             const uint8_t *q = (const uint8_t *)(t + 1) + 8, *e = q + t->body_bytes;
             for (op_hdr g; q < e; q += g.size) {
                 memcpy(&g, q, sizeof g);
-                if (g.op == OP_COPY_STRIDE && g.size >= 8 + sizeof(p_copy_stride)) {
-                    p_copy_stride s; memcpy(&s, q + 8, sizeof s); row = (ptrdiff_t)s.stride; *known = 1;
+                if (g.size < 8 || (g.size & 7) || (size_t)(e - q) < g.size) { *known = -1; break; }
+                if (g.op == want_op && g.size >= 8 + sizeof(p_copy_stride)) {
+                    p_copy_stride s; memcpy(&s, q + 8, sizeof s); val = (ptrdiff_t)s.stride; *known = 1;
                 }
             }
-        } else if (h.op == OP_COPY_STRIDE && h.size >= 8 + sizeof(p_copy_stride)) {
-            p_copy_stride s; memcpy(&s, p + 8, sizeof s); row = (ptrdiff_t)s.stride; *known = 1;
+        } else if (h.op == want_op && h.size >= 8 + sizeof(p_copy_stride)) {
+            p_copy_stride s; memcpy(&s, p + 8, sizeof s); val = (ptrdiff_t)s.stride; *known = 1;
         }
         p += h.size;
     }
-    return row;
+    return val;
 }
 NVN(nvnCommandBufferCopyBufferToTexture, void, NVNcommandBuffer *c, NVNbufferAddress src, const NVNtexture *t, const NVNtextureView *v,
     const NVNcopyRegion *r, int flags) {
     if (totk_texcopy_on()) {
-        int known; ptrdiff_t row = texcopy_recorded_row(c, &known);
-        totk_texcopy_side source = {.addr = src, .bytes = totk_texcopy_buffer_size(CTX(t), r, row, 0)};
+        int known, iknown; ptrdiff_t row = recorded_copy_stride(c, OP_COPY_STRIDE, &known), img = recorded_copy_stride(c, OP_COPY_IMAGE_STRIDE, &iknown);
+        totk_texcopy_side source = {.addr = src, .bytes = totk_texcopy_buffer_size(CTX(t), r, row, img)};
         totk_texcopy_side destination = {.tex = CTX(t), .view = (const view_t *)v, .region = r};
-        char details[160]; snprintf(details, sizeof details, "flags=%#x row=%lld row_source=%s result=pending-record", flags,
-                                   (long long)row, known > 0 ? "recorded" : known < 0 ? "unavailable" : "default-or-inherited");
+        char details[192]; snprintf(details, sizeof details, "flags=%#x row=%lld row_source=%s img=%lld result=pending-record", flags,
+                                    (long long)row, known > 0 ? "recorded" : known < 0 ? "unavailable" : "default-or-inherited", (long long)img);
         totk_texcopy_frontend("nvnCommandBufferCopyBufferToTexture", "record", totk_texcopy_caller(), c, &source, &destination, details);
     }
     p_copy_b2t *o = REC(c, OP_COPY_B2T, p_copy_b2t); o->src = src; o->tex = tex_pin(t); copy_view(&o->view, &o->has_view, v); o->r = *r; o->flags = flags;
@@ -2273,11 +2283,11 @@ NVN(nvnCommandBufferCopyBufferToTexture, void, NVNcommandBuffer *c, NVNbufferAdd
 NVN(nvnCommandBufferCopyTextureToBuffer, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r,
     NVNbufferAddress dst, int flags) {
     if (totk_texcopy_on()) {
-        int known; ptrdiff_t row = texcopy_recorded_row(c, &known);
+        int known, iknown; ptrdiff_t row = recorded_copy_stride(c, OP_COPY_STRIDE, &known), img = recorded_copy_stride(c, OP_COPY_IMAGE_STRIDE, &iknown);
         totk_texcopy_side source = {.tex = CTX(t), .view = (const view_t *)v, .region = r};
-        totk_texcopy_side destination = {.addr = dst, .bytes = totk_texcopy_buffer_size(CTX(t), r, row, 0)};
-        char details[160]; snprintf(details, sizeof details, "flags=%#x row=%lld row_source=%s result=pending-record", flags,
-                                   (long long)row, known > 0 ? "recorded" : known < 0 ? "unavailable" : "default-or-inherited");
+        totk_texcopy_side destination = {.addr = dst, .bytes = totk_texcopy_buffer_size(CTX(t), r, row, img)};
+        char details[192]; snprintf(details, sizeof details, "flags=%#x row=%lld row_source=%s img=%lld result=pending-record", flags,
+                                    (long long)row, known > 0 ? "recorded" : known < 0 ? "unavailable" : "default-or-inherited", (long long)img);
         totk_texcopy_frontend("nvnCommandBufferCopyTextureToBuffer", "record", totk_texcopy_caller(), c, &source, &destination, details);
     }
     p_copy_b2t *o = REC(c, OP_COPY_T2B, p_copy_b2t); o->src = dst; o->tex = tex_pin(t); copy_view(&o->view, &o->has_view, v); o->r = *r; o->flags = flags;
@@ -2302,6 +2312,9 @@ NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNte
     copy_view(&o->sv, &o->has_sv, sv); copy_view(&o->dv, &o->has_dv, dv); o->sr = *sr; o->dr = *dr; o->flags = flags;
 }
 NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_STRIDE, p_copy_stride)->stride = st; }
+NVN(nvnCommandBufferSetCopyImageStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_IMAGE_STRIDE, p_copy_stride)->stride = st; }
+NVN(nvnCommandBufferGetCopyRowStride, ptrdiff_t, const NVNcommandBuffer *c) { int known; return recorded_copy_stride(c, OP_COPY_STRIDE, &known); }
+NVN(nvnCommandBufferGetCopyImageStride, ptrdiff_t, const NVNcommandBuffer *c) { int known; return recorded_copy_stride(c, OP_COPY_IMAGE_STRIDE, &known); }
 NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
 NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float r) { REC(c, OP_ALPHA_REF, p_alpha_ref)->value = r; }
 
@@ -2582,7 +2595,7 @@ static void submit_exec(int n, const uint64_t *h, void *ucap, uint64_t guest_ns,
     pin_step(__atomic_load_n(&g_submits, __ATOMIC_RELAXED));   /* TOTK: free texture copies no recording refers to any more */
     if (cmdlog_env()) for (int i = 0; i < n; i++) {
         unsigned ops = 0, draws = 0, calls = 0; const uint8_t *p = (const uint8_t *)h[i];
-        for (;;) { op_hdr hh; memcpy(&hh, p, sizeof hh); ops++; if (hh.op == OP_DRAW || hh.op == OP_DRAW_IDX) draws++; if (hh.op == OP_CALL) calls++; if (hh.op == OP_END || hh.size < 8 || ops > 1000000) break; p += hh.size; }
+        for (;;) { op_hdr hh; memcpy(&hh, p, sizeof hh); ops++; if (hh.op == OP_DRAW || hh.op == OP_DRAW_IDX || hh.op == OP_DRAW_INDIRECT || hh.op == OP_DRAW_IDX_INDIRECT) draws++; if (hh.op == OP_CALL) calls++; if (hh.op == OP_END || hh.size < 8 || ops > 1000000) break; p += hh.size; }
         LOG("[cmd] Submit %d/%d handle=%#llx ops=%u draws=%u calls=%u", i, n, (unsigned long long)h[i], ops, draws, calls); }
     if (getenv("TOTK_CHAIN_LOG")) { static int k; if (k++ < 20) guest_chain("Submit"); }
     uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);

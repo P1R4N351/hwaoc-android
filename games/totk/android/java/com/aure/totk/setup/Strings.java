@@ -631,7 +631,9 @@ final class Strings {
             case "too_many": return "This has more than 500 files, so it is not a " + GameBuild.TITLE + " save set.";
             case "too_big": return "This is larger than 128 MB, so it is not a " + GameBuild.TITLE + " save set.";
             case "huge_file": return "It contains a file far larger than any save file, so it was not imported.";
-            case "no_saves": return "No " + GameBuild.TITLE + " saves found. A save set has " + GameBuild.SAVE_SLOT_NAMES + " folders with " + GameBuild.SAVE_SLOT_FILE
+            case "no_saves": return GameBuild.SAVE_SLOT_DIR.isEmpty()
+                    ? "No " + GameBuild.TITLE + " saves found. A save set has a " + GameBuild.SAVE_SLOT_FILE + " file."
+                    : "No " + GameBuild.TITLE + " saves found. A save set has " + GameBuild.SAVE_SLOT_NAMES + " folders with " + GameBuild.SAVE_SLOT_FILE
                     + ", or option.sav.";
             case "corrupt": return "The saves are damaged or do not match their list of files" + (detail == null ? "." : ": " + detail);
             case "not_zip": return "That file is not a zip archive.";

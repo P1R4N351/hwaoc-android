@@ -15,7 +15,7 @@ extern int vk_one_primary_on;
     X(CopyQueryPoolResults) X(CopyBufferToImage) X(CopyImageToBuffer) X(CopyImage) \
     X(BlitImage) X(ClearColorImage) X(ClearDepthStencilImage) X(ClearAttachments) \
     X(PushConstants) X(BindPipeline) X(BindDescriptorSets) X(BindVertexBuffers2) \
-    X(BindIndexBuffer) X(Draw) X(DrawIndexed) X(Dispatch) X(SetViewport) \
+    X(BindIndexBuffer) X(Draw) X(DrawIndexed) X(DrawIndirect) X(DrawIndexedIndirect) X(Dispatch) X(SetViewport) \
     X(SetScissor) X(SetDepthBias) X(SetBlendConstants) X(SetStencilCompareMask) \
     X(SetStencilWriteMask) X(SetStencilReference) X(SetCullMode) X(SetFrontFace) \
     X(SetPrimitiveTopology) X(SetDepthTestEnable) X(SetDepthWriteEnable) \
@@ -107,6 +107,8 @@ void vk_sections_destroy_view(VkDevice dev, VkImageView view, const VkAllocation
 #define vkCmdBindIndexBuffer(cb, ...) vkCmdBindIndexBuffer(vk_sections_command_kind(cb, VK_SECTION_BindIndexBuffer), __VA_ARGS__)
 #define vkCmdDraw(cb, ...) vkCmdDraw(vk_sections_command_kind(cb, VK_SECTION_Draw), __VA_ARGS__)
 #define vkCmdDrawIndexed(cb, ...) vkCmdDrawIndexed(vk_sections_command_kind(cb, VK_SECTION_DrawIndexed), __VA_ARGS__)
+#define vkCmdDrawIndirect(cb, ...) vkCmdDrawIndirect(vk_sections_command_kind(cb, VK_SECTION_DrawIndirect), __VA_ARGS__)
+#define vkCmdDrawIndexedIndirect(cb, ...) vkCmdDrawIndexedIndirect(vk_sections_command_kind(cb, VK_SECTION_DrawIndexedIndirect), __VA_ARGS__)
 #define vkCmdDispatch(cb, ...) vkCmdDispatch(vk_sections_command_kind(cb, VK_SECTION_Dispatch), __VA_ARGS__)
 #define vkCmdSetViewport(cb, ...) vkCmdSetViewport(vk_sections_command_kind(cb, VK_SECTION_SetViewport), __VA_ARGS__)
 #define vkCmdSetScissor(cb, ...) vkCmdSetScissor(vk_sections_command_kind(cb, VK_SECTION_SetScissor), __VA_ARGS__)

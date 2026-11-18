@@ -366,6 +366,12 @@ class SavesTests(ProbeCase):
         self.assertEqual(tree(self.dir / 's1'), tree(root))
 
 
+def hwaoc_save_set(base, size=1048576, seed=1):
+    base.mkdir(parents=True, exist_ok=True)
+    (base / 'svdt').write_bytes(bytes([seed % 256]) * size)
+    return base
+
+
 class BotWSavesTests(ProbeCase):
     """The save manager built as BotW Native: its slot layout is found, listed, exported, imported and backed up."""
     GAME = 'botw'
@@ -430,6 +436,68 @@ class BotWSavesTests(ProbeCase):
         self.assertEqual(self.one('backups', backups), f'{name}:manual:6')
         self.assertEqual(tree(backups / name / 'save'), before)
         staged = botw_save_set(files / 'save-staging/import', slots=(0, 1), seed=9)
+        incoming = tree(staged)
+        answer = self.one('replace', files, staged, 'import', 1_700_000_000_000)
+        self.assertTrue(answer.startswith('ok '), answer)
+        self.assertEqual(tree(live), incoming)
+        self.assertEqual(tree(files / 'save-backups' / answer.split()[1] / 'save'), before)
+
+
+class HwaocSavesTests(ProbeCase):
+    """The save manager built as AoC Native: flat single-file svdt save layout is listed, imported, exported, and backed up."""
+    GAME = 'hwaoc'
+
+    def test_flat_svdt_slot_of_the_live_root(self):
+        root = hwaoc_save_set(self.dir / 'save/ed6c25b6e39046c2d3b0a0b305767b46', seed=5)
+        os.utime(root / 'svdt', (1_763_300_000, 1_763_300_000))
+        slots = self.one('slots', root, 'UTC').split()
+        self.assertEqual(slots, ['0:2025-11-16T13:33:20'])
+        self.assertEqual(self.one('pictures', root), '0:-:-')
+
+    def test_flat_save_root_detection(self):
+        flat = hwaoc_save_set(self.dir / 'flat', seed=1)
+        jksv = self.dir / 'jksv/JKSV/Hyrule Warriors Age of Calamity'
+        older = hwaoc_save_set(jksv / 'Local - 2023.05.18', seed=2)
+        newer = hwaoc_save_set(jksv / 'Local - 2023.06.01', seed=3)
+        os.utime(older / 'svdt', (1_684_000_000, 1_684_000_000))
+        os.utime(newer / 'svdt', (1_685_600_000, 1_685_600_000))
+        totk = save_set(self.dir / 'totk', slots=(0, 1), extra=False)
+        (self.dir / 'other').mkdir(parents=True, exist_ok=True)
+        (self.dir / 'other/README.txt').write_text('not a save\n')
+        answers = self.probe(('select', flat), ('select', self.dir / 'jksv'), ('select', self.dir / 'other'), ('select', totk))
+        self.assertEqual(answers[0], 'root= files=1 total=1048576 manifest=false')
+        self.assertTrue(answers[1].startswith('root=JKSV/Hyrule Warriors Age of Calamity/Local - 2023.06.01/ files=1 '), answers[1])
+        self.assertEqual(answers[2:], ['invalid no_saves', 'invalid no_saves'])
+
+    def test_export_import_round_trip(self):
+        live = hwaoc_save_set(self.dir / 'live', seed=7)
+        exported = self.dir / 'export.zip'
+        self.assertEqual(self.one('top'), 'AoC Native saves|AoC Native saves NNNN-NN-NN NNNN.zip')
+        self.assertEqual(self.one('export', live, exported), '1')
+        with zipfile.ZipFile(exported) as z:
+            names = z.namelist()
+            manifest = z.read(names[-1]).decode()
+        self.assertEqual(names[-1], 'AoC Native saves/totk-native-saves.json')
+        self.assertIn('"title_id":"01002B00111A2000"', manifest)
+        self.assertIn('AoC Native saves/svdt', names)
+        self.assertEqual(self.one('zip', exported, self.dir / 'staged'), 'root=AoC Native saves/ files=1')
+        self.assertEqual(tree(self.dir / 'staged'), tree(live))
+        totk = self.dir / 'totk.zip'
+        with zipfile.ZipFile(totk, 'w') as z:
+            z.writestr('TotK Native saves/svdt', b's' * 16)
+            z.writestr('TotK Native saves/totk-native-saves.json', manifest.replace('01002B00111A2000', '0100F2C0115B6000'))
+        self.assertEqual(self.one('zip', totk, self.dir / 'staged-totk'), 'invalid corrupt')
+
+    def test_backup_counts_and_restores_flat_save(self):
+        files = self.dir / 'files'
+        root_name = self.one('root', files)
+        live = hwaoc_save_set(files / 'user-data/save' / root_name, seed=1)
+        before = tree(live)
+        backups = self.dir / 'backups'
+        name = self.one('backup', live, backups, 'manual', 1_700_000_000_000)
+        self.assertEqual(self.one('backups', backups), f'{name}:manual:1')
+        self.assertEqual(tree(backups / name / 'save'), before)
+        staged = hwaoc_save_set(files / 'save-staging/import', seed=9)
         incoming = tree(staged)
         answer = self.one('replace', files, staged, 'import', 1_700_000_000_000)
         self.assertTrue(answer.startswith('ok '), answer)
