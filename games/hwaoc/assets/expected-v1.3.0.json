@@ -1,0 +1,28 @@
+{
+  "_comment": "Verified Age of Calamity 1.3.0 (v327680) ExeFS source pins and M1 Android rewriter status (DM_HOST_TP=tpidr_el0). main rewrite awaits the jump-table lr/fp index fix in games/totk/third_party/d2r/patch_nso.py.",
+  "title_id": "01002B00111A2000",
+  "version": 327680,
+  "display_version": "1.3.0",
+  "build_ids": {
+    "main": "c3cf52bf2b05d7310884971b50bcccb8974577bc000000000000000000000000",
+    "rtld": "51b657503637c8a8d6729ce7d8ddaa6a163c356a000000000000000000000000",
+    "sdk": "95832210b36121e88b4f9b7b66239dade9c82a67000000000000000000000000",
+    "subsdk0": "3ab92c3444d4ece2f52417b5d8ee86eb115212a3000000000000000000000000"
+  },
+  "exefs_sha256": {
+    "main": "84fbac8bb4734cdbeb3362a87479e484915682791688a2e8b2258b8229541022",
+    "main.npdm": "6ffc47950fde1f67e4024e621a01f8f7e062f233ccd2b892844424f95e7a7063",
+    "rtld": "b09545d23efe76925191e9ded2c5ca81179f07fc823162c2b367a63b82d8d9fc",
+    "sdk": "71a49827250b6bc2883ac44e5d42f4d20110a95d930c2387311c7ff415eb4534",
+    "subsdk0": "b515e170ed8799af63e0f2e1a58b344ec8c78605976a2148374d13e6ced93d30"
+  },
+  "android_rewritten_sha256": {
+    "main.patched.bin": null,
+    "sdk.patched.bin": "b6cc413ad5854ab562a601dfe751c3ac588d6e3173893abd7b2bb4f8d828b573",
+    "subsdk0.patched.bin": "146e4de3ef491bde117d1160df3aa10723b79b2a0fbaf0904239f77c10913961"
+  },
+  "m1_blocked_reason": "patch_nso.py AssertionError: jump table 138216c (Capstone reg_name returns 'lr' for x30 in add x18, x18, x30, lsl #2)",
+  "romfs": {
+    "files": 1101
+  }
+}
