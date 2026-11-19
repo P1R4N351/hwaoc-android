@@ -10,7 +10,7 @@ This branch adds a third Switch 1 game to the Android port: **Hyrule Warriors: A
 |---|---|
 | Build | `make -C games/totk/android VERSION=hwaoc130 TARGET=android APP=0 GPU={null,vk} ...` / `tools/build_app.sh hwaoc {dev,release}` |
 | Defines | `-DGAME_HWAOC -DGAME_HWAOC130` (`games/games.toml`) |
-| App flavours | `io.github.p1r4n351.hwaoc` (`0.1.0-pre.1`, release) and `io.github.p1r4n351.hwaoc.dev` (`0.1.0-dev`, debuggable) |
+| App flavours | `io.github.p1r4n351.hwaoc` (`0.1.0-beta.1`, release) and `io.github.p1r4n351.hwaoc.dev` (`0.1.0-dev`, debuggable) |
 | Game patches | `runtime/game_patches_hwaoc.c`: shifts `4 MiB` from the KTSL2 data heap to the KTSL2 engine heap (`main+0x8d9610`/`0x8d9618`, `15+142 -> 19+138 MiB`, disabled with `TOTK_KTSL_HEAP=0`) and emits 30s frame telemetry |
 | Memory pool reserve | `services.c`: `GetInfo(7/22)` includes a `16 MiB` default reserve (`TOTK_MEM_RESERVE`) before `SetHeapSize` runs so `nninitStartup` (`main+0x8ad2f0`) leaves room inside `APP_POOL` for `MapPhysicalMemory` worker thread stacks |
 | NVN level & graphics | `hle_nvn.c` / `vk_draw.c`: NVN `53.312` (`main+0x9f94..0x9f9c`), `NEAR_IS_MINUS_W`, `nvnQueueAcquireTexture`, separable `nvnCommandBufferBindProgram`, `nvnCommandBufferSetCopyImageStride`, `nvnTexturePoolRegisterImage`, `nvnCommandBufferDrawArraysIndirect` (incl. `QUADS` rewrite via `quad_indirect_spv`), `nvnCommandBufferDrawElementsIndirect` |
