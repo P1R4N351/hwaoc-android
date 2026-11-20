@@ -32,6 +32,24 @@
 #include "vk_edge_guard.h"
 #include "vk_res_fast.h"
 #include "vk_tbuf_fast.h"
+#include "vk_view_fast.h"
+static __thread totk_view_memo4 *T_view_memo;
+static __thread totk_view_id_memo4 *T_view_id_memo;
+static __thread totk_view_cut_memo4 *T_view_cut_memo;
+static inline uint64_t tex_view_meta_key(const tex_t *t, int attach) {
+    return (uint64_t)(uint32_t)t->d.format | ((uint64_t)(uint8_t)t->d.target << 32) |
+           ((uint64_t)(attach & 3) << 40) | ((uint64_t)(t->d.dsmode != 0) << 42) |
+           ((uint64_t)(t->d.swizzle_r & 7) << 43) | ((uint64_t)(t->d.swizzle_g & 7) << 46) |
+           ((uint64_t)(t->d.swizzle_b & 7) << 49) | ((uint64_t)(t->d.swizzle_a & 7) << 52);
+}
+static inline void tex_view_pack(const view_t *v, uint64_t *v0, uint64_t *v1) {
+    static const uint8_t z[4] = {0, 0, 0, 0};
+    if (!v) totk_view_pack_fields(0, 0, 0, 0, 0, 0, 0, 0u, 0u, 0u, 0u, 0u, 0u, z, v0, v1);
+    else totk_view_pack_fields(v->set_levels, v->set_layers, v->set_format, v->set_target,
+                               v->set_swizzle, v->set_dsmode, v->dsmode,
+                               v->base_level, v->nlevels, v->target,
+                               v->min_layer, v->nlayers, v->format, v->swz, v0, v1);
+}
 static int res_fast_on(void) {
     static _Atomic int on = -1;
     int v = atomic_load_explicit(&on, memory_order_relaxed);
@@ -1843,6 +1861,17 @@ static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_tar
 /* Diagnostic identity comes from the actual cached Vulkan view, not a guessed registry range.
    No resource is created, content resolved or pass ended by this metadata query. */
 int vk_tex_view_identity(vk_tex *x, VkImageView view, vk_canvas_image *image, VkImageSubresourceRange *range) {
+    int fast = totk_view_fast_on() && x != NULL && view != VK_NULL_HANDLE;
+    if (fast && T_view_id_memo) {
+        uint64_t rev = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire);
+        const totk_view_id_ent *e = totk_view_id_get(T_view_id_memo, (uint64_t)(uintptr_t)x, (uint64_t)(uintptr_t)view, rev);
+        if (e) {
+            *range = (VkImageSubresourceRange){(VkImageAspectFlags)e->aspect, e->base_mip, e->level_cnt, e->base_layer, e->layer_cnt};
+            *image = (vk_canvas_image){.image = e->img_u, .incarnation = e->incarn, .storage = e->storage,
+                .size = e->size, .serial = e->serial, .width = e->width, .height = e->height, .format = (VkFormat)e->fmt_u};
+            return 1;
+        }
+    }
     int found = 0;
     pthread_mutex_lock(&g_tex_mu);
     vk_img *images[2] = {x ? x->im : NULL, x && x->im ? x->im->native : NULL};
@@ -1857,6 +1886,18 @@ int vk_tex_view_identity(vk_tex *x, VkImageView view, vk_canvas_image *image, Vk
                 .storage=im->shared ? im->k.mem : (uint64_t)(uintptr_t)x->t.mem,
                 .size=im->shared ? im->k.size : x->t.L.size, .serial=x->serial,
                 .width=im->w, .height=im->h, .format=(VkFormat)(uint32_t)a};
+            if (fast) {
+                if (!T_view_id_memo) T_view_id_memo = calloc(1, sizeof *T_view_id_memo);
+                if (T_view_id_memo) {
+                    uint64_t rev = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire);
+                    totk_view_id_ent ent = {(uint64_t)(uintptr_t)x, (uint64_t)(uintptr_t)view, rev,
+                        image->image, image->incarnation, image->storage, image->size, image->serial,
+                        image->width, image->height, (uint32_t)image->format, (uint32_t)range->aspectMask,
+                        range->baseMipLevel, range->levelCount, range->baseArrayLayer, range->layerCount,
+                        (int32_t)((a >> 32) & 0xff), 1u};
+                    totk_view_id_put(T_view_id_memo, &ent);
+                }
+            }
             found = 1; break;
         }
     }
@@ -1866,10 +1907,22 @@ int vk_tex_view_identity(vk_tex *x, VkImageView view, vk_canvas_image *image, Vk
 /* TOTK_VK_FEEDBACK_CUT: the same cached view (format, type, aspect, swizzle, layers, base level) with only its first
    `levels` levels, cached beside it. The original view when it is unknown or already that short. */
 VkImageView vk_tex_view_levels(vk_tex *x, VkImageView view, uint32_t levels) {
+    int fast = totk_view_fast_on() && x != NULL && x->im != NULL && view != VK_NULL_HANDLE && levels > 0u;
+    if (fast) {
+        if (!T_view_cut_memo) T_view_cut_memo = calloc(1, sizeof *T_view_cut_memo);
+        if (T_view_cut_memo) {
+            uint64_t rev = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire), cu = 0;
+            if (totk_view_cut_get(T_view_cut_memo, (uint64_t)(uintptr_t)x->im, x->im->incarnation,
+                                  rev, (uint64_t)(uintptr_t)view, levels, &cu))
+                return (VkImageView)(uintptr_t)cu;
+        }
+    }
     VkImageView result = view;
+    int found_view = 0;
     pthread_mutex_lock(&g_tex_mu);
     vk_img *im = x ? x->im : NULL;
     for (int i = 0; im && levels && i < im->nviews; i++) if (im->views[i].v == view) {
+        found_view = 1;
         uint64_t k0 = im->views[i].k0, k1 = im->views[i].k1;
         uint32_t l0 = (uint32_t)(k1 & 255), nl = (uint32_t)((k1 >> 8) & 255);
         if (levels >= nl) break;
@@ -1883,32 +1936,84 @@ VkImageView vk_tex_view_levels(vk_tex *x, VkImageView view, uint32_t levels) {
             .viewType = (VkImageViewType)(k0 >> 32 & 0xff), .format = (VkFormat)(uint32_t)k0, .components = sw,
             .subresourceRange = {(VkImageAspectFlags)(k0 >> 40 & 0xff), l0, levels, (uint32_t)(k1 >> 16 & 4095), (uint32_t)(k1 >> 28 & 4095)}};
         VkImageView v;
-        if (vkCreateImageView(V.dev, &ci, NULL, &v)) { RED(16, "feedback-cut view failed (ser %llu)", (unsigned long long)x->serial); break; }
+        if (vkCreateImageView(V.dev, &ci, NULL, &v)) { RED(16, "feedback-cut view failed (ser %llu)", (unsigned long long)x->serial); found_view = 0; break; }
         if (im->nviews == im->capviews) { im->capviews = im->capviews ? 2 * im->capviews : 4; im->views = realloc(im->views, (size_t)im->capviews * sizeof *im->views); }
         im->views[im->nviews++] = (view_ent){k0, cut, v};
         result = v; break;
     }
 done:
+    if (fast && found_view && im && result != VK_NULL_HANDLE && T_view_cut_memo) {
+        uint64_t rev = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire);
+        totk_view_cut_put(T_view_cut_memo, (uint64_t)(uintptr_t)im, im->incarnation, rev,
+                          (uint64_t)(uintptr_t)view, levels, (uint64_t)(uintptr_t)result);
+    }
     pthread_mutex_unlock(&g_tex_mu);
     return result;
 }
 int vk_xlate_texture_view_type(vk_tex *x, VkImageView view) {
+    int fast = totk_view_fast_on() && x != NULL && view != VK_NULL_HANDLE;
+    if (fast && T_view_id_memo) {
+        uint64_t rev = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire);
+        const totk_view_id_ent *e = totk_view_id_get(T_view_id_memo, (uint64_t)(uintptr_t)x, (uint64_t)(uintptr_t)view, rev);
+        if (e) return e->view_type;
+    }
     int type = -1;
     pthread_mutex_lock(&g_tex_mu);
     vk_img *images[2] = {x ? x->im : NULL, x && x->im ? x->im->native : NULL};
     for (int k = 0; k < 2; k++) if (images[k]) {
-        for (int i = 0; i < images[k]->nviews; i++) if (images[k]->views[i].v == view)
-            type = (int)((images[k]->views[i].k0 >> 32) & 0xff);
+        vk_img *im = images[k];
+        for (int i = 0; i < im->nviews; i++) if (im->views[i].v == view) {
+            uint64_t a = im->views[i].k0, b = im->views[i].k1;
+            type = (int)((a >> 32) & 0xff);
+            if (fast) {
+                if (!T_view_id_memo) T_view_id_memo = calloc(1, sizeof *T_view_id_memo);
+                if (T_view_id_memo) {
+                    uint64_t rev = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire);
+                    totk_view_id_ent ent = {(uint64_t)(uintptr_t)x, (uint64_t)(uintptr_t)view, rev,
+                        (uint64_t)(uintptr_t)im->img, im->incarnation,
+                        im->shared ? im->k.mem : (uint64_t)(uintptr_t)x->t.mem,
+                        im->shared ? im->k.size : x->t.L.size, x->serial,
+                        im->w, im->h, (uint32_t)a, (uint32_t)((a >> 40) & 255),
+                        (uint32_t)(b & 255), (uint32_t)((b >> 8) & 255),
+                        (uint32_t)((b >> 16) & 4095), (uint32_t)((b >> 28) & 4095),
+                        (int32_t)type, 1u};
+                    totk_view_id_put(T_view_id_memo, &ent);
+                }
+            }
+        }
     }
     pthread_mutex_unlock(&g_tex_mu);
     return type;
+}
+static VkImageView view_get_fast_wrap(vk_tex *x, const view_t *v, int attach) {
+    int fast = totk_view_fast_on() && x != NULL && x->im != NULL;
+    uint64_t v0 = 0, v1 = 0, t_meta = 0;
+    if (fast) {
+        if (!T_view_memo) T_view_memo = calloc(1, sizeof *T_view_memo);
+        tex_view_pack(v, &v0, &v1);
+        t_meta = tex_view_meta_key(&x->t, attach);
+        if (T_view_memo) {
+            uint64_t rev = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire), vu = 0;
+            if (totk_view_memo4_get(T_view_memo, (uint64_t)(uintptr_t)x->im, x->im->incarnation,
+                                    rev, t_meta, v0, v1, &vu))
+                return (VkImageView)(uintptr_t)vu;
+        }
+    }
+    pthread_mutex_lock(&g_tex_mu);
+    VkImageView r = x && x->im ? view_get(x, v, attach, -1) : VK_NULL_HANDLE;
+    if (fast && r != VK_NULL_HANDLE && x->im && T_view_memo) {
+        uint64_t rev = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire);
+        totk_view_memo4_put(T_view_memo, (uint64_t)(uintptr_t)x->im, x->im->incarnation,
+                            rev, t_meta, v0, v1, (uint64_t)(uintptr_t)r);
+    }
+    pthread_mutex_unlock(&g_tex_mu);
+    return r;
 }
 VkImageView vk_tex_view(vk_tex *x, const tex_t *t, const view_t *v, int attach) {
     if (!attach) vk_draw_texture_read(0,t);
     if (!attach) vk_tex_native_read(x);
     (void)t;
-    pthread_mutex_lock(&g_tex_mu); VkImageView r = x && x->im ? view_get(x, v, attach, -1) : VK_NULL_HANDLE; pthread_mutex_unlock(&g_tex_mu);
-    return r;
+    return view_get_fast_wrap(x, v, attach);
 }
 
 void vk_native_window_size(uint32_t w, uint32_t h) {
@@ -1983,9 +2088,7 @@ static vk_post_output scene_image(vk_tex *owner, vk_img *im, int attach) {
     vk_tex host=*owner; host.im=im;
     host.t.d.format=im->nvn_fmt;
     view_t view={.set_levels=1,.nlevels=1,.set_layers=1,.nlayers=1,.set_swizzle=1,.swz={2,3,4,5}};
-    pthread_mutex_lock(&g_tex_mu);
-    VkImageView v=view_get(&host,&view,attach,-1);
-    pthread_mutex_unlock(&g_tex_mu);
+    VkImageView v = view_get_fast_wrap(&host, &view, attach);
     return (vk_post_output){im->img,v,im->w,im->h,im->fmt};
 }
 static int native_scene_seed(vk_tex *x, vk_img *host, uint32_t w, uint32_t h) {
@@ -2067,10 +2170,7 @@ int vk_tex_native_backed(vk_tex *x) { return x && x->im && x->im->native; }
 static VkImageView native_view(vk_tex *x, const view_t *view, int attach, int preserve) {
     vk_img *im = native_prepare(x,preserve); if (!im) return VK_NULL_HANDLE;
     vk_tex host = *x; host.im = im;
-    pthread_mutex_lock(&g_tex_mu);
-    VkImageView result = view_get(&host, view, attach, -1);
-    pthread_mutex_unlock(&g_tex_mu);
-    return result;
+    return view_get_fast_wrap(&host, view, attach);
 }
 VkImageView vk_tex_native_view(vk_tex *x, const view_t *view, int attach) { return native_view(x,view,attach,1); }
 VkImageView vk_tex_native_clear_view(vk_tex *x, const view_t *view) {
