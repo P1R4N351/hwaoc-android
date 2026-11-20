@@ -29,6 +29,7 @@
 #define MAX_FRAME 1024
 #define RING_FRAMES 16384            /* stereo frames, ~340 ms at 48 kHz */
 #define SPLITTER_UNUSED 0xffffffffu
+#include "audio_fast.h"
 
 typedef struct { float vol[24]; int32_t dest; uint8_t used; AudrenBiquadFloat biquads[2]; float state[2][2]; } SplitDest;
 typedef struct { int32_t ndest; int32_t *ids; } SplitInfo;
@@ -162,7 +163,11 @@ static void pull_frames(Mixer *m, float *out, uint32_t frames) {
     }
     uint32_t n = frames < have ? frames : (uint32_t)have;
     uint64_t nonzero=0;
-    for (uint32_t i = 0; i < n; i++) { uint64_t k = (rd + i) % RING_FRAMES; out[2 * i] = m->ring[2 * k]; out[2 * i + 1] = m->ring[2 * k + 1];if(out[2*i]!=0 || out[2*i+1]!=0)nonzero++; }
+    if (totk_audio_fast_enabled()) {
+        totk_ring_pull_stereo(m->ring, RING_FRAMES, rd, out, n, &nonzero);
+    } else {
+        for (uint32_t i = 0; i < n; i++) { uint64_t k = (rd + i) % RING_FRAMES; out[2 * i] = m->ring[2 * k]; out[2 * i + 1] = m->ring[2 * k + 1];if(out[2*i]!=0 || out[2*i+1]!=0)nonzero++; }
+    }
     atomic_fetch_add(&m->callback_nonzero,nonzero);
     if (n < frames) { memset(out + 2 * n, 0, (frames - n) * 2 * sizeof(float));atomic_fetch_add(&m->underruns,1);atomic_fetch_add(&m->missing_frames,frames-n);m->ready=0; }
     atomic_store_explicit(&m->rd, rd + n, memory_order_release);
@@ -314,7 +319,8 @@ static void output_push(Mixer *m, const float *lr, int frames) {
     if (audio_mixer_output_paused()) return;
     uint64_t wr = atomic_load(&m->wr), rd = atomic_load_explicit(&m->rd, memory_order_acquire);
     if (m->unit_ok && wr + (uint64_t)frames - rd > RING_FRAMES) { atomic_fetch_add(&m->overruns, 1); return; }   /* device stalled: drop this frame */
-    for (int i = 0; i < frames; i++) { uint64_t k = (wr + (uint64_t)i) % RING_FRAMES; m->ring[2 * k] = lr[2 * i]; m->ring[2 * k + 1] = lr[2 * i + 1]; }
+    if (totk_audio_fast_enabled()) totk_ring_push_stereo(m->ring, RING_FRAMES, wr, lr, (uint32_t)frames);
+    else for (int i = 0; i < frames; i++) { uint64_t k = (wr + (uint64_t)i) % RING_FRAMES; m->ring[2 * k] = lr[2 * i]; m->ring[2 * k + 1] = lr[2 * i + 1]; }
     atomic_store_explicit(&m->wr, wr + (uint64_t)frames, memory_order_release);
     if (!m->unit_ok) atomic_store(&m->rd, wr + (uint64_t)frames);   /* no device: the ring only keeps the latest frames */
 }
@@ -549,6 +555,77 @@ static void walk_step(Walk *w) {   /* the same transitions as advance_voice in a
     if (b->end_of_stream && !AUDIO_EOS_PLAYS_ON) w->ended = 1;
     walk_skip_empty(w);
 }
+static uint64_t adpcm_span_offsets(double step, double frac, int frames, uint16_t rel[MAX_FRAME]) {
+    uint64_t off = 0;
+    for (int k = 0; k < frames; k++) {
+        rel[k] = (uint16_t)off;
+        frac += step;
+        while (frac >= 1.0) { frac -= 1.0; off++; }
+    }
+    return frames > 0 ? rel[frames - 1] : 0;
+}
+static int voice_render_adpcm_fast(ServerVoice *v, Walk *w, const AudrenWaveBuffer *b,
+                                   double step, double frac, float out[6][MAX_FRAME], int frames) {
+    if (!v->in.extra_address || v->in.extra_size < 32) return 0;
+    uint16_t rel[MAX_FRAME];
+    uint64_t span = adpcm_span_offsets(step, frac, frames, rel);
+    if (span > 2048u) return 0;
+    uint64_t i_first = (uint64_t)b->start + w->offset;
+    uint64_t i_next_end = i_first + span + 1u;
+    if (((i_next_end / 14u) + 1u) * 8u > b->size) return 0;
+    const int16_t *coef = (const int16_t *)(uintptr_t)v->in.extra_address;
+    int16_t pcm[2052];
+    if (w->abuf != (int32_t)w->index || w->aat > i_first + 1u) {
+        w->abuf = (int32_t)w->index;
+        if (b->context_address && b->context_size >= 6) {
+            const int16_t *ctx = (const int16_t *)(uintptr_t)b->context_address;
+            w->h1 = ctx[1]; w->h2 = ctx[2]; w->aat = (uint64_t)b->start;
+        } else {
+            w->aat = (uint64_t)b->start - (uint64_t)b->start % 14u;
+        }
+        if (i_first < w->aat) w->aat = i_first;
+    }
+    while (w->aat <= i_first) (void)adpcm_next(w, b, coef, w->aat++);
+    pcm[0] = w->h1;
+    for (uint64_t s = 1u; s <= span; s++) {
+        uint64_t idx = i_first + s;
+        pcm[s] = (w->aat <= idx) ? adpcm_next(w, b, coef, w->aat++) : w->h1;
+    }
+    int16_t saved_h1 = w->h1, saved_h2 = w->h2;
+    uint64_t saved_aat = w->aat;
+    pcm[span + 1u] = adpcm_next(w, b, coef, w->aat++);
+    if (TOTK_AUD_FAULT() != 2) { w->h1 = saved_h1; w->h2 = saved_h2; w->aat = saved_aat; }
+    double f = frac;
+    for (int k = 0; k < frames; k++) {
+        uint16_t r0 = rel[k];
+        float s0 = pcm[r0] / 32768.0f, s1 = pcm[r0 + 1u] / 32768.0f;
+        out[0][k] = (float)(s0 + (s1 - s0) * f);
+        f += step;
+        while (f >= 1.0) f -= 1.0;
+    }
+    return 1;
+}
+static int voice_render_fast(ServerVoice *v, Walk *w, int cc, double step, double frac,
+                             float out[6][MAX_FRAME], int frames) {
+    if (w->ended || !w->valid[w->index] || frames <= 0 || frames > MAX_FRAME) return 0;
+    if (step < 0.0 || step > 8.0) return 0;
+    const AudrenWaveBuffer *b = &v->buffers[w->index];
+    if (!b->address || b->end <= b->start) return 0;
+    uint64_t length = (uint64_t)(b->end - b->start);
+    uint64_t max_adv = (uint64_t)(frac + (double)frames * step + 2.0);
+    if (w->offset + max_adv >= length) return 0;
+    int fmt = v->in.sample_format;
+    if (fmt == FMT_ADPCM && cc == 1) return voice_render_adpcm_fast(v, w, b, step, frac, out, frames);
+    if (fmt == FMT_PCM16 && (cc == 1 || cc == 2) && (b->address & 1u) == 0u) {
+        uint64_t need_bytes = ((uint64_t)b->start + w->offset + max_adv + 1u) * (uint64_t)cc * 2u;
+        if (need_bytes > b->size) return 0;
+        const int16_t *pcm = (const int16_t *)(uintptr_t)b->address + ((uint64_t)b->start + w->offset) * (uint64_t)cc;
+        if (frac == 0.0 && step == 1.0) totk_pcm16_unit_render(pcm, cc, out, frames);
+        else totk_pcm16_interp_render(pcm, cc, step, frac, out, frames);
+        return 1;
+    }
+    return 0;
+}
 /* Decodes `frames` output samples per channel into out[c][k]; the renderer advances the voice afterwards by the same amount. */
 static void voice_render(AudioRenderer *r, ServerVoice *v, float out[6][MAX_FRAME], int frames) {
     const double step = v->in.sample_rate * (v->in.pitch > 0 ? v->in.pitch : 1.0) / r->param.sample_rate;
@@ -556,11 +633,13 @@ static void voice_render(AudioRenderer *r, ServerVoice *v, float out[6][MAX_FRAM
     memcpy(w.valid, v->valid, sizeof w.valid);
     walk_skip_empty(&w);
     int cc = (int)v->in.channel_count; double frac = v->fraction;
-    for (int k = 0; k < frames; k++) {
-        Walk next = w; walk_step(&next);
-        for (int c = 0; c < cc; c++) { float s0 = sample_at(&w, c), s1 = sample_at(&next, c); out[c][k] = (float)(s0 + (s1 - s0) * frac); }
-        frac += step;
-        while (frac >= 1.0) { frac -= 1.0; walk_step(&w); }
+    if (!totk_audio_fast_enabled() || !voice_render_fast(v, &w, cc, step, frac, out, frames)) {
+        for (int k = 0; k < frames; k++) {
+            Walk next = w; walk_step(&next);
+            for (int c = 0; c < cc; c++) { float s0 = sample_at(&w, c), s1 = sample_at(&next, c); out[c][k] = (float)(s0 + (s1 - s0) * frac); }
+            frac += step;
+            while (frac >= 1.0) { frac -= 1.0; walk_step(&w); }
+        }
     }
     v->adpcm.history[0] = w.h1; v->adpcm.history[1] = w.h2; v->adpcm.buffer = w.abuf; v->adpcm.at = w.aat;
 }
@@ -569,7 +648,9 @@ static void voice_render(AudioRenderer *r, ServerVoice *v, float out[6][MAX_FRAM
 static float *mixbuf(Mixer *m, int i) { return m->buf + (size_t)i * (size_t)m->frame; }
 static void accumulate(Mixer *m, int buffer, const float *src, float vol, int frames) {
     if (vol == 0 || buffer < 0 || buffer >= m->nbuf) return;
-    float *d = mixbuf(m, buffer); for (int k = 0; k < frames; k++) d[k] += src[k] * vol;
+    float *d = mixbuf(m, buffer);
+    if (totk_audio_fast_enabled()) totk_mix_accumulate(d, src, vol, frames);
+    else for (int k = 0; k < frames; k++) d[k] += src[k] * vol;
 }
 static int mix_valid(AudioRenderer *r, int32_t id) { return id >= 0 && id <= r->param.submix_count && r->mixes[id].in_use; }
 static int mix_depth(AudioRenderer *r, int id, int depth[256], uint8_t visiting[256]) {
@@ -790,6 +871,8 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
         ServerVoice *v = &r->voices[i];
         if (!v->in.in_use || v->state != SV_STARTED || !v->in.sample_rate || !v->valid[v->index]) continue;
         int cc = (int)v->in.channel_count; if (cc < 1 || cc > 6) { report_once(m, 2, "voice channel count unsupported", cc); continue; }
+        const int fast_on = totk_audio_fast_enabled();
+        if (fast_on && totk_voice_can_skip_silent(v->in.sample_format, v->in.volume, v->in.splitter_id, v->in.biquads[0].enable, v->in.biquads[1].enable)) continue;
         voice_render(r, v, vs, frames);
         for (int f = 0; f < 2; f++) if (v->in.biquads[f].enable) {
             const AudrenBiquad *b = &v->in.biquads[f];
@@ -817,7 +900,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
                 const float *source=splitter_filter(d,vs[c],filtered,frames);
                 for (int b = 0; b < r->mixes[d->dest].buffer_count && b < 24; b++) accumulate(m, m->offset[d->dest] + b, source, d->vol[b] * v->in.volume, frames);
             }
-        } else if (mix_valid(r, v->in.mix_id)) {
+        } else if (mix_valid(r, v->in.mix_id) && (!fast_on || v->in.volume != 0.0f)) {
             for (int c = 0; c < cc; c++) {
                 int32_t id = v->in.channel_ids[c]; if (id < 0 || id >= r->param.voice_count * 6) continue;
                 const AudrenChannelIn *ch = &r->channels[id];
@@ -841,7 +924,7 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
                 const float *source=splitter_filter(d,mixbuf(m,src+c),filtered,frames);
                 for (int b = 0; b < r->mixes[d->dest].buffer_count && b < 24; b++) accumulate(m, m->offset[d->dest] + b, source, d->vol[b] * x->volume, frames);
             }
-        } else if (mix_valid(r, x->dest_mix_id)) {
+        } else if (mix_valid(r, x->dest_mix_id) && (!totk_audio_fast_enabled() || x->volume != 0.0f)) {
             for (int c = 0; c < x->buffer_count && c < 24; c++)
                 for (int b = 0; b < r->mixes[x->dest_mix_id].buffer_count && b < 24; b++) accumulate(m, m->offset[x->dest_mix_id] + b, mixbuf(m, src + c), x->mix[c][b] * x->volume, frames);
         }
@@ -860,17 +943,21 @@ void audio_mixer_render(AudioRenderer *r, double seconds) {
         const float gain = atomic_load(&device_volume) * (r->mixes[0].in_use ? r->mixes[0].volume : 1.0f);
         const float *ch[6] = {0};
         for (uint32_t c = 0; c < sink->input_count; c++) if (sink->inputs[c] >= 0 && sink->inputs[c] < m->nbuf) ch[c] = mixbuf(m, sink->inputs[c]);
-        for (int k = 0; k < frames; k++) {
-            float l, rr;
-            if (sink->input_count >= 6) {   /* FL FR C LFE RL RR -> stereo */
-                float ff = sink->downmix_enabled ? sink->downmix[0] : 1.0f, cf = sink->downmix_enabled ? sink->downmix[1] : 0.7071f, sf = sink->downmix_enabled ? sink->downmix[2] : 0.7071f;
-                float C = ch[2] ? ch[2][k] : 0;
-                l = ff * (ch[0] ? ch[0][k] : 0) + cf * C + sf * (ch[4] ? ch[4][k] : 0);
-                rr = ff * (ch[1] ? ch[1][k] : 0) + cf * C + sf * (ch[5] ? ch[5][k] : 0);
-            } else if (sink->input_count >= 2) { l = ch[0] ? ch[0][k] : 0; rr = ch[1] ? ch[1][k] : 0; }
-            else l = rr = ch[0] ? ch[0][k] : 0;
-            l *= gain; rr *= gain;
-            lr[2 * k] = l > 1 ? 1 : l < -1 ? -1 : l; lr[2 * k + 1] = rr > 1 ? 1 : rr < -1 ? -1 : rr;
+        if (totk_audio_fast_enabled()) {
+            totk_sink_downmix_stereo(lr, ch, sink->input_count, sink->downmix_enabled, sink->downmix, gain, frames);
+        } else {
+            for (int k = 0; k < frames; k++) {
+                float l, rr;
+                if (sink->input_count >= 6) {   /* FL FR C LFE RL RR -> stereo */
+                    float ff = sink->downmix_enabled ? sink->downmix[0] : 1.0f, cf = sink->downmix_enabled ? sink->downmix[1] : 0.7071f, sf = sink->downmix_enabled ? sink->downmix[2] : 0.7071f;
+                    float C = ch[2] ? ch[2][k] : 0;
+                    l = ff * (ch[0] ? ch[0][k] : 0) + cf * C + sf * (ch[4] ? ch[4][k] : 0);
+                    rr = ff * (ch[1] ? ch[1][k] : 0) + cf * C + sf * (ch[5] ? ch[5][k] : 0);
+                } else if (sink->input_count >= 2) { l = ch[0] ? ch[0][k] : 0; rr = ch[1] ? ch[1][k] : 0; }
+                else l = rr = ch[0] ? ch[0][k] : 0;
+                l *= gain; rr *= gain;
+                lr[2 * k] = l > 1 ? 1 : l < -1 ? -1 : l; lr[2 * k + 1] = rr > 1 ? 1 : rr < -1 ? -1 : rr;
+            }
         }
     } else if (!sink && !circular) report_once(m, 5, "no device sink in use", r->param.sink_count);
     { /* Per-renderer level report; independent renderers never share scratch or meter state. */
