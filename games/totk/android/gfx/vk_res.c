@@ -34,6 +34,7 @@
 #include "vk_tbuf_fast.h"
 #include "vk_view_fast.h"
 #include "vk_reg_wb_fast.h"
+#include "vk_serial_fast.h"
 static __thread totk_view_memo4 *T_view_memo;
 static __thread totk_view_id_memo4 *T_view_id_memo;
 static __thread totk_view_cut_memo4 *T_view_cut_memo;
@@ -69,6 +70,7 @@ static int res_fast_on(void) {
 #define MAXV(a, b) ((a) > (b) ? (a) : (b))
 #define MINV(a, b) ((a) < (b) ? (a) : (b))
 
+static int serial_fast_on(void) { static int off = -1; if (off < 0) off = vk_off("serialfast"); return !off && totk_vk_serial_fast_on(); }
 /* Independent diagnostic cutouts; defaults retain the current settled-writeback policies. */
 static int backoff_on(void) { static int on = -1; if (on < 0) on = !vk_off("settledbackoff"); return on; }
 static int invalidate_on(void) { static int on = -1; if (on < 0) on = !vk_off("settledinval"); return on; }
@@ -265,6 +267,9 @@ struct vk_tex {
     VkBuffer tb_buffer; VkDeviceSize tb_offset, tb_range;
 };
 static nvn_hmap g_by_serial = {.klen = 8};          /* serial -> vk_tex */
+static _Atomic uint32_t g_tex_serial_gen = 1u;
+static __thread totk_tex_serial_memo4 *T_tex_serial_memo;
+static totk_idle_shared_summary g_idle_shared;
 static nvn_hmap g_by_storage = {.klen = sizeof(stor_key)};   /* stor_key -> vk_img (shared) */
 static nvn_hmap g_window_serials = {.klen = 8};
 static _Atomic uint64_t g_native_extent = (uint64_t)1080 << 32 | 1920;
@@ -372,6 +377,7 @@ static void retire_host(void *p) { if (p) retire((retired_t){.host = p}); }
    texel views must not survive its destruction or the lag-off cutover. */
 void vk_res_buffer_released(VkBuffer buffer) {
     pthread_mutex_lock(&g_tex_mu);
+    atomic_fetch_add_explicit(&g_tex_serial_gen, 1u, memory_order_release);
     atomic_fetch_add_explicit(&g_tbv_evict_gen, 1, memory_order_release);
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         vk_tex *x = g_by_serial.vals ? g_by_serial.vals[i] : NULL;
@@ -409,12 +415,17 @@ void vk_res_sweep(void) {   /* nvn_vk.c, after each commit */
     wb_age_locked();
     /* shared images nobody holds for a while (the game re-creates per-frame textures at the same storage) */
     uint64_t sub = vk_submit_serial();
-    for (uint32_t i = 0; i < g_by_storage.cap; i++) {
-        vk_rec_service_check();
-        vk_img *im = g_by_storage.vals ? g_by_storage.vals[i] : NULL;
-        if (!im || im->refs || im->wbrefs || sub - im->idle_sub < 600) continue;
-        texcopy_retire(im, "sweep");
-        stor_key k = im->k; nvn_hm_del(&g_by_storage, &k); retire_img(im); i--; g_stat_swept++;   /* deletion shifts entries back */
+    if (!(serial_fast_on() && totk_idle_shared_can_skip(&g_idle_shared, sub, 600u))) {
+        uint32_t rem_cnt = 0; uint64_t rem_min = 0;
+        for (uint32_t i = 0; i < g_by_storage.cap; i++) {
+            vk_rec_service_check();
+            vk_img *im = g_by_storage.vals ? g_by_storage.vals[i] : NULL;
+            if (!im || im->refs || im->wbrefs) continue;
+            if (sub - im->idle_sub < 600) { if (!rem_cnt || im->idle_sub < rem_min) rem_min = im->idle_sub; rem_cnt++; continue; }
+            texcopy_retire(im, "sweep");
+            stor_key k = im->k; nvn_hm_del(&g_by_storage, &k); retire_img(im); i--; g_stat_swept++;   /* deletion shifts entries back */
+        }
+        totk_idle_shared_reset(&g_idle_shared, rem_cnt, rem_min);
     }
     pthread_mutex_unlock(&g_tex_mu);
     wb_diag_end(WB_D_SWEEP, start);
@@ -768,44 +779,31 @@ static void tex_drop_locked(vk_tex *x) {
     texcopy_resource("drop", x);
     if (x->tbv) retire_bview(x->tbv, x->tb_buffer);
     if (x->im) {
-        if (x->im->shared) { if (--x->im->refs == 0) x->im->idle_sub = vk_submit_serial(); }
+        if (x->im->shared) { if (--x->im->refs == 0) { x->im->idle_sub = vk_submit_serial(); if (!x->im->wbrefs) totk_idle_shared_note(&g_idle_shared, x->im->idle_sub); } }
         else if (x->im->wbrefs) x->im->orphan = 1;   /* a rendering waiting for write-back keeps it */
         else retire_img(x->im);
     }
     retire_host(x);
 }
-static vk_tex *tex_get_inner(const tex_t *t) {
-    if (!t || !t->serial) return NULL;
-    pthread_mutex_lock(&g_tex_mu);
-    vk_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
-    uint64_t sub = vk_submit_serial();
-    if (x && x->im && x->mirrored && !x->im->gpu_written && x->csub != sub) {   /* once per submission: changed since the upload? */
-        x->csub = sub;
-        stor_key k; vk_img *g = NULL;
-        if (mirshare_on() && stor_key_of(t, &k) && (g = nvn_hm_get(&g_by_storage, &k)) && g != x->im && g->gpu_written) {
-            retire_img(x->im); x->im = g; g->refs++; __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_switched++;   /* the GPU renders this storage now */
-            tex_stamp_bump(&x->identity);
-            texcopy_resource("switch", x);
-        } else if (tex_mirrored_dirty(x)) {
-            texcopy_resource("reupload", x); upload(x); g_stat_reuploads++;
-        }
-    }
-    /* TOTK_VK_TEX_MEMO: whatever this submission needs for x (above) is done; memo hits on mirrored textures wait for it. */
-    if (x && vk_tex_memo_on() && atomic_load_explicit(&x->memo_sub, memory_order_relaxed) != sub)
-        atomic_store_explicit(&x->memo_sub, sub, memory_order_release);
-    if (x) { pthread_mutex_unlock(&g_tex_mu); return x->im || x->tbv ? x : NULL; }
-    x = calloc(1, sizeof *x); x->serial = t->serial; x->t = *t; x->csub = sub; atomic_init(&x->memo_sub, sub);
+static inline void tex_serial_memo_put_locked(uint64_t serial, uint64_t sub, const vk_tex *x) {
+    if (!T_tex_serial_memo) T_tex_serial_memo = calloc(1, sizeof *T_tex_serial_memo);
+    if (!T_tex_serial_memo || !x || (!x->im && !x->tbv)) return;
+    uint8_t non_mir = (uint8_t)(!x->mirrored || (x->im && x->im->gpu_written));
+    totk_tex_serial_memo4_put(T_tex_serial_memo, serial, atomic_load_explicit(&g_tex_serial_gen, memory_order_relaxed), sub, non_mir, (uint64_t)(uintptr_t)x);
+}
+static vk_tex *tex_create_locked(const tex_t *t, uint64_t sub) {
+    vk_tex *x = calloc(1, sizeof *x); x->serial = t->serial; x->t = *t; x->csub = sub; atomic_init(&x->memo_sub, sub);
     x->identity = tex_stamp_new();
     if (vk_canvas_on) x->canvas_window = nvn_hm_get(&g_window_serials, &t->serial) != NULL;
     nvn_hm_put(&g_by_serial, &t->serial, x);
-    if (t->d.target == 10) { pthread_mutex_unlock(&g_tex_mu); return x; }   /* buffer textures: vk_tbuf_by_id */
+    if (t->d.target == 10) return x;
     x->mirrored = x->cpu_pool = tex_mirrored(t);
     stor_key k;
-    if (x->mirrored && mirshare_on() && stor_key_of(t, &k)) {   /* a GPU-written image already holds this storage */
+    if (x->mirrored && mirshare_on() && stor_key_of(t, &k)) {
         vk_img *g = nvn_hm_get(&g_by_storage, &k);
         if (g && g->gpu_written) {
             x->mirrored = 0; g->refs++; x->im = g; g_stat_shared_hits++;
-            texcopy_resource("realize-shared-gpu-hit", x); pthread_mutex_unlock(&g_tex_mu); return x;
+            texcopy_resource("realize-shared-gpu-hit", x); return x;
         }
     }
     if (!x->mirrored && stor_key_of(t, &k)) {
@@ -820,22 +818,49 @@ static vk_tex *tex_get_inner(const tex_t *t) {
                 if (n <= 8) LOGV("compressible storage %p (%ux%u) now NVN format %#x: it gets its own image, the other format keeps its content (%llu so far)", (void *)t->mem, t->d.width, t->d.height, t->d.format, (unsigned long long)n); }
             nvn_hm_put(&g_comp_owner, &k0, (void *)(uintptr_t)k.fcls);
         } }
-        if (im) {
-            im->refs++; x->im = im;
-            texcopy_resource(storage_hit ? "realize-storage-share" : "realize-gpu-only-undefined", x);
-        }
+        if (im) { im->refs++; x->im = im; texcopy_resource(storage_hit ? "realize-storage-share" : "realize-gpu-only-undefined", x); }
     } else {
         x->im = img_create(t);
         texcopy_resource(x->mirrored ? "realize-own-upload" : "realize-gpu-only-undefined", x);
         if (x->im && x->mirrored) { upload(x); g_stat_uploads++; }
     }
-    pthread_mutex_unlock(&g_tex_mu);
     return x->im ? x : NULL;
+}
+static vk_tex *tex_get_inner(const tex_t *t) {
+    if (!t || !t->serial) return NULL;
+    int fast = serial_fast_on();
+    uint64_t sub = vk_submit_serial();
+    if (fast && T_tex_serial_memo) {
+        uint32_t sgen = atomic_load_explicit(&g_tex_serial_gen, memory_order_acquire);
+        uint64_t xu = 0;
+        if (totk_tex_serial_memo4_get(T_tex_serial_memo, t->serial, sgen, sub, &xu) && atomic_load_explicit(&g_tex_serial_gen, memory_order_acquire) == sgen)
+            return (vk_tex *)(uintptr_t)xu;
+    }
+    pthread_mutex_lock(&g_tex_mu);
+    vk_tex *x = nvn_hm_get(&g_by_serial, &t->serial);
+    sub = vk_submit_serial();
+    if (x && x->im && x->mirrored && !x->im->gpu_written && x->csub != sub) {   /* once per submission: changed since the upload? */
+        x->csub = sub;
+        stor_key k; vk_img *g = NULL;
+        if (mirshare_on() && stor_key_of(t, &k) && (g = nvn_hm_get(&g_by_storage, &k)) && g != x->im && g->gpu_written) {
+            retire_img(x->im); x->im = g; g->refs++; __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_switched++;   /* the GPU renders this storage now */
+            tex_stamp_bump(&x->identity); texcopy_resource("switch", x);
+        } else if (tex_mirrored_dirty(x)) {
+            texcopy_resource("reupload", x); upload(x); g_stat_reuploads++;
+        }
+    }
+    if (x && vk_tex_memo_on() && atomic_load_explicit(&x->memo_sub, memory_order_relaxed) != sub)
+        atomic_store_explicit(&x->memo_sub, sub, memory_order_release);
+    vk_tex *ret = x ? ((x->im || x->tbv) ? x : NULL) : tex_create_locked(t, sub);
+    if (fast && ret) tex_serial_memo_put_locked(t->serial, sub, ret);
+    pthread_mutex_unlock(&g_tex_mu);
+    return ret;
 }
 vk_tex *vk_tex_get(const tex_t *t) { return VK_REC_VALUE(VK_REC_S_RESOURCE, tex_get_inner(t)); }
 void mtl_xv_window_tex(uint64_t serial) {
     if (!vk_canvas_on) return;
     pthread_mutex_lock(&g_tex_mu);
+    atomic_fetch_add_explicit(&g_tex_serial_gen, 1u, memory_order_release);
     nvn_hm_put(&g_window_serials, &serial, (void *)1);
     vk_tex *x = nvn_hm_get(&g_by_serial, &serial);
     if (x) { x->canvas_window = 1; if (x->im) x->im->native_window = 1; }
@@ -845,6 +870,7 @@ void mtl_xv_window_tex(uint64_t serial) {
 void mtl_tex_release(tex_t *t) {
     if (!t->serial) return;
     pthread_mutex_lock(&g_tex_mu);
+    atomic_fetch_add_explicit(&g_tex_serial_gen, 1u, memory_order_release);
     vk_tex *x = nvn_hm_del(&g_by_serial, &t->serial);
     nvn_hm_del(&g_window_serials, &t->serial);
     tex_drop_locked(x);
@@ -853,6 +879,7 @@ void mtl_tex_release(tex_t *t) {
 }
 void vk_tex_pool_gone(uintptr_t lo, uintptr_t hi) {   /* nvn_vk.c: a pool was finalised: shared images over it are dropped */
     pthread_mutex_lock(&g_tex_mu);
+    atomic_fetch_add_explicit(&g_tex_serial_gen, 1u, memory_order_release);
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         vk_tex *x = g_by_serial.vals ? g_by_serial.vals[i] : NULL;
         if (!x || (uintptr_t)x->t.mem >= hi || (uintptr_t)x->t.mem + x->t.L.size <= lo) continue;
@@ -1151,7 +1178,7 @@ static void wb_detail(const wb_ent *e, const wb_history *h, enum wb_land_mode mo
 static void wb_ref(vk_img *im) { im->wbrefs++; }
 static void wb_unref(vk_img *im) {
     im->wbrefs--;
-    if (im->shared) { if (!im->refs) im->idle_sub = vk_submit_serial(); }
+    if (im->shared) { if (!im->refs) { im->idle_sub = vk_submit_serial(); if (!im->wbrefs) totk_idle_shared_note(&g_idle_shared, im->idle_sub); } }
     else if (!im->wbrefs && im->orphan) retire_img(im);
 }
 static void wb_staging_free(wb_ent *e) {
