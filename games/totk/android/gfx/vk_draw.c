@@ -4377,7 +4377,8 @@ void vk_pipeline_prewarm(void) {
 }
 static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLayout layout) {
     static pipe_ent *last;   /* entries never move or die; only the recording thread reads this memo */
-    static pipe_ent *memo[256];   /* bounded exact-key front cache for alternating separable shaders/topologies */
+    static pipe_ent *memo[64];
+    static vk_pipe_memo g_ktgl_pipe;   /* 256x4 zero-write front cache when ktglmemo is active */
     pipe_ent *e = last; pipe_key k;
     g_draw_fast = 0;
     int screen_aspect = pipe_screen_class() != 0;
@@ -4385,12 +4386,23 @@ static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLay
     if (g_pipe_dirty || !e || e->layout != layout || e->k.vs != vs || e->k.fs != fs || e->k.topo_class != topo_class(prim)) {
         pipe_key_fill(&k, &S, vs, fs, prim); g_pipe_dirty = 0;
         if (!e || e->layout != layout || memcmp(&e->k, &k, sizeof k)) {
-            unsigned mask = ktglmemo_draw_on() ? 255u : 63u;
-            unsigned h = (unsigned)(((uintptr_t)vs >> 4) ^ ((uintptr_t)fs >> 8) ^ k.topo_class) & mask;
-            pipe_ent *candidate = memo[h];
-            e = candidate && candidate->layout == layout && !memcmp(&candidate->k, &k, sizeof k) ?
-                candidate : nvn_hm_get(&g_pipes, &k);
-            if (e) memo[h] = e;
+            if (ktglmemo_draw_on()) {
+                uint64_t lay64 = (uint64_t)(uintptr_t)layout;
+                const vk_pipe_set_t *ps = vk_pipe_memo_set(&g_ktgl_pipe, vs, fs, (uint32_t)k.topo_class, lay64);
+                e = NULL;
+                for (int w = 0; w < VK_KTGL_PIPE_WAYS; w++) {
+                    pipe_ent *cand = (pipe_ent *)ps->ways[w];
+                    if (!cand) break;
+                    if (cand->layout == layout && cand->k.vs == vs && cand->k.fs == fs && !memcmp(&cand->k, &k, sizeof k)) { e = cand; break; }
+                }
+                if (!e) { e = nvn_hm_get(&g_pipes, &k); if (e) vk_pipe_memo_put(&g_ktgl_pipe, vs, fs, (uint32_t)k.topo_class, lay64, e); }
+            } else {
+                unsigned h = (unsigned)(((uintptr_t)vs >> 4) ^ ((uintptr_t)fs >> 8) ^ k.topo_class) & 63u;
+                pipe_ent *candidate = memo[h];
+                e = candidate && candidate->layout == layout && !memcmp(&candidate->k, &k, sizeof k) ?
+                    candidate : nvn_hm_get(&g_pipes, &k);
+                if (e) memo[h] = e;
+            }
         }
     }
     /* A memo hit still observes a worker's publication, including queued and failed entries. */

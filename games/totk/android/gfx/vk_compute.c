@@ -2,6 +2,7 @@
  * to replay; shader/module/layout maps stay startup/recording-thread owned. */
 #include "vk_int.h"
 #include "vk_compute_store.h"
+#include "vk_ktgl_memo.h"
 #include "vk_overlay.h"
 #include "nvn_hmap.h"
 #include "dm_wait_stats.h"
@@ -82,7 +83,7 @@ static void build(compute_entry *e, int background) {
         RED(8, "compute pipeline %s: %d", e->shader->key, result);
     }
     pthread_mutex_lock(&mu);
-    e->pipeline = p; e->state = result ? CP_FAILED : CP_READY;
+    e->pipeline = p; __atomic_store_n(&e->state, result ? CP_FAILED : CP_READY, __ATOMIC_RELEASE);
     vk_lend done = {0};
     if (background && lend.lent && lend_for == e) { done = lend; lend.lent = 0; lend_for = NULL; }
     if (stats_on) {
@@ -126,10 +127,9 @@ static void *worker(void *unused) {
     }
     pthread_mutex_unlock(&mu); return NULL;
 }
-void vk_compute_prepare(vk_shader *cs) {
-    if (!cs || cs->stage != 5) return;
-    /* All callers are startup/replay. Precreate layouts here, never on worker. */
-    pthread_mutex_lock(&mu);
+static vk_cs_memo g_cs_memo;
+static int cs_memo_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
+static compute_entry *compute_prepare_locked(vk_shader *cs) {
     compute_entry *e = nvn_hm_get(&pipes, cs->key);
     if (!e) {
         e = calloc(1, sizeof *e); if (!e) DIE("compute pipeline entry allocation");
@@ -137,6 +137,13 @@ void vk_compute_prepare(vk_shader *cs) {
         nvn_hm_put(&pipes, cs->key, e);
         if (running) enqueue(e);
     }
+    return e;
+}
+void vk_compute_prepare(vk_shader *cs) {
+    if (!cs || cs->stage != 5) return;
+    /* All callers are startup/replay. Precreate layouts here, never on worker. */
+    pthread_mutex_lock(&mu);
+    (void)compute_prepare_locked(cs);
     pthread_mutex_unlock(&mu);
 }
 void vk_compute_stop(void) {
@@ -177,9 +184,15 @@ void vk_compute_start(void) { /* Vulkan device ready, before replay */
     LOGV("[compute-prewarm] loaded %u keys, missing seed %u; worker=%d (independent of graphics key lists)", count, missing, running);
 }
 VkPipeline vk_compute_pipeline(vk_shader *cs, VkPipelineLayout *layout) {
-    vk_compute_prepare(cs);
+    if (cs && cs->stage == 5 && !stats_on && cs_memo_on()) {
+        uint64_t mp = 0, ml = 0;
+        if (vk_cs_memo_get(&g_cs_memo, cs, &mp, &ml)) {
+            if (layout) *layout = (VkPipelineLayout)(uintptr_t)ml;
+            return (VkPipeline)(uintptr_t)mp;
+        }
+    }
     pthread_mutex_lock(&mu);
-    compute_entry *e = nvn_hm_get(&pipes, cs->key);
+    compute_entry *e = compute_prepare_locked(cs);
     if (!e->learned) {
         e->learned = 1;
         /* Bounded exact-key set. Full histories replace the oldest discovered key. */
@@ -222,7 +235,10 @@ VkPipeline vk_compute_pipeline(vk_shader *cs, VkPipelineLayout *layout) {
         if (stats_on) { window.total += elapsed; if (elapsed > window.maximum) window.maximum = elapsed; }
     } else if (stats_on) window.ready++;
     VkPipeline pipeline = e->pipeline;
-    pthread_mutex_unlock(&mu); return pipeline;
+    int can_memo = !stats_on && cs_memo_on() && e->learned && __atomic_load_n(&e->state, __ATOMIC_ACQUIRE) == CP_READY && pipeline != VK_NULL_HANDLE;
+    pthread_mutex_unlock(&mu);
+    if (can_memo) vk_cs_memo_put(&g_cs_memo, cs, (uint64_t)(uintptr_t)pipeline, (uint64_t)(uintptr_t)*layout);
+    return pipeline;
 }
 void vk_compute_report(void) {
     pthread_mutex_lock(&mu);

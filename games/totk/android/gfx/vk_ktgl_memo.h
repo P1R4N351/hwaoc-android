@@ -8,7 +8,11 @@ enum {
     VK_KTGL_PROGC_SETS = 512,
     VK_KTGL_PROGC_WAYS = 4,
     VK_KTGL_LAY_SETS = 512,
-    VK_KTGL_LAY_WAYS = 4
+    VK_KTGL_LAY_WAYS = 4,
+    VK_KTGL_PIPE_SETS = 1024,
+    VK_KTGL_PIPE_WAYS = 4,
+    VK_KTGL_CS_SETS = 64,
+    VK_KTGL_CS_WAYS = 4
 };
 
 typedef struct { uint64_t serial; void *pr; } vk_progc_slot;
@@ -89,4 +93,70 @@ static inline vk_qi_bar2_spec vk_qi_barrier_spec(int phase, int fault_all) {
     return (vk_qi_bar2_spec){QI_STAGE_COMPUTE, QI_ACC_SHADER_W, QI_STAGE_DRAW_INDIRECT, QI_ACC_INDIRECT};
 }
 
+typedef struct { void *ways[VK_KTGL_PIPE_WAYS]; uint8_t next; } vk_pipe_set_t;
+typedef struct { vk_pipe_set_t sets[VK_KTGL_PIPE_SETS]; } vk_pipe_memo;
+
+typedef struct { const void *cs; uint64_t pipeline; uint64_t layout; } vk_cs_slot;
+typedef struct { vk_cs_slot ways[VK_KTGL_CS_WAYS]; uint8_t next; } vk_cs_set_t;
+typedef struct { vk_cs_set_t sets[VK_KTGL_CS_SETS]; } vk_cs_memo;
+
+static inline uint64_t vk_ktgl_splitmix64(uint64_t x) {
+    x = (x ^ (x >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    x = (x ^ (x >> 27)) * UINT64_C(0x94d049bb133111eb);
+    return x ^ (x >> 31);
+}
+
+static inline uint32_t vk_pipe_set_idx(const void *vs, const void *fs, uint32_t topo, uint64_t layout) {
+    uint64_t h = ((uint64_t)(uintptr_t)vs * UINT64_C(11400714819323198485)
+                + (uint64_t)(uintptr_t)fs * UINT64_C(0x9e3779b97f4a7c15))
+               ^ ((uint64_t)topo * UINT64_C(0xbf58476d1ce4e5b9)) ^ layout;
+    return (uint32_t)((vk_ktgl_splitmix64(h) >> 54) & (VK_KTGL_PIPE_SETS - 1));
+}
+
+static inline const vk_pipe_set_t *vk_pipe_memo_set(const vk_pipe_memo *m, const void *vs,
+                                                    const void *fs, uint32_t topo, uint64_t layout) {
+    return &m->sets[vk_pipe_set_idx(vs, fs, topo, layout)];
+}
+
+static inline void vk_pipe_memo_put(vk_pipe_memo *m, const void *vs, const void *fs,
+                                    uint32_t topo, uint64_t layout, void *ent) {
+    if (!m || !ent) return;
+    vk_pipe_set_t *s = &m->sets[vk_pipe_set_idx(vs, fs, topo, layout)];
+    for (int w = 0; w < VK_KTGL_PIPE_WAYS; w++) {
+        if (s->ways[w] == ent) return;
+        if (!s->ways[w]) { s->ways[w] = ent; return; }
+    }
+    int slot = s->next & (VK_KTGL_PIPE_WAYS - 1);
+    s->next = (uint8_t)(s->next + 1);
+    s->ways[slot] = ent;
+}
+
+static inline uint32_t vk_cs_set_idx(const void *cs) {
+    uint64_t h = vk_ktgl_splitmix64((uint64_t)(uintptr_t)cs * UINT64_C(11400714819323198485));
+    return (uint32_t)((h >> 58) & (VK_KTGL_CS_SETS - 1));
+}
+
+static inline int vk_cs_memo_get(const vk_cs_memo *m, const void *cs, uint64_t *pipeline_out, uint64_t *layout_out) {
+    if (!m || !cs || !pipeline_out || !layout_out) return 0;
+    const vk_cs_slot *ways = m->sets[vk_cs_set_idx(cs)].ways;
+    for (int w = 0; w < VK_KTGL_CS_WAYS; w++) {
+        if (ways[w].cs == cs && ways[w].pipeline) {
+            *pipeline_out = ways[w].pipeline;
+            *layout_out = ways[w].layout;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline void vk_cs_memo_put(vk_cs_memo *m, const void *cs, uint64_t pipeline, uint64_t layout) {
+    if (!m || !cs || !pipeline) return;
+    vk_cs_set_t *s = &m->sets[vk_cs_set_idx(cs)];
+    int slot = -1;
+    for (int w = 0; w < VK_KTGL_CS_WAYS; w++) {
+        if (!s->ways[w].cs || s->ways[w].cs == cs) { slot = w; break; }
+    }
+    if (slot < 0) { slot = s->next & (VK_KTGL_CS_WAYS - 1); s->next = (uint8_t)(s->next + 1); }
+    s->ways[slot] = (vk_cs_slot){cs, pipeline, layout};
+}
 #endif

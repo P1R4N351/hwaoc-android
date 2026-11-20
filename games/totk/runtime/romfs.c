@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include "romfs_proof.h"
+#include "romfs_handles.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -59,7 +60,8 @@ static const uint8_t *image_map;
 static char mount_name[32];
 static pthread_mutex_t lock=PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t read_calls,read_bytes,read_ns,read_prepare_ns,read_report_ns;
-static uint64_t handles[NH]; /* file index + 1; 0 is free */
+static romfs_htable htable; /* lock-free seqlock + O(1) FIFO free ring for RomFS handles */
+static int romfs_fast_on(void){static _Atomic int mode=-1;int v=atomic_load_explicit(&mode,memory_order_acquire);if(v<0){const char *e=getenv("TOTK_ROMFS_FAST");v=!(e&&!strcmp(e,"0"));atomic_store_explicit(&mode,v,memory_order_release);}return v;}
 /* Overlays: files listed in a directory's manifest.tsv are served in place of the originals. Each line names a RomFS
    path, the overlay's size and SHA-256 and the original's SHA-256; a missing path, a size or hash mismatch or a changed
    original stops the start. The directories, in this order: the build's patches (scripts/make_romfs_patches.py;
@@ -79,8 +81,7 @@ static size_t noverlay,overlay_cap;
 #define ADDED UINT64_MAX   /* an added file's index until overlay_init numbers it */
 static char **added;       /* RomFS paths of the added files, sorted; added[k] is index file_count + k */
 static size_t nadded;
-static uint32_t handle_ovl[NH]; /* overlay slot + 1 of an open handle, 0 = original */
-static int handle_fd[NH];       /* the handle's open overlay file, when handle_ovl is set */
+
 typedef struct { uint64_t offset,size;uint32_t name,len; } Entry;
 _Static_assert(sizeof(Entry)==24,"index entry layout");
 static Entry entry(uint64_t i) {Entry e;memcpy(&e,index_bytes+24+i*24,24);return e;}
@@ -460,18 +461,19 @@ unsigned runtime_romfs_open(uint64_t *out,const char *path,int mode) {
  if(ov&&!overlays[ov-1].memory){const Overlay *o=&overlays[ov-1];fd=open(o->path,O_RDONLY|O_CLOEXEC);struct stat st;
   if(fd<0||fstat(fd,&st)!=0||(uint64_t)st.st_size!=o->size||st.st_dev!=o->dev||st.st_ino!=o->ino||st.st_mtimespec.tv_sec!=o->mtime.tv_sec||st.st_mtimespec.tv_nsec!=o->mtime.tv_nsec){
    fprintf(stderr,"[totk] RomFS overlay: %s is missing or changed since the start check\n",o->path);runtime_fail("RomFS overlay file changed while the game ran (restart the game)");}}
- pthread_mutex_lock(&lock);for(unsigned j=1;j<NH;j++)if(!handles[j]){handles[j]=i+1;handle_ovl[j]=ov;handle_fd[j]=fd;*out=0x100000000ULL+j;pthread_mutex_unlock(&lock);return 0;}pthread_mutex_unlock(&lock);runtime_fail("file handle table full");return INVALID;
+ pthread_mutex_lock(&lock);uint64_t h=romfs_htable_alloc_locked(&htable,i+1,ov,fd);pthread_mutex_unlock(&lock);if(h){*out=h;return 0;}runtime_fail("file handle table full");return INVALID;
 }
-static int handle_entry(uint64_t h,Entry *e) {if(h<=0x100000000ULL||h>=0x100000000ULL+NH)return 0;pthread_mutex_lock(&lock);uint64_t i=handles[h-0x100000000ULL];pthread_mutex_unlock(&lock);if(!i)return 0;*e=i-1<file_count?entry(i-1):(Entry){0};return 1;}   /* an added file's bytes are all in its overlay */
-/* Where an open handle's bytes come from: an immutable memory overlay, an
-   identity-checked overlay file, or the original's range of the image. */
-static void handle_source(uint64_t h,const Entry *e,int *fd,uint64_t *base,uint64_t *size,const uint8_t **memory) {
- pthread_mutex_lock(&lock);uint32_t ov=handle_ovl[h-0x100000000ULL];int ofd=handle_fd[h-0x100000000ULL];pthread_mutex_unlock(&lock);
+/* Resolve handle to backing range/memory: lock-free seqlock for immutable base RomFS & memory overlays; mutex for unmapped mod fds. */
+static int handle_resolve(uint64_t h,int *fd,uint64_t *base,uint64_t *size,const uint8_t **memory) {
+ uint64_t fp1=0;uint32_t ov=0;int ofd=-1;
+ if(romfs_fast_on()){if(!romfs_htable_resolve_fast(&htable,h,&fp1,&ov,&ofd))return 0;if(ov&&!overlays[ov-1].memory){pthread_mutex_lock(&lock);int ok=romfs_htable_resolve_locked(&htable,h,&fp1,&ov,&ofd);pthread_mutex_unlock(&lock);if(!ok)return 0;}}
+ else{pthread_mutex_lock(&lock);int ok=romfs_htable_resolve_locked(&htable,h,&fp1,&ov,&ofd);pthread_mutex_unlock(&lock);if(!ok)return 0;}
  if(ov){*fd=ofd;*base=0;*size=overlays[ov-1].size;*memory=overlays[ov-1].memory;}
- else{*fd=image_fd;*base=e->offset;*size=e->size;*memory=image_map?image_map+e->offset:NULL;}
+ else{Entry e=fp1-1<file_count?entry(fp1-1):(Entry){0};*fd=image_fd;*base=e.offset;*size=e.size;*memory=image_map?image_map+e.offset:NULL;}
+ return 1;
 }
 unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer,uint64_t size) {
- Entry e;if(!out||offset<0||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,fsize;const uint8_t *memory;handle_source(h,&e,&fd,&base,&fsize,&memory);if((uint64_t)offset>fsize||(!buffer&&size))return INVALID;
+ if(!out||offset<0)return INVALID;int fd;uint64_t base,fsize;const uint8_t *memory;if(!handle_resolve(h,&fd,&base,&fsize,&memory))return INVALID;if((uint64_t)offset>fsize||(!buffer&&size))return INVALID;
  uint64_t n=size;if(n>fsize-(uint64_t)offset)n=fsize-(uint64_t)offset;uint64_t done=0;
  static _Atomic int profile_mode=-1;int profile=atomic_load(&profile_mode);if(profile<0){profile=getenv("TOTK_FS_TIMING")!=NULL;atomic_store(&profile_mode,profile);}uint64_t prep_start=profile?runtime_now_ns():0;
  dm_guest_write_prepare(buffer,(size_t)n);
@@ -485,14 +487,14 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
     (unsigned long long)atomic_exchange(&read_calls,0),(unsigned long long)atomic_exchange(&read_bytes,0),atomic_exchange(&read_ns,0)/1e6,atomic_exchange(&read_prepare_ns,0)/1e6);}
  *out=done;return 0;
 }
-unsigned runtime_romfs_size(int64_t *out,uint64_t h) {Entry e;if(!out||!handle_entry(h,&e))return INVALID;int fd;uint64_t base,size;const uint8_t *memory;handle_source(h,&e,&fd,&base,&size,&memory);*out=(int64_t)size;return 0;}
-void runtime_romfs_close(uint64_t h) {Entry e;if(!handle_entry(h,&e))runtime_fail("close invalid file handle");uint64_t j=h-0x100000000ULL;pthread_mutex_lock(&lock);int fd=handle_ovl[j]?handle_fd[j]:-1;handles[j]=0;handle_ovl[j]=0;handle_fd[j]=-1;pthread_mutex_unlock(&lock);if(fd>=0)close(fd);}
+unsigned runtime_romfs_size(int64_t *out,uint64_t h) {int fd;uint64_t base,size;const uint8_t *memory;if(!out||!handle_resolve(h,&fd,&base,&size,&memory))return INVALID;*out=(int64_t)size;return 0;}
+void runtime_romfs_close(uint64_t h) {int fd=-1;pthread_mutex_lock(&lock);int ok=romfs_htable_close_locked(&htable,h,&fd);pthread_mutex_unlock(&lock);if(!ok)runtime_fail("close invalid file handle");if(fd>=0)close(fd);}
 unsigned runtime_romfs_entry_type(int *out,const char *path) {
  if(!out)return INVALID;const char *p=rom_path(path);if(!p)return NOT_FOUND;if(file_index(p)!=UINT64_MAX){*out=1;return 0;}
  char dir[4096];if(snprintf(dir,sizeof(dir),"%s/",p)>=(int)sizeof(dir))return INVALID;if(folder_exists(dir)){*out=0;return 0;}return NOT_FOUND;
 }
 int runtime_romfs_owns(const char *path) {size_t n=strlen(mount_name);return n&&path&&!strncmp(path,mount_name,n)&&path[n]==':';}
-int runtime_romfs_handle(uint64_t h) {return h>0x100000000ULL&&h<0x100000000ULL+NH;}
+int runtime_romfs_handle(uint64_t h) {return romfs_h_valid_bits(h);}
 unsigned runtime_romfs_read_options(uint64_t *out,uint64_t h,int64_t off,void *buf,uint64_t size) {return runtime_romfs_read(out,h,off,buf,size);}
 void *runtime_fs_override(const char *name) {
  static const struct{const char *name;void *fn;} map[]={
