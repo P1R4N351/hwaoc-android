@@ -15,6 +15,8 @@
    0.83 deg/s on average (bias 0.05, 0.73, 0.38 deg/s after its factory calibration), at most 1.07 deg/s, in 616 samples,
    enough for the aim to creep; a DualSense through GameController needs none. */
 #include "runtime.h"
+#include "totk_hid_fast.h"
+static totk_motion_fast_ring g_motion_fast;
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -117,6 +119,7 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
         for (int j = 0; j < 3; j++) s->dir[i * 3 + j] = (float)R[j][i];   /* direction i = controller axis i in the reference frame */
     }
     produced++;
+    totk_motion_fast_publish(&g_motion_fast, s, produced, now);
     if (!log_at) log_at = now;
     if (now - log_at >= 30000000000ull) {
         uint64_t values, reads; runtime_hid_feedback_stats(&values, &reads);
@@ -129,6 +132,10 @@ void runtime_motion_feed(const double raw_acc[3], const double raw_gyro[3], uint
 }
 int runtime_motion_read(RuntimeMotionState *out, int max) {
     if (max <= 0) return 0;
+    if (totk_hid_fast_on()) {
+        int fn = totk_motion_fast_read(&g_motion_fast, runtime_now_ns, out, max);
+        if (fn >= 0) return fn;
+    }
     int n = 0;
     pthread_mutex_lock(&lock);
     if (live && runtime_now_ns() - last_ns < 200000000ull) {   /* no sample for 200 ms: no motion */
@@ -142,4 +149,4 @@ int runtime_motion_read(RuntimeMotionState *out, int max) {
 void runtime_motion_start(void) { pthread_mutex_lock(&lock); restart = 1; pthread_mutex_unlock(&lock); }
 /* The dead zone in deg/s when TOTK_GYRO_DEADZONE is unset: the HID reader sets 1.2, a GameController controller 0. */
 void runtime_motion_deadzone_default(double deg) { pthread_mutex_lock(&lock); deadzone_default = deg; deadzone = -1; pthread_mutex_unlock(&lock); }
-void runtime_motion_live(int on) { pthread_mutex_lock(&lock); live = on; if (on) restart = 1; pthread_mutex_unlock(&lock); }
+void runtime_motion_live(int on) { pthread_mutex_lock(&lock); live = on; if (on) restart = 1; totk_motion_fast_set_live(&g_motion_fast, on); pthread_mutex_unlock(&lock); }

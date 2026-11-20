@@ -38,9 +38,11 @@ static bool env_on(const char *name) {
 /* Read once each: these are queried on every rumble/motion poll from the game's threads. */
 int runtime_rumble_enabled(void) { static _Atomic int on = -1; int v = atomic_load_explicit(&on, memory_order_relaxed); if (v < 0) { v = env_on("TOTK_RUMBLE"); atomic_store_explicit(&on, v, memory_order_relaxed); } return v; }
 int runtime_gyro_enabled(void) { static _Atomic int on = -1; int v = atomic_load_explicit(&on, memory_order_relaxed); if (v < 0) { v = env_on("TOTK_GYRO"); atomic_store_explicit(&on, v, memory_order_relaxed); } return v; }
+#include "totk_hid_fast.h"
 static _Atomic int rumble_muted, gyro_muted;
 static pthread_mutex_t lastLock = PTHREAD_MUTEX_INITIALIZER;
 static VibrationValue last[2] = {{0, 160, 0, 320}, {0, 160, 0, 320}};   /* lastLock */
+static totk_vib_fast_state g_vib_fast;
 static _Atomic uint64_t values_in, reads;
 
 static void note_once(_Atomic int *flag, const char *text, uint32_t handle) {
@@ -59,11 +61,20 @@ static void play(int side, const VibrationValue *v) {
     if (side < 0) return;
     VibrationValue c = *v;
     if (!isfinite(c.amp_low) || !isfinite(c.amp_high) || !isfinite(c.freq_low) || !isfinite(c.freq_high)) c = (VibrationValue){0, 160, 0, 320};
-    pthread_mutex_lock(&lastLock); last[side] = c; pthread_mutex_unlock(&lastLock); atomic_fetch_add(&values_in, 1);
+    if (totk_hid_fast_on()) {
+        VibrationValue cur; int rd = totk_vib_fast_read(&g_vib_fast, side, &cur.amp_low, &cur.freq_low, &cur.amp_high, &cur.freq_high);
+        if (rd < 0 || memcmp(&cur, &c, sizeof c) != 0) {
+            pthread_mutex_lock(&lastLock); last[side] = c; totk_vib_fast_write(&g_vib_fast, side, c.amp_low, c.freq_low, c.amp_high, c.freq_high); pthread_mutex_unlock(&lastLock);
+        }
+        if (totk_hid_w23_fault() != 71) atomic_fetch_add(&values_in, 1);
+    } else {
+        pthread_mutex_lock(&lastLock); last[side] = c; pthread_mutex_unlock(&lastLock); atomic_fetch_add(&values_in, 1);
+    }
     static _Atomic int first; if (!atomic_exchange(&first, 1)) fprintf(stderr, "[hid] first vibration value from the game: %s %.2f@%.0f Hz %.2f@%.0f Hz\n",
                                                                          side ? "right" : "left", c.amp_low, c.freq_low, c.amp_high, c.freq_high);
     if (atomic_load(&rumble_muted)) c.amp_low = c.amp_high = 0;
-    runtime_rumble_set((unsigned)side, c.amp_low, c.freq_low, c.amp_high, c.freq_high);
+    if (!totk_hid_fast_on() || totk_vib_fast_should_send(&g_vib_fast, side, c.amp_low, c.amp_high))
+        runtime_rumble_set((unsigned)side, c.amp_low, c.freq_low, c.amp_high, c.freq_high);
 }
 static uint32_t vib_init(const uint32_t *h) {
     int side = vibration_side(h); static _Atomic int once;
@@ -79,7 +90,11 @@ static uint32_t vib_send_many(const uint32_t *h, const VibrationValue *v, int n)
 static uint32_t vib_actual(VibrationValue *out, const uint32_t *h) {
     if (!out) runtime_fail("vibration value output pointer");
     int side = vibration_side(h); *out = (VibrationValue){0, 160, 0, 320};
-    if (side >= 0) { pthread_mutex_lock(&lastLock); *out = last[side]; pthread_mutex_unlock(&lastLock); }
+    if (side >= 0) {
+        if (!totk_hid_fast_on() || totk_vib_fast_read(&g_vib_fast, side, &out->amp_low, &out->freq_low, &out->amp_high, &out->freq_high) < 0) {
+            pthread_mutex_lock(&lastLock); *out = last[side]; pthread_mutex_unlock(&lastLock);
+        }
+    }
     return 0;
 }
 static uint32_t vib_info(VibrationDeviceInfo *out, const uint32_t *h) {
@@ -128,6 +143,7 @@ int runtime_hid_feedback_flag(const char *name, int v) {
     if (v != 0 && v != 1) runtime_fail("flag rumble / gyro takes 0 or 1");
     int on = muted == &rumble_muted ? runtime_rumble_enabled() : runtime_gyro_enabled();
     atomic_store(muted, !v);
+    if (muted == &rumble_muted) totk_vib_fast_reset_silent(&g_vib_fast, !v);
     if (!v && muted == &rumble_muted) { runtime_rumble_set(0, 0, 160, 0, 320); runtime_rumble_set(1, 0, 160, 0, 320); }
     fprintf(stderr, "[hid] %s %s%s\n", name, v ? "on" : "muted", on ? "" : " (no effect: the game has no such device in this run; start it with TOTK_RUMBLE=1 / TOTK_GYRO=1)");
     return 1;

@@ -279,6 +279,9 @@ static _Atomic uint64_t g_slot_on_time_applies,g_slot_late_applies;
 static _Atomic uint64_t g_slot_template_refused,g_slot_irrevocable_real_conflicts,g_fg_generated,g_fg_pending;
 static struct {uint64_t generated,phase[4];} g_adaptive_stats;
 static int g_pres_qcom[NPRES],g_pres_lsfg[NPRES],g_bound_pipe,g_dyn_dirty,g_bound_set[1][2];
+static int g_vb_state,g_cs_pipe;
+static void totk_vb_invalidate(int *s) {(void)s;}
+static void totk_cs_pipe_invalidate(int *s) {(void)s;}
 static int g_fg_job_trace,clock_ok=1,dispatch_ok=1;
 static unsigned backend_cancel_reason;
 static uint64_t host_now_ns(void) {return 1000000000;}

@@ -1770,7 +1770,13 @@ static pthread_mutex_t g_pad_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_keys, g_hat, g_trig, g_edges;   /* buttons from key events, from the hat axes, from trigger axes; presses since the last read */
 static int32_t g_axes[4];
 static int g_pad_seen;
+#include "totk_hid_fast.h"
 static overlay_chord g_chord;   /* Minus + R live overlay shortcut (overlay_chord.h); under g_pad_mu */
+static totk_pad_fast_slot g_pad_fast;
+static void pad_publish_locked(void) {
+    int fast_ok = !g_edges && g_chord.minus != CHORD_HELD_BACK && g_chord.minus != CHORD_TAP;
+    totk_pad_fast_write(&g_pad_fast, g_keys | g_hat | g_trig, g_axes, g_pad_seen, fast_ok);
+}
 static uint64_t mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec; }
 static int64_t game_input_after_ns; /* UI-owned: do not replay queued events or a return-to-game button held across resume */
 static void pad_key_locked(int bit, int down) {
@@ -1843,6 +1849,7 @@ static int handle_input(AInputEvent *ev) {
         if (r & OVERLAY_CHORD_PASS) pad_key_locked(bit, act == AKEY_EVENT_ACTION_DOWN);
         g_pad_seen = 1;
         unsigned state = g_chord.minus;
+        pad_publish_locked();
         pthread_mutex_unlock(&g_pad_mu);
         if (button != OVERLAY_CHORD_OTHER && chord_log()) chord_trace(button, action, r, state);
         if (r & OVERLAY_CHORD_CYCLE) {
@@ -1867,6 +1874,7 @@ static int handle_input(AInputEvent *ev) {
         g_hat = hat; g_trig = trig;
         g_axes[0] = stick(lx); g_axes[1] = -stick(ly); g_axes[2] = stick(rx); g_axes[3] = -stick(ry);   /* Android: down is +y; Switch: up is + */
         g_pad_seen = 1;
+        pad_publish_locked();
         pthread_mutex_unlock(&g_pad_mu);
         return 1;
     }
@@ -1876,9 +1884,11 @@ void runtime_gamepad_start(void) {}
 void runtime_gamepad_clear(void) {
     pthread_mutex_lock(&g_pad_mu);
     g_keys = g_hat = g_trig = g_edges = 0; memset(g_axes, 0, sizeof g_axes); memset(&g_chord, 0, sizeof g_chord);
+    pad_publish_locked();
     pthread_mutex_unlock(&g_pad_mu);
 }
 void runtime_gamepad_read(RuntimeGamepadState *out) {
+    if (totk_hid_fast_on() && totk_pad_fast_read(&g_pad_fast, out) > 0) return;
     pthread_mutex_lock(&g_pad_mu);
     unsigned timed = overlay_chord_poll(&g_chord, mono_ns());   /* a lone Minus past its window, a replayed tap's end */
     chord_minus_locked(timed);
@@ -1887,6 +1897,7 @@ void runtime_gamepad_read(RuntimeGamepadState *out) {
     out->buttons = g_keys | g_hat | g_trig | g_edges; g_edges = 0;   /* a press shorter than one read still reaches the game */
     out->lx = g_axes[0]; out->ly = g_axes[1]; out->rx = g_axes[2]; out->ry = g_axes[3];
     out->connected = g_pad_seen;
+    pad_publish_locked();
     pthread_mutex_unlock(&g_pad_mu);
 }
 int runtime_front_request_close(void) {

@@ -177,13 +177,12 @@ class HudAspect(unittest.TestCase):
         post = (GFX / 'vk_post.c').read_text()
         self.assertIn('vk_ui_aspect_tracks(vk_ui_aspect_requested(getenv("TOTK_ASPECT")))', post)
         self.assertIn('g_ui_aspect = vk_ui_aspect_draw(shown, &target, sh[0]->canvas_ui, count);', draw)
-        body = draw[draw.index('static void dynamic_state('):]
-        body = body[:body.index('\n}\n')]
+        body = draw[draw.index('static void dynamic_state_pack('):draw.index('    static __typeof__(D) last;')]
         # Squeezed in guest coordinates, before native-UI scaling and before recording / frame-generation capture.
         self.assertLess(body.index('vk_ui_aspect_viewport('), body.index('if (R.native)'))
-        self.assertLess(body.index('vk_ui_aspect_rect('), body.index('D.sc = native_rect(D.sc)'))
-        self.assertLess(body.index('vk_ui_aspect_viewport('), body.index('g_record_draw->dynamic = D'))
-        self.assertLess(body.index('vk_ui_aspect_viewport('), body.index('FGX.record->draw.dynamic = D'))
+        self.assertLess(body.index('vk_ui_aspect_rect('), body.index('out->sc = native_rect(out->sc)'))
+        self.assertLess(body.index('dynamic_state_pack(&D, prim)'), body.index('g_record_draw->dynamic = D'))
+        self.assertLess(body.index('dynamic_state_pack(&D, prim)'), body.index('FGX.record->draw.dynamic = D'))
         self.assertEqual(draw.count('dynamic_state(cb, prim)'), 1)
 
 
