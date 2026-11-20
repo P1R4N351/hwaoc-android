@@ -26,6 +26,7 @@
 #include "vk_ktgl_memo.h"
 #include "vk_shader_fast.h"
 #include "vk_cs_fast.h"
+#include "vk_prog_fast.h"
 #include "vk_subgroup.h"
 #include "vk_position.h"
 #include "vk_int_fold.h"
@@ -765,22 +766,27 @@ static vk_prog *prog_of(const prog_t *p) {
     else { unsigned h = (unsigned)(p->serial % PROGC_N); g_progc[h].serial = p->serial; g_progc[h].pr = pr; }
     return pr;
 }
+static totk_prog_prep_memo4 g_prog_prep_memo;
 void vk_prog_prepare(const prog_t *p) {
-    if (!vk_shaders_ready()) return;
-    vk_prog *pr = prog_of(p); if (!pr) return;
+    if (!vk_shaders_ready() || !p || !p->serial) return;
     uint64_t epoch = vk_shader_xlate_epoch();
-    if (pr->prepared && pr->prepare_epoch == epoch) return;
-    pr->prepared = 1; pr->prepare_epoch = epoch;
-    for (unsigned stages = pr->stages; stages; stages &= stages - 1) {
-        int st = __builtin_ctz(stages);
-        /* Compute pipelines depend only on the exact shader, not dispatch-time
-           resources. Compile all listed variants without choosing one using stale
-           bind state. Dispatch still uses the authoritative ordinary resolver. */
-        if (st == 5) {
-            variant_list *vl = variants_of(pr->key[st]);
-            for (int i = 0; i < vl->n; i++) (void)vk_shader_seed(vl->v[i].name, 5, 0);
+    int fast = totk_vk_prog_fast_on();
+    if (fast && totk_prog_prep_memo4_has(&g_prog_prep_memo, (uint64_t)(uintptr_t)p, p->serial, epoch)) return;
+    vk_prog *pr = prog_of(p); if (!pr) return;
+    if (!pr->prepared || pr->prepare_epoch != epoch) {
+        pr->prepared = 1; pr->prepare_epoch = epoch;
+        for (unsigned stages = pr->stages; stages; stages &= stages - 1) {
+            int st = __builtin_ctz(stages);
+            /* Compute pipelines depend only on the exact shader, not dispatch-time
+               resources. Compile all listed variants without choosing one using stale
+               bind state. Dispatch still uses the authoritative ordinary resolver. */
+            if (st == 5) {
+                variant_list *vl = variants_of(pr->key[st]);
+                for (int i = 0; i < vl->n; i++) (void)vk_shader_seed(vl->v[i].name, 5, 0);
+            }
         }
     }
+    if (fast) totk_prog_prep_memo4_put(&g_prog_prep_memo, (uint64_t)(uintptr_t)p, p->serial, epoch);
 }
 void mtl_prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&g_progs_mu); nvn_hm_del(&g_progs, &p->serial); pthread_mutex_unlock(&g_progs_mu); }   /* the vk_prog leaks a little; programs are few */
 /* ---------- varyings a fragment shader reads that the vertex shader does not write (vk_varyings.h) ---------- */
@@ -921,10 +927,26 @@ int vk_prog_resolve_compute(const prog_t *p, vk_shader *out[6]) {
     }
     return rc;
 }
+static totk_gfx_pair_memo4 g_gfx_pair_memo;
+static totk_gfx_pair_memo4 g_rec_pair_memo;
 int vk_prog_resolve_gfx(const prog_t *const progs[6], vk_shader *out[6]) {
     memset(out, 0, 6 * sizeof *out);
     if (!progs || !progs[0] || !vk_shaders_ready()) return -1;
-    uint64_t epoch = vk_shader_xlate_epoch(); int missing = 0;
+    uint64_t epoch = vk_shader_xlate_epoch();
+    int two = totk_vk_prog_fast_on() && progs[0]->serial && (!progs[1] || progs[1]->serial) && !progs[2] && !progs[3] && !progs[4];
+    uint64_t sig0 = 0, sig1 = 0;
+    if (two) {
+        uint64_t reg = vk_treg_revision(), sh0 = 0, sh1 = 0;
+        sig0 = stage_sig_at(0, reg);
+        sig1 = progs[1] ? stage_sig_at(1, reg) : 0;
+        if (totk_gfx_pair_memo4_find(&g_gfx_pair_memo, (uint64_t)(uintptr_t)progs[0], progs[0]->serial,
+                                     (uint64_t)(uintptr_t)progs[1], progs[1] ? progs[1]->serial : 0,
+                                     epoch, sig0, sig1, &sh0, &sh1, NULL)) {
+            out[0] = (vk_shader *)(uintptr_t)sh0; out[1] = (vk_shader *)(uintptr_t)sh1;
+            return 0;
+        }
+    }
+    int missing = 0;
     for (int st = 0; st < 5; st++) {
         if (!progs[st]) continue;
         vk_prog *pr = prog_of(progs[st]);
@@ -932,7 +954,13 @@ int vk_prog_resolve_gfx(const prog_t *const progs[6], vk_shader *out[6]) {
         prog_sync_epoch(pr, epoch);
         if (prog_resolve_stage(pr, st, &out[st])) missing = 1;
     }
-    return (missing || !out[0]) ? -1 : 0;
+    if (missing || !out[0]) return -1;
+    if (two && (!progs[1] || out[1] != NULL)) {
+        totk_gfx_pair_memo4_put(&g_gfx_pair_memo, (uint64_t)(uintptr_t)progs[0], progs[0]->serial,
+                                (uint64_t)(uintptr_t)progs[1], progs[1] ? progs[1]->serial : 0,
+                                epoch, sig0, sig1, (uint64_t)(uintptr_t)out[0], (uint64_t)(uintptr_t)out[1], 0);
+    }
+    return 0;
 }
 static vk_prog *prog_lookup_ready(const prog_t *p) {
     if (!p || !p->serial) return NULL;
@@ -1031,6 +1059,23 @@ int vk_prog_resolve_gfx_record(const prog_t *const progs[6], vk_shader *out[6]) 
     }
     memset(out, 0, 6 * sizeof *out);
     uint64_t registry = vk_treg_revision(), epoch = vk_shader_xlate_epoch();
+    int two = totk_vk_prog_fast_on() && (!progs[1] || progs[1]->serial) && !progs[2] && !progs[3] && !progs[4];
+    uint64_t sig0 = 0, sig1 = 0;
+    if (two) {
+        int ref0 = !(g_stage_sig_valid & 1u) || g_stage_sig_revision[0] != registry;
+        int ref1 = progs[1] && (!(g_stage_sig_valid & 2u) || g_stage_sig_revision[1] != registry);
+        sig0 = stage_sig_at(0, registry);
+        sig1 = progs[1] ? stage_sig_at(1, registry) : 0;
+        uint64_t sh0 = 0, sh1 = 0, prev_reg = registry;
+        if (totk_gfx_pair_memo4_find(&g_rec_pair_memo, (uint64_t)(uintptr_t)progs[0], progs[0]->serial,
+                                     (uint64_t)(uintptr_t)progs[1], progs[1] ? progs[1]->serial : 0,
+                                     epoch, sig0, sig1, &sh0, &sh1, &prev_reg)) {
+            if (ref0 || ref1 || prev_reg != registry) vk_record_memo_saved(VK_REC_M_SIGNATURE);
+            out[0] = (vk_shader *)(uintptr_t)sh0; out[1] = (vk_shader *)(uintptr_t)sh1;
+            g_record_prog_hits++;
+            return 0;
+        }
+    }
     int any_miss = 0, any_refreshed = 0, result = 0; unsigned causes = 0;
     for (int st = 0; st < 5; st++) {
         if (!progs[st]) continue;
@@ -1045,7 +1090,13 @@ int vk_prog_resolve_gfx_record(const prog_t *const progs[6], vk_shader *out[6]) 
         vk_record_memo_miss(1, causes);
         g_record_prog_misses++;
     }
-    return (result || !out[0]) ? -1 : 0;
+    if (result || !out[0]) return -1;
+    if (two && (!progs[1] || out[1] != NULL)) {
+        totk_gfx_pair_memo4_put(&g_rec_pair_memo, (uint64_t)(uintptr_t)progs[0], progs[0]->serial,
+                                (uint64_t)(uintptr_t)progs[1], progs[1] ? progs[1]->serial : 0,
+                                epoch, sig0, sig1, (uint64_t)(uintptr_t)out[0], (uint64_t)(uintptr_t)out[1], registry);
+    }
+    return 0;
 }
 void vk_prog_record_cache_take(uint64_t *hits, uint64_t *misses) {
     *hits = g_record_prog_hits; *misses = g_record_prog_misses; g_record_prog_hits = g_record_prog_misses = 0;
