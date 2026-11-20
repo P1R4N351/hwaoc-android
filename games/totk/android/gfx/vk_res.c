@@ -33,6 +33,7 @@
 #include "vk_res_fast.h"
 #include "vk_tbuf_fast.h"
 #include "vk_view_fast.h"
+#include "vk_reg_wb_fast.h"
 static __thread totk_view_memo4 *T_view_memo;
 static __thread totk_view_id_memo4 *T_view_id_memo;
 static __thread totk_view_cut_memo4 *T_view_cut_memo;
@@ -931,7 +932,9 @@ static nvn_hmap g_wb_history = {.klen = sizeof(wb_hist_key)};
 typedef struct { uint64_t address, size; } wb_lookup_ent;
 static pthread_mutex_t g_wb_lookup_mu = PTHREAD_MUTEX_INITIALIZER;
 static wb_lookup_ent *g_wb_lookup; static int g_wb_lookup_n, g_wb_lookup_cap;
-static uint64_t g_wb_lookup_calls, g_wb_lookup_hits;
+static _Atomic uint64_t g_wb_lookup_calls;
+static uint64_t g_wb_lookup_hits;
+static totk_wb_summary g_wb_sum, g_wb_tile_sum;
 /* The rec-lock owner may detach records for synchronous landing, but consumers must still see them until it
    finishes. Borrow its EXISTING list: .t.mem/.t.L.size are immutable while published, no allocation/image ref.
    Writers hold g_tex_mu; readers hold only g_wb_lookup_mu. Publish before removing rows, clear before freeing. */
@@ -940,6 +943,9 @@ static uint64_t g_wb_inflight_hits;
 static void wb_landing_publish(const wb_ent *list, int n) {
     pthread_mutex_lock(&g_wb_lookup_mu);
     g_wb_landing = list; g_wb_landing_n = n;
+    totk_wb_landing_begin(&g_wb_sum);
+    for (int i = 0; i < n; i++) totk_wb_landing_add(&g_wb_sum, (uintptr_t)list[i].t.mem, list[i].t.L.size);
+    totk_wb_landing_end(&g_wb_sum);
     pthread_mutex_unlock(&g_wb_lookup_mu);
 }
 /* Always-on, bounded evidence for the 64 terrain-normal tiles. Unlike pending rows, these survive a landing/drop:
@@ -975,13 +981,16 @@ static uint64_t wb_tile_note(const vk_tex *x) {
     pthread_mutex_lock(&g_wb_lookup_mu);
     unsigned i = 0;
     for (; i < g_wb_ntiles; i++) if (g_wb_tiles[i].address == address && g_wb_tiles[i].pool == pool) break;
+    uint64_t old_addr = 0, old_size = 0;
+    if (i < g_wb_ntiles) { old_addr = g_wb_tiles[i].address; old_size = g_wb_tiles[i].size; }
     if (i == g_wb_ntiles) {
         if (g_wb_ntiles < WB_TILE_MAX) g_wb_ntiles++;
-        else i = g_wb_tile_next++ % WB_TILE_MAX;
+        else { i = g_wb_tile_next++ % WB_TILE_MAX; old_addr = g_wb_tiles[i].address; old_size = g_wb_tiles[i].size; }
         g_wb_tiles[i] = (wb_tile){0};
     }
     wb_tile *d = &g_wb_tiles[i];
     d->address = address; d->size = x->t.L.size; d->pool = pool; d->serial = x->t.serial;
+    totk_wb_sum_replace(&g_wb_tile_sum, old_addr, old_size, d->address, d->size);
     d->image = (uintptr_t)x->im->img; d->version = ++g_wb_tile_version; d->write_sub = sub;
     d->reason = "pending"; d->staged = 0;
     if (address < atomic_load(&g_wb_tile_lo)) atomic_store(&g_wb_tile_lo, address);
@@ -1006,6 +1015,7 @@ static void wb_tile_event(uint64_t version, const char *reason, int landed, int 
 }
 static void wb_tile_invalidate(uint64_t address, uint64_t n, const char *event) {
     if (address >= atomic_load(&g_wb_tile_hi) || address + n <= atomic_load(&g_wb_tile_lo)) return;
+    if (totk_vk_reg_wb_fast_on() && !totk_wb_sum_may_overlap(&g_wb_tile_sum, address, n)) return;
     /* Bounded stack batches, even for whole-pool invalidates. No page access, allocation, drain or rec lock. */
     unsigned next = 0; int more;
     do {
@@ -1031,19 +1041,27 @@ static void wb_lookup_set(int i, const wb_ent *e) {
         g_wb_lookup_cap = g_wb_lookup_cap ? g_wb_lookup_cap * 2 : 64;
         g_wb_lookup = realloc(g_wb_lookup, (size_t)g_wb_lookup_cap * sizeof *g_wb_lookup);
     }
-    g_wb_lookup[i] = (wb_lookup_ent){(uintptr_t)e->t.mem, e->cancelled ? 0 : e->t.L.size};
+    uint64_t old_a = i < g_wb_lookup_n ? g_wb_lookup[i].address : 0;
+    uint64_t old_s = i < g_wb_lookup_n ? g_wb_lookup[i].size : 0;
+    uint64_t new_a = (uintptr_t)e->t.mem, new_s = e->cancelled ? 0 : e->t.L.size;
+    g_wb_lookup[i] = (wb_lookup_ent){new_a, new_s};
     if (i == g_wb_lookup_n) g_wb_lookup_n++;
+    totk_wb_sum_replace(&g_wb_sum, old_a, old_s, new_a, new_s);
     pthread_mutex_unlock(&g_wb_lookup_mu);
 }
 static void wb_lookup_remove(int i) {
     pthread_mutex_lock(&g_wb_lookup_mu);
+    uint64_t old_a = g_wb_lookup[i].address, old_s = g_wb_lookup[i].size;
     g_wb_lookup[i] = g_wb_lookup[--g_wb_lookup_n];
     if (!g_wb_lookup_n) { free(g_wb_lookup); g_wb_lookup = NULL; g_wb_lookup_cap = 0; }
+    totk_wb_sum_delta(&g_wb_sum, old_a, old_s, -1);
     pthread_mutex_unlock(&g_wb_lookup_mu);
 }
 static int wb_invalidate_pending(uint64_t address, uint64_t n) {
+    atomic_fetch_add_explicit(&g_wb_lookup_calls, 1u, memory_order_relaxed);
+    if (totk_vk_reg_wb_fast_on() && !totk_wb_sum_may_overlap(&g_wb_sum, address, n)) return 0;
     int found = 0, inflight = 0;
-    pthread_mutex_lock(&g_wb_lookup_mu); g_wb_lookup_calls++;
+    pthread_mutex_lock(&g_wb_lookup_mu);
     for (int i = 0; i < g_wb_lookup_n; i++) {
         const wb_lookup_ent *e = &g_wb_lookup[i];
         if (e->size && e->address < address + n && address < e->address + e->size) {
@@ -1512,7 +1530,7 @@ static void wb_diag_report(void) {
         delta[i] = total[i] - previous[i]; previous[i] = total[i];
     }
     pthread_mutex_lock(&g_wb_lookup_mu);
-    lookups = g_wb_lookup_calls; hits = g_wb_lookup_hits;
+    lookups = atomic_load_explicit(&g_wb_lookup_calls, memory_order_relaxed); hits = g_wb_lookup_hits;
     pthread_mutex_unlock(&g_wb_lookup_mu);
     pthread_mutex_lock(&g_wb_diag_mu);
     __typeof__(g_wb_diag) d = g_wb_diag;
@@ -1602,7 +1620,7 @@ uint64_t vk_wb_test_invalidates(void) {
     pthread_mutex_lock(&g_tex_mu); uint64_t n = g_set_invalidate; pthread_mutex_unlock(&g_tex_mu); return n;
 }
 void vk_wb_test_sync(uint64_t v[7]) {
-    pthread_mutex_lock(&g_wb_lookup_mu); v[0] = g_wb_lookup_calls; v[1] = g_wb_lookup_hits; pthread_mutex_unlock(&g_wb_lookup_mu);
+    pthread_mutex_lock(&g_wb_lookup_mu); v[0] = atomic_load_explicit(&g_wb_lookup_calls, memory_order_relaxed); v[1] = g_wb_lookup_hits; pthread_mutex_unlock(&g_wb_lookup_mu);
     for (int i = 0; i < WB_OP_COUNT; i++) v[2 + i] = atomic_load(&g_wb_ops[i]);
     pthread_mutex_lock(&g_wb_diag_mu); v[6] = g_wb_diag.peak; pthread_mutex_unlock(&g_wb_diag_mu);
 }
@@ -2315,12 +2333,27 @@ void mtl_reg_tex(int tid, const tex_t *t, const view_t *v) {
     } else tex_epoch_bump();
     pthread_mutex_unlock(&g_reg_mu);
 }
+_Static_assert(sizeof(vk_treg) <= TOTK_TREG_MAX_BYTES, "vk_treg exceeds TOTK_TREG_MAX_BYTES");
+static __thread totk_treg_memo4 *T_treg_memo;
 int vk_treg_get(int tid, vk_treg *out) {   /* g_treg grows by realloc on the game's threads: never hand out a pointer into it */
+    int fast = totk_vk_reg_wb_fast_on() && tid > 0 && tid < TID_GEN_N;
+    if (fast) {
+        int pool_n = atomic_load_explicit(&g_tpool_n, memory_order_acquire);
+        if (pool_n && tid >= pool_n) return 0;
+        uint32_t gen = atomic_load_explicit(&g_treg_gen[tid], memory_order_acquire);
+        if (!gen) return 0;
+        int ok_m = 0;
+        if (totk_treg_memo4_get(&T_treg_memo, (uint32_t)tid, (uint64_t)gen + 1ull, out, sizeof *out, &ok_m)) return ok_m;
+    }
     pthread_mutex_lock(&g_reg_mu);
     int pool_n = atomic_load_explicit(&g_tpool_n, memory_order_acquire);
+    uint32_t gen_lk = (tid > 0 && tid < TID_GEN_N) ? atomic_load_explicit(&g_treg_gen[tid], memory_order_relaxed) : 0u;
     int ok = tid > 0 && tid < g_ntreg && !(pool_n && tid >= pool_n) && g_treg[tid].ok;
-    if (ok) *out = g_treg[tid];
+    vk_treg copy = {0};
+    if (ok) copy = g_treg[tid];
     pthread_mutex_unlock(&g_reg_mu);
+    if (ok) *out = copy;
+    if (fast && gen_lk) totk_treg_memo4_put(&T_treg_memo, (uint32_t)tid, (uint64_t)gen_lk + 1ull, ok, ok ? &copy : NULL, sizeof copy);
     return ok;
 }
 /* Registry writers hold g_reg_mu. A lookup can observe an older or newer registration,
