@@ -296,9 +296,9 @@ vktest: $(OUT)/vkseedpacktest $(OUT)/vkseediotest
 vktest: $(OUT)/vkcomputestoretest
 vktest: $(OUT)/ktglopttest
 ktglopttest: $(OUT)/ktglopttest
-$(OUT)/ktglopttest: $(TOTK)/android/gfx/test_vk_ktgl_opt.c $(TOTK)/android/gfx/host_test_support.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h $(TOTK)/android/gfx/vk_ktgl_memo.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w2.h $(TOTK)/runtime/movie_nv12.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w3.h $(TOTK)/runtime/romfs_handles.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w5.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w6.h $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle_fast.h
+$(OUT)/ktglopttest: $(TOTK)/android/gfx/test_vk_ktgl_opt.c $(TOTK)/android/gfx/host_test_support.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h $(TOTK)/android/gfx/vk_ktgl_memo.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w2.h $(TOTK)/runtime/movie_nv12.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w3.h $(TOTK)/runtime/romfs_handles.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w5.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w6.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w7.h $(TOTK)/android/gfx/vk_res_fast.h $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle_fast.h
 	@mkdir -p $(dir $@)
-	$(CC) -O2 -g $(WARN) -Wno-unused-parameter -D_GNU_SOURCE -DW6_TEST_HOOKS -I$(TOTK)/runtime -I$(TOTK)/third_party/d2r_gfx/gfx/nvn -I$(TOTK)/third_party/d2r_gfx/gfx/nvn/include -I$(TOTK)/third_party/d2r_gfx/gfx/tex $(COMPAT) -o $@ $(filter %.c,$^) $(if $(filter linux,$(TARGET)),-lpthread)
+	$(CC) -O2 -g $(WARN) -Wno-unused-parameter -D_GNU_SOURCE -DW6_TEST_HOOKS -DW7_TEST_HOOKS -I$(TOTK)/runtime -I$(TOTK)/third_party/d2r_gfx/gfx/nvn -I$(TOTK)/third_party/d2r_gfx/gfx/nvn/include -I$(TOTK)/third_party/d2r_gfx/gfx/tex $(COMPAT) -o $@ $(filter %.c,$^) $(if $(filter linux,$(TARGET)),-lpthread)
 vktest: $(OUT)/vksubgrouptest
 vksubgrouptest: $(OUT)/vksubgrouptest
 $(OUT)/vksubgrouptest: $(TOTK)/android/gfx/test_vk_subgroup.c $(TOTK)/android/gfx/vk_subgroup.h

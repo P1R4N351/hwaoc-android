@@ -30,6 +30,13 @@
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include "vk_upload_pool.h"
 #include "vk_edge_guard.h"
+#include "vk_res_fast.h"
+static int res_fast_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_VK_RES_FAST"); v = !(e && atoi(e) == 0); atomic_store_explicit(&on, v, memory_order_relaxed); }
+    return v;
+}
 #include <assert.h>
 #include <unistd.h>
 #include "../../runtime/frame_timeline.h"
@@ -1816,7 +1823,7 @@ static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_tar
     if (im->type == VK_IMAGE_TYPE_3D && attach != 1) { vt = VK_IMAGE_VIEW_TYPE_3D; s0 = 0; ns = 1; }
     uint64_t k0 = (uint64_t)vf | (uint64_t)vt << 32 | (uint64_t)aspect << 40 | (uint64_t)(attach & 3) << 48, k1 = (uint64_t)l0 | (uint64_t)nl << 8 | (uint64_t)s0 << 16 | (uint64_t)ns << 28
         | (uint64_t)(sw.r & 7) << 40 | (uint64_t)(sw.g & 7) << 43 | (uint64_t)(sw.b & 7) << 46 | (uint64_t)(sw.a & 7) << 49;
-    for (int i = 0; i < im->nviews; i++) if (im->views[i].k0 == k0 && im->views[i].k1 == k1) return im->views[i].v;
+    for (int i = 0; i < im->nviews; i++) if (im->views[i].k0 == k0 && im->views[i].k1 == k1) { if (i >= 2 && res_fast_on()) { view_ent tmp = im->views[1]; im->views[1] = im->views[i]; im->views[i] = tmp; return im->views[1].v; } return im->views[i].v; }
     VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
         .usage = attach == 1 ? im->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
                : attach == 2 ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
@@ -2231,6 +2238,9 @@ typedef struct {
 } tidc_t;
 enum { TIDC_N = 4096 };
 static __thread tidc_t *T_tidc;
+static __thread totk_tidc_vic *T_tvic;
+static __thread totk_fmemo *T_fmemo;
+static __thread totk_scache4 *T_sc4;
 #ifdef TOTK_VK_TESTS
 static __thread uint64_t T_tex_lookup[3];
 void vk_tex_lookup_counters(uint64_t out[3]) { memcpy(out, T_tex_lookup, sizeof T_tex_lookup); }
@@ -2257,6 +2267,31 @@ static VkImageView tex_by_id_slow(int tid, int want, vk_tex **x_out, tidc_t *cac
     pthread_mutex_unlock(&g_tex_mu);
     *x_out = x;
     return v;
+}
+static int tidc_try_victim(unsigned hash, int tid, int want, int in_pool, uint32_t gen, uint64_t sub, uint64_t epoch, int precise, VkImageView *out_v, vk_tex **x_out) {
+    if (!T_tvic) { T_tvic = calloc(1, sizeof *T_tvic); return 0; }
+    totk_tvic_ent *ve = totk_tvic_find(T_tvic, hash, tid, want, gen);
+    if (!ve) return 0;
+    int vok = precise ? (ve->in_pool == in_pool && (ve->x ? tex_stamp_current((tex_stamp){ve->tex_cell, ve->tex_val}) && tex_stamp_current((tex_stamp){ve->img_cell, ve->img_val}) : ve->sub == sub))
+                      : (ve->epoch == epoch && ve->sub == sub);
+    if (vok && precise && ve->x && ve->sub != sub) {
+        TEX_LOOKUP_COUNT(2);
+        (void)vk_tex_get(&((vk_tex *)ve->x)->t);
+        vok = tex_stamp_current((tex_stamp){ve->tex_cell, ve->tex_val}) && tex_stamp_current((tex_stamp){ve->img_cell, ve->img_val});
+        ve->sub = sub;
+    }
+    if (!vok) { ve->tid = 0; return 0; }
+    if (precise && texgen_check()) {
+        vk_tex *oracle; VkImageView view = tex_by_id_slow(tid, want, &oracle, NULL);
+        int cur_pn = atomic_load_explicit(&g_tpool_n, memory_order_acquire);
+        int stable = gen == atomic_load_explicit(&g_treg_gen[tid], memory_order_acquire) && in_pool == (!cur_pn || tid < cur_pn) &&
+            (!ve->x || (tex_stamp_current((tex_stamp){ve->tex_cell, ve->tex_val}) && tex_stamp_current((tex_stamp){ve->img_cell, ve->img_val})));
+        if (stable && (view != (VkImageView)(uintptr_t)ve->view_u || oracle != (vk_tex *)ve->x)) { LOGV("texture generation mismatch: tid=%d target=%d", tid, want); abort(); }
+        if (!stable) { ve->tid = 0; *out_v = view; if (x_out) *x_out = oracle; return 1; }
+    }
+    *out_v = (VkImageView)(uintptr_t)ve->view_u;
+    if (x_out) *x_out = (vk_tex *)ve->x;
+    return 1;
 }
 static VkImageView tex_by_id_cached(int tid, int want, vk_tex **x_out) {
     if (!texcache_on() || tid <= 0 || tid >= TID_GEN_N) {
@@ -2287,6 +2322,16 @@ static VkImageView tex_by_id_cached(int tid, int want, vk_tex **x_out) {
         }
     } else valid = valid && c->epoch == epoch && c->sub == sub;
     if (!valid) {
+        if (res_fast_on()) {
+            VkImageView vv;
+            if (tidc_try_victim(hash, tid, want, in_pool, gen, sub, epoch, precise, &vv, x_out)) return vv;
+            if (c->tid > 0 && T_tvic) {
+                totk_tvic_ent old_v = { .tid = c->tid, .want = c->want, .in_pool = c->in_pool, .gen = c->gen,
+                    .sub = c->sub, .epoch = c->epoch, .view_u = (uint64_t)(uintptr_t)c->v, .x = c->x,
+                    .tex_cell = c->texture.cell, .tex_val = c->texture.value, .img_cell = c->image.cell, .img_val = c->image.value };
+                totk_tvic_put(T_tvic, hash, &old_v);
+            }
+        }
         TEX_LOOKUP_COUNT(1);
         *c = (tidc_t){.tid = tid, .want = want, .in_pool = in_pool, .gen = gen, .sub = sub, .epoch = epoch};
         c->v = tex_by_id_slow(tid, want, &c->x, precise ? c : NULL);
@@ -2343,10 +2388,46 @@ static void texmemo_publish(texmemo_t *m) {
         m->published[i] = m->counts[i];
     }
 }
+static void fmemo_publish(totk_fmemo *m) {
+    for (int i = 0; i < 3; i++) {
+        atomic_fetch_add_explicit(&g_tex_memo_counts[i], m->counts[i] - m->published[i], memory_order_relaxed);
+        m->published[i] = m->counts[i];
+    }
+}
+static VkImageView vk_tex_by_id_fast(int tid, int want, vk_tex **x_out) {
+    totk_fmemo *m = T_fmemo;
+    if (!m && !(m = T_fmemo = calloc(1, sizeof *m))) return tex_by_id_cached(tid, want, x_out);
+    uint64_t registry = vk_treg_revision(), identity = atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire);
+    uint64_t sub = vk_submit_serial();
+    if (registry != m->registry || identity != m->identity) {
+        m->registry = registry; m->identity = identity; m->counts[2]++;
+        if (!++m->gen) { memset(m->p, 0, sizeof m->p); memset(m->v, 0, sizeof m->v); m->gen = 1; }
+    }
+    if (want < -2 || want >= 4094) return tex_by_id_cached(tid, want, x_out);
+    uint32_t key = (uint32_t)tid | (uint32_t)(want + 2) << 20;
+    const totk_fm_ent *e = totk_fmemo_get(m, key);
+    VkImageView v = VK_NULL_HANDLE; vk_tex *x = NULL;
+    int hit = e && (e->x ? e->sub != UINT64_MAX || atomic_load_explicit(&((vk_tex *)e->x)->memo_sub, memory_order_acquire) == sub : totk_fmemo_sub_ok(e, sub));
+    if (hit) {
+        v = (VkImageView)(uintptr_t)e->v; x = (vk_tex *)e->x; m->counts[0]++;
+        if (texgen_check()) {
+            vk_tex *oracle; VkImageView view = tex_by_id_cached(tid, want, &oracle);
+            if (registry == vk_treg_revision() && identity == atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire) &&
+                sub == vk_submit_serial() && (view != v || oracle != x)) { LOGV("texture memo mismatch: tid=%d target=%d", tid, want); abort(); }
+        }
+    } else {
+        v = tex_by_id_cached(tid, want, &x); m->counts[1]++;
+        totk_fmemo_put(m, key, !x ? sub : __atomic_load_n(&x->mirrored, __ATOMIC_RELAXED) ? UINT64_MAX : 0, (uint64_t)(uintptr_t)v, x);
+    }
+    if (!((m->counts[0] + m->counts[1]) & 4095)) fmemo_publish(m);
+    if (x_out) *x_out = x;
+    return v;
+}
 VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out) {
     vk_draw_texture_read(tid,NULL); /* before either descriptor cache can bypass resource preparation */
     int want = target_out ? *target_out : -1;
     TEX_LOOKUP_COUNT(0);
+    if (res_fast_on() && vk_tex_memo_on() && tid > 0 && tid < TID_GEN_N && texcache_on()) return vk_tex_by_id_fast(tid, want, x_out);
     texmemo_t *m = T_texmemo;
     if (!vk_tex_memo_on() || tid <= 0 || tid >= TID_GEN_N || !texcache_on() ||
         (!m && !(m = T_texmemo = calloc(1, sizeof *m))))
@@ -2466,7 +2547,14 @@ VkSampler vk_samp_by_id(int sid) {
     enum { SC = 1 << 12 };   /* sampler ids change rarely: cached until any sampler registration changes one */
     static struct { int sid; uint32_t ep; VkSampler s; } sc[SC];
     uint32_t ep = atomic_load(&g_samp_epoch); unsigned h = (unsigned)sid & (SC - 1);
-    if (texcache_on() && sid > 0 && sc[h].sid == sid && sc[h].ep == ep) return sc[h].s;
+    int fast = res_fast_on(), tc = texcache_on();
+    if (tc && fast && sid > 0) {
+        if (!T_sc4) T_sc4 = calloc(1, sizeof *T_sc4);
+        if (T_sc4) {
+            uint64_t cached = totk_scache4_get(T_sc4, sid, ep);
+            if (cached) return (VkSampler)(uintptr_t)cached;
+        }
+    } else if (tc && sid > 0 && sc[h].sid == sid && sc[h].ep == ep) return sc[h].s;
     pthread_mutex_lock(&g_reg_mu);
     VkSampler s = VK_NULL_HANDLE;
     if (sid > 0 && sid < g_nsreg && g_sreg_ok[sid]) {
@@ -2480,7 +2568,7 @@ VkSampler vk_samp_by_id(int sid) {
         s = g_sobj[sid];
     }
     pthread_mutex_unlock(&g_reg_mu);
-    if (s) { sc[h].sid = sid; sc[h].ep = ep; sc[h].s = s; }
+    if (s) { if (fast && T_sc4) totk_scache4_put(T_sc4, sid, ep, (uint64_t)(uintptr_t)s); else { sc[h].sid = sid; sc[h].ep = ep; sc[h].s = s; } }
     return s;
 }
 VkSampler vk_dummy_sampler(void) {

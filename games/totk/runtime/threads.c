@@ -49,6 +49,7 @@ static inline uintptr_t runtime_host_slots(void) { return 0; }
 #include "fps_auto_block.h"
 #include <dlfcn.h>
 #include <string.h>
+#include "sync_fast.h"
 #include <sys/ucontext.h>
 
 #if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
@@ -126,6 +127,10 @@ typedef struct thr {
     int wkind, woke; uint64_t waddr, wkey; uint32_t wtag; int64_t wres;
     uint64_t wseq;             // 登记等待的先后序号：同优先级先到先醒（与 Horizon 内核 KThread 等待树同序） | Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
     struct thr *next;          // 等待链 | Wait chain
+    struct thr **wprev, *bnext, **bprev;
+    const uint32_t *whs;
+    int whn;
+    uint64_t wbloom;
     struct thr *all;           // 全部线程链（现场导出用） | All-threads chain (for the state dump)
     int last_svc; uint64_t last_lr, last_fp;
     int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
@@ -276,9 +281,33 @@ static void vcore_stats_frame(uint64_t frame) {
 }
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
+static sync_hmap g_hmap;
+static int sync_fast_on(void) {
+    static _Atomic int on = -1;
+    int v = atomic_load_explicit(&on, memory_order_relaxed);
+    if (v < 0) { const char *e = getenv("TOTK_SYNC_FAST"); v = !(e && atoi(e) == 0); atomic_store_explicit(&on, v, memory_order_relaxed); }
+    return v;
+}
+static int h_find_free(void) {
+    if (sync_fast_on()) {
+        unsigned s = sync_hmap_alloc(&g_hmap);
+        if (!s || g_h[s].type) {
+            memset(&g_hmap, 0, sizeof g_hmap);
+            for (int k = 1; k < MAX_H; k++) if (g_h[k].type) sync_hmap_mark(&g_hmap, (unsigned)k);
+            s = sync_hmap_alloc(&g_hmap);
+        }
+        if (s > 0 && s < MAX_H && !g_h[s].type) return (int)s;
+        if (s) sync_hmap_free(&g_hmap, s);
+    }
+    for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { sync_hmap_mark(&g_hmap, (unsigned)i); return i; }
+    return 0;
+}
 static pthread_key_t g_keythr;
 static uint64_t g_next_id = 0x51;
 static thr_t *g_wait;          // 全部在等的线程（锁 / 条件 / 地址 / 同步） | All waiting threads (lock / condition / address / synchronization)
+static thr_t *g_wbucket[SYNC_WB_BUCKETS];
+static thr_t *g_wsync;
+static uint32_t g_wb_live;
 
 #ifdef GAME_BOTW
 /* Handles as Horizon encodes them (Atmosphere KHandleTable): the slot in bits 0-14 and, in bits 15-29, a linear id that
@@ -290,7 +319,8 @@ static uint16_t g_hlin[MAX_H];
 static uint16_t g_next_lin = 1;
 static uint32_t g_main_handle;
 static uint32_t h_new(int type, void *obj) {     // caller holds G
-    for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) {
+    int i = h_find_free();
+    if (i > 0) {
         uint16_t lin = g_next_lin++; if (g_next_lin > 0x7fff) g_next_lin = 1;
         g_h[i].type = type; g_h[i].obj = obj; g_hlin[i] = lin;
         return ((uint32_t)lin << 15) | (uint32_t)i;
@@ -310,7 +340,8 @@ static unsigned h_index(uint32_t h) {            // slot of a live handle, 0 whe
 }
 #else
 static uint32_t h_new(int type, void *obj) {     // 调用方持 G | Caller holds G
-    for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
+    int i = h_find_free();
+    if (i > 0) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + (uint32_t)i; }
     die("句柄表满");
 }
 #endif
@@ -337,18 +368,51 @@ static thr_t *cur(void) {
 
 // ---------- 等待原语（持 G 调用）----------
 // ---------- Wait primitives (called holding G) ----------
+static void wb_reset_if_empty(void) {
+    if (!g_wait && g_wb_live) { memset(g_wbucket, 0, sizeof g_wbucket); g_wsync = NULL; g_wb_live = 0; }
+}
+static void wb_link(thr_t *t, int kind) {
+    wb_reset_if_empty();
+    int wb_clean = !(g_wait && !g_wait->wprev);
+    t->next = g_wait; t->wprev = wb_clean ? &g_wait : NULL;
+    if (g_wait && wb_clean) g_wait->wprev = &t->next;
+    g_wait = t;
+    thr_t **head = kind == 4 ? &g_wsync : &g_wbucket[sync_wb_hash(kind, kind == 2 ? t->wkey : t->waddr)];
+    t->bnext = *head; t->bprev = head;
+    if (*head) (*head)->bprev = &t->bnext;
+    *head = t; g_wb_live++;
+}
+static void wb_retarget_lock(thr_t *t, uint64_t addr) {
+    if (t->bprev && *t->bprev == t) { *t->bprev = t->bnext; if (t->bnext) t->bnext->bprev = t->bprev; }
+    t->wkind = 1; t->waddr = addr;
+    thr_t **head = &g_wbucket[sync_wb_hash(1, addr)];
+    t->bnext = *head; t->bprev = head;
+    if (*head) (*head)->bprev = &t->bnext;
+    *head = t;
+}
 static void wait_unlink(thr_t *t) {
-    for (thr_t **p = &g_wait; *p; p = &(*p)->next) if (*p == t) { *p = t->next; break; }
-    t->next = NULL;
+    if (t->wprev && *t->wprev == t) { *t->wprev = t->next; if (t->next) t->next->wprev = t->wprev; }
+    else for (thr_t **p = &g_wait; *p; p = &(*p)->next) if (*p == t) { *p = t->next; if (t->next) t->next->wprev = p; break; }
+    t->next = NULL; t->wprev = NULL;
+    if (t->bprev && *t->bprev == t) { *t->bprev = t->bnext; if (t->bnext) t->bnext->bprev = t->bprev; if (g_wb_live) g_wb_live--; }
+    t->bnext = NULL; t->bprev = NULL;
 }
 // 按内核顺序挑等待者：优先级数值小者优先，同优先级先登记者优先（持 G）。kind 1 按锁地址、2 按条件键、3 按地址匹配
 // Pick a waiter in kernel order: numerically lower priority first, at equal priority the earlier registered first (holding G). kind 1 matches by lock address, 2 by condition key, 3 by address
 static uint64_t g_wseq;
 static thr_t *pick(int kind, uint64_t a) {
     thr_t *b = NULL;
+    if (sync_fast_on() && kind >= 1 && kind <= 3 && !(g_wait && !g_wait->wprev)) {
+        wb_reset_if_empty();
+        for (thr_t *t = g_wbucket[sync_wb_hash(kind, a)]; t; t = t->bnext) {
+            if (t->wkind != kind || (kind == 2 ? t->wkey : t->waddr) != a) continue;
+            if (!b || sync_wb_prio_better(t->prio, t->wseq, b->prio, b->wseq)) b = t;
+        }
+        return b;
+    }
     for (thr_t *t = g_wait; t; t = t->next) {
         if (t->wkind != kind || (kind == 2 ? t->wkey : t->waddr) != a) continue;
-        if (!b || t->prio < b->prio || (t->prio == b->prio && t->wseq < b->wseq)) b = t;
+        if (!b || sync_wb_prio_better(t->prio, t->wseq, b->prio, b->wseq)) b = t;
     }
     return b;
 }
@@ -1076,7 +1140,9 @@ static int64_t block(thr_t *t,int kind,int64_t ns) {
     return r;
 }
 static int64_t block_inner(thr_t *t, int kind, int64_t ns) {
-    t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
+    t->wkind = kind; t->woke = 0; t->wseq = ++g_wseq;
+    if (ns == 0 && sync_fast_on()) { t->wkind = 0; return R_TIMEOUT; }
+    wb_link(t, kind);
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     struct timespec dl;
     int det_wait = ns > 0 && dm_detclock_enabled();
@@ -1121,7 +1187,10 @@ static void tag_check(const thr_t *t, uint32_t tag, const char *what, uint64_t a
 static void lock_handoff(uint64_t addr) {
     thr_t *w = pick(1, addr); int more = 0;
     if (!w) { st32(addr, 0); return; }
-    for (thr_t *t = g_wait; t; t = t->next) if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
+    int use_b = sync_fast_on() && !(g_wait && !g_wait->wprev);
+    thr_t *head = use_b ? g_wbucket[sync_wb_hash(1, addr)] : g_wait;
+    for (thr_t *t = head; t; t = use_b ? t->bnext : t->next)
+        if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
     wake(w, 0);
 }
@@ -1133,7 +1202,8 @@ static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
         if (v == 0) { if (cas32(addr, &v, tag)) { wake(t, 0); return; } continue; }
         if (cas32(addr, &v, v | WAITERS_BIT)) break;
     }
-    t->wkind = 1; t->waddr = addr; t->wtag = tag;      // 仍在 g_wait 里，改为锁等待 | Still in g_wait, changed to a lock wait
+    t->wtag = tag;
+    wb_retarget_lock(t, addr);                           // 仍在 g_wait 里，改为锁等待 | Still in g_wait, moved to mutex wait bucket
     t->wseq = ++g_wseq;                                  // 内核把它新插进锁持有者的等待队列：同优先级排在已有锁等待者之后 | The kernel inserts it anew into the lock owner's wait queue: at equal priority it goes after the existing lock waiters
 }
 
@@ -1161,6 +1231,7 @@ static void *thread_main(void *p) {
     dm_thread_enter(t->entry, t->arg, t->stack_top,t->host_context);   // 不返回：客体须经 ExitThread 退出 | Does not return: the guest must exit through ExitThread
     die("客体线程入口返回");
 }
+static void wake_sync_waiters_obj(const void *obj);
 static void thr_free(thr_t *t) {   // 持 G；从全部线程链摘下并释放 | Holding G; unlink from the all-threads chain and free
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
     pthread_cond_destroy(&t->cv); free(t->profile); free(t);
@@ -1174,7 +1245,7 @@ static _Noreturn void thread_exit_on_host(void *argument) {
     pthread_mutex_lock(&G);
     core_put(t);
     t->exited = 1;
-    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next; if (w->wkind == 4) wake(w, -1); w = n; }   // 同步等待者重查 | Synchronization waiters re-check
+    wake_sync_waiters_obj(t);   // 同步等待者重查 | Synchronization waiters re-check
     pthread_setspecific(g_keythr, NULL);
     if (t->closed) thr_free(t);
     pthread_mutex_unlock(&G);
@@ -1303,12 +1374,15 @@ uint32_t dm_guest_work_qos(unsigned *count) {
 
 // ---------- 同步对象 ----------
 // ---------- Synchronization objects ----------
-static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = signaled (holding G)
+static unsigned h_slot(uint32_t h) {
 #ifdef GAME_BOTW
-    unsigned i = h_index(h);
+    return h_index(h);
 #else
-    unsigned i = h - 0x1000;
+    return h - 0x1000;
 #endif
+}
+static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = signaled (holding G)
+    unsigned i = h_slot(h);
     if (h == H_CUR_THREAD) return 0;
     if (i == 0 || i >= MAX_H) { *bad = 1; return 0; }
     switch (g_h[i].type) {
@@ -1329,7 +1403,28 @@ static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = si
 // kept under GAME_BOTW only so that commit left Tears of the Kingdom's build unchanged, not because of a problem there. Semantics are
 // unchanged: a waiter none of whose objects is signaled would only have gone back to sleep (nxnative df7badd does the same).
 // Holding G.
-static void wake_sync_waiters(void) {
+static uint64_t sync_bloom_of(const uint32_t *hs, int n) {
+    if (!hs || n <= 0) return ~0ull;
+    uint64_t bm = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned k = h_slot(hs[i]);
+        if (k > 0 && k < MAX_H && g_h[k].obj) bm |= sync_obj_bloom_ins(g_h[k].obj);
+    }
+    return bm;
+}
+static void wake_sync_waiters_obj(const void *obj) {
+    if (sync_fast_on() && !(g_wait && !g_wait->wprev)) {
+        wb_reset_if_empty();
+        uint64_t bit = obj ? sync_obj_bloom_qry(obj) : ~0ull;
+        for (thr_t *w = g_wsync; w; ) { thr_t *n = w->bnext;
+            if (w->wkind == 4 && (!obj || !w->whs || (w->wbloom & bit))) {
+                int hit = !w->whs;
+                for (int i = 0; i < w->whn && !hit; i++) { unsigned k = h_slot(w->whs[i]); hit = k > 0 && k < MAX_H && g_h[k].obj == obj; }
+                if (hit) wake(w, -1);
+            }
+            w = n; }
+        return;
+    }
     for (thr_t *w = g_wait; w; ) { thr_t *n = w->next;
         if (w->wkind == 4) { int hit = w->nwh > 4, bad = 0; for (int i = 0; !hit && i < w->nwh; i++) hit = sig_obj(w->wh[i], &bad) || bad; if (hit) wake(w, -1); }
         w = n; }
@@ -1355,14 +1450,25 @@ void dm_guest_clock_advanced(void) {
 // each time the game uses amiibo (nxnative 49ee623 found the same). Lock order: G, then g_se_lock (nothing takes G holding g_se_lock).
 static struct { void *ev; uint32_t wh; } g_se[512];
 static int g_nse;
+static sync_se_idx g_se_idx;
 static pthread_mutex_t g_se_lock = PTHREAD_MUTEX_INITIALIZER;
+static void se_rebuild_idx(void) {
+    memset(&g_se_idx, 0, sizeof g_se_idx);
+    for (int i = 0; i < g_nse; i++) sync_se_put(&g_se_idx, g_se[i].ev, g_se[i].wh);
+}
 static uint32_t se_find(void *ev) {   // 调用方持 g_se_lock | Caller holds g_se_lock
+    if (sync_fast_on() && ev) {
+        uint32_t wh = sync_se_find_ev(&g_se_idx, ev);
+        if (wh || !g_se_idx.overflow) return wh;
+    }
     for (int i = 0; i < g_nse; i++) if (g_se[i].ev == ev) return g_se[i].wh;
     return 0;
 }
 static void se_unbind(uint32_t wh) {   // 调用方持 G | Caller holds G
     pthread_mutex_lock(&g_se_lock);
+    sync_se_del_wh(&g_se_idx, wh);
     for (int i = 0; i < g_nse; ) if (g_se[i].wh == wh) g_se[i] = g_se[--g_nse]; else i++;
+    if (g_se_idx.overflow) se_rebuild_idx();
     pthread_mutex_unlock(&g_se_lock);
 }
 
@@ -1541,7 +1647,7 @@ int svc_thread(int num, uint64_t *regs) {
         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
         pthread_mutex_lock(&G);
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // 按内核顺序；转为锁等待或被唤醒后不再是 kind 2 | In kernel order; once turned into a lock wait or woken it is no longer kind 2
-        int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
+        int left = 0, use_b = sync_fast_on() && !(g_wait && !g_wait->wprev); for (thr_t *w = use_b ? g_wbucket[sync_wb_hash(2, key)] : g_wait; w; w = use_b ? w->bnext : w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
         pthread_mutex_unlock(&G);
         regs[0] = 0; return 1;
@@ -1561,7 +1667,7 @@ int svc_thread(int num, uint64_t *regs) {
     case 0x35: {  // SignalToAddress(x0 地址, w1 类型, w2 值, w3 个数)：0 唤醒、1 相等则加一并唤醒、2 相等则按等待数改值并唤醒 | SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
         pthread_mutex_lock(&G);
-        int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
+        int nw = 0, use_b = sync_fast_on() && !(g_wait && !g_wait->wprev); for (thr_t *w = use_b ? g_wbucket[sync_wb_hash(3, addr)] : g_wait; w; w = use_b ? w->bnext : w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
         int64_t r = 0;
         if (type != 0) {
             int32_t nv = val + 1;
@@ -1595,7 +1701,7 @@ int svc_thread(int num, uint64_t *regs) {
         int64_t r = 0;
         if (!e) { r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
                   if (r == R_BAD_HANDLE) LOG("事件 SVC %#x 句柄无效 %#x", num, h); }
-        else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(); }
+        else if (num == 0x11) { e->signaled = 1; wake_sync_waiters_obj(e); }
         else if (num == 0x17 && !e->signaled) r = R_BAD_STATE;
         else e->signaled = 0;
         pthread_mutex_unlock(&G);
@@ -1616,7 +1722,10 @@ int svc_thread(int num, uint64_t *regs) {
             if (idx >= 0) { r = 0; break; }
             int64_t left = ns < 0 ? -1 : ns == 0 ? 0 : deadline - (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns());
             if (ns > 0 && left <= 0) { r = R_TIMEOUT; break; }
-            if (block(t, 4, left) == R_TIMEOUT) { r = R_TIMEOUT; break; }
+            t->whs = hs; t->whn = n; t->wbloom = sync_bloom_of(hs, n);
+            int64_t br = block(t, 4, left);
+            t->whs = NULL; t->whn = 0;
+            if (br == R_TIMEOUT) { r = R_TIMEOUT; break; }
         }
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
@@ -1638,16 +1747,16 @@ int svc_thread(int num, uint64_t *regs) {
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
             if (g_h[i].type == O_EVENT_W) se_unbind((uint32_t)regs[0]);   // 绑定随写端结束 | the binding ends with its write end
             valid=1;event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
-            g_h[i].type = O_FREE; g_h[i].obj = NULL;
+            g_h[i].type = O_FREE; g_h[i].obj = NULL; sync_hmap_free(&g_hmap, i);
         } else if (i > 0 && i < MAX_H && (g_h[i].type == O_SESSION || g_h[i].type == O_TMEM)) {
             valid=1;void *o = g_h[i].obj; int session = g_h[i].type == O_SESSION;
-            g_h[i].type = O_FREE; g_h[i].obj = NULL;
+            g_h[i].type = O_FREE; g_h[i].obj = NULL; sync_hmap_free(&g_hmap, i);
             pthread_mutex_unlock(&G);
             if (session) runtime_ipc_session_closed(o); else runtime_ipc_tmem_closed(o);
             pthread_mutex_lock(&G);
         } else if (i > 0 && i < MAX_H && g_h[i].type == O_THREAD) {
             valid=1;thr_t *t = g_h[i].obj;
-            g_h[i].type = O_FREE; g_h[i].obj = NULL;
+            g_h[i].type = O_FREE; g_h[i].obj = NULL; sync_hmap_free(&g_hmap, i);
             t->closed = 1;
             if (t->exited) thr_free(t);
         }
@@ -1677,7 +1786,7 @@ void hle_bind_system_event(void *ev, int autoclear) {      // 必须在客体线
     wh = getw(ev);
     pthread_mutex_lock(&g_se_lock);
     if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent 绑定表满");
-    g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh;
+    g_se[g_nse].ev = ev; g_se[g_nse++].wh = wh; sync_se_put(&g_se_idx, ev, wh);
     pthread_mutex_unlock(&g_se_lock);
 }
 // 未绑定的在客体线程上按手动清除即时绑定；宿主线程（显示链接的垂直同步回调等）上未绑定说明游戏已销毁了它，这次触发没有对象可发，跳过。
@@ -1693,7 +1802,7 @@ void hle_signal_system_event(void *ev) {
         if (wh) {
             event_t *e = h_get(wh, O_EVENT_W);
             if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
-            e->signaled = 1; wake_sync_waiters();
+            e->signaled = 1; wake_sync_waiters_obj(e);
             pthread_mutex_unlock(&G);
             return;
         }
@@ -1724,7 +1833,7 @@ uint32_t runtime_event_readable(uint32_t hw) {
 }
 void runtime_event_signal(uint32_t hw) {
     pthread_mutex_lock(&G); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
-    e->signaled = 1; wake_sync_waiters(); pthread_mutex_unlock(&G);
+    e->signaled = 1; wake_sync_waiters_obj(e); pthread_mutex_unlock(&G);
 }
 
 // ---------- Diagnostics: TOTK_DUMP_AFTER=<seconds> prints every guest thread's wait state and guest return chain ----------
