@@ -283,7 +283,7 @@ $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vk
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest vkrectest vkcanvastest): $(TOTK)/android/gfx/pso_trace_key.h
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_screen_classify.h
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_alpha_test.h
-$(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h
+$(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h $(TOTK)/android/gfx/vk_ktgl_memo.h
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vknativeuitest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_pso_keys.h $(TOTK)/android/gfx/vk_pso_runtime.inc
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest vkrectest vkcanvastest): $(TOTK)/android/gfx/pso_trace_key.h
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_screen_classify.h
@@ -296,7 +296,7 @@ vktest: $(OUT)/vkseedpacktest $(OUT)/vkseediotest
 vktest: $(OUT)/vkcomputestoretest
 vktest: $(OUT)/ktglopttest
 ktglopttest: $(OUT)/ktglopttest
-$(OUT)/ktglopttest: $(TOTK)/android/gfx/test_vk_ktgl_opt.c $(TOTK)/android/gfx/host_test_support.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h
+$(OUT)/ktglopttest: $(TOTK)/android/gfx/test_vk_ktgl_opt.c $(TOTK)/android/gfx/host_test_support.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h $(TOTK)/android/gfx/vk_ktgl_memo.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w2.h $(TOTK)/runtime/movie_nv12.h
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -g $(WARN) -Wno-unused-parameter -D_GNU_SOURCE -I$(TOTK)/runtime -I$(TOTK)/third_party/d2r_gfx/gfx/nvn -I$(TOTK)/third_party/d2r_gfx/gfx/nvn/include $(COMPAT) -o $@ $(filter %.c,$^) $(if $(filter linux,$(TARGET)),-lpthread)
 vktest: $(OUT)/vksubgrouptest

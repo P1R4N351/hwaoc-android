@@ -226,7 +226,7 @@ bug report.
 - [games/totk/android/BOTW.md](games/totk/android/BOTW.md): what is ported for Breath of the Wild, and the game folder.
 - [docs/research/](docs/research/README.md): findings with their evidence (graphics, LEDs, stamina and cutscene
   signals, per-LED control).
-- [docs/ktgl-commonalities.md](docs/ktgl-commonalities.md): KTGL engine commonalities & cross-venture optimizations (`AoC` + `AoI`).
+- [docs/ktgl-commonalities.md](docs/ktgl-commonalities.md): KTGL engine commonalities & cross-venture optimizations (`AoC` + `AoI`: `edgeguard`, `quadbatch`, `ktglmemo`, `TOTK_MOVIE_MT`/`FAST_NV12`).
 - [docs/companion-waist.md](docs/companion-waist.md): the second-screen ledger.
 - [docs/architecture.md](docs/architecture.md), [docs/building.md](docs/building.md),
   [docs/developer-settings.md](docs/developer-settings.md): how the port works, building and `totk.env` switches.

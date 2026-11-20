@@ -23,6 +23,7 @@
 #include "vk_shader_xlate.h"
 #include "vk_seed_io.h"
 #include "vk_load_proof.h"
+#include "vk_ktgl_memo.h"
 #include "vk_subgroup.h"
 #include "vk_position.h"
 #include "vk_int_fold.h"
@@ -709,12 +710,24 @@ static pthread_mutex_t g_progs_mu = PTHREAD_MUTEX_INITIALIZER;
    serials are never reused (nvn_new_serial; ProgramSetShaders takes a new one) and a vk_prog is never freed. */
 enum { PROGC_N = 64 };
 static struct { uint64_t serial; vk_prog *pr; } g_progc[PROGC_N];
+static vk_progc_memo g_ktgl_progc;
+static int ktglmemo_shader_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 static vk_prog *prog_of(const prog_t *p) {
     if (!p || !p->serial) return NULL;
-    unsigned h = (unsigned)(p->serial % PROGC_N);
-    if (g_progc[h].serial == p->serial) return g_progc[h].pr;
+    int memo = ktglmemo_shader_on();
+    if (memo) {
+        vk_prog *cached = (vk_prog *)vk_progc_get(&g_ktgl_progc, p->serial);
+        if (cached) return cached;
+    } else {
+        unsigned h = (unsigned)(p->serial % PROGC_N);
+        if (g_progc[h].serial == p->serial) return g_progc[h].pr;
+    }
     pthread_mutex_lock(&g_progs_mu); vk_prog *pr = nvn_hm_get(&g_progs, &p->serial); pthread_mutex_unlock(&g_progs_mu);
-    if (pr) { g_progc[h].serial = p->serial; g_progc[h].pr = pr; return pr; }
+    if (pr) {
+        if (memo) vk_progc_put(&g_ktgl_progc, p->serial, pr);
+        else { unsigned h = (unsigned)(p->serial % PROGC_N); g_progc[h].serial = p->serial; g_progc[h].pr = pr; }
+        return pr;
+    }
     pr = calloc(1, sizeof *pr);
     for (unsigned i = 0; i < p->nstage && i < 6; i++) {
         const uint8_t *control = p->sd[i].control; uint32_t length = 0, st = 0;
@@ -727,7 +740,8 @@ static vk_prog *prog_of(const prog_t *p) {
         pr->ctl[st] = control; pr->code[st] = (const uint8_t *)(uintptr_t)p->sd[i].data; pr->has[st] = 1; pr->stages |= 1u << st;
     }
     pthread_mutex_lock(&g_progs_mu); nvn_hm_put(&g_progs, &p->serial, pr); pthread_mutex_unlock(&g_progs_mu);
-    g_progc[h].serial = p->serial; g_progc[h].pr = pr;
+    if (memo) vk_progc_put(&g_ktgl_progc, p->serial, pr);
+    else { unsigned h = (unsigned)(p->serial % PROGC_N); g_progc[h].serial = p->serial; g_progc[h].pr = pr; }
     return pr;
 }
 void vk_prog_prepare(const prog_t *p) {
@@ -875,8 +889,13 @@ int vk_prog_resolve_gfx(const prog_t *const progs[6], vk_shader *out[6]) {
 }
 static vk_prog *prog_lookup_ready(const prog_t *p) {
     if (!p || !p->serial) return NULL;
-    unsigned h = (unsigned)(p->serial % PROGC_N);
-    if (g_progc[h].serial == p->serial) return g_progc[h].pr;
+    if (ktglmemo_shader_on()) {
+        vk_prog *cached = (vk_prog *)vk_progc_peek(&g_ktgl_progc, p->serial);
+        if (cached) return cached;
+    } else {
+        unsigned h = (unsigned)(p->serial % PROGC_N);
+        if (g_progc[h].serial == p->serial) return g_progc[h].pr;
+    }
     pthread_mutex_lock(&g_progs_mu); vk_prog *pr = nvn_hm_get(&g_progs, &p->serial); pthread_mutex_unlock(&g_progs_mu);
     return pr;
 }

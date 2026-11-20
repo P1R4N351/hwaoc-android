@@ -23,6 +23,8 @@
 #include "dm_wait_stats.h"
 #include "nvn_scan_budget.h"
 #include "../../runtime/frame_timeline.h"
+#include "vk_ktgl_memo.h"
+static int ktglmemo_draw_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "../../runtime/present_clock.h"
 #include "../../runtime/present_predict.h"
 #include "../../runtime/fps_auto_runtime.h"
@@ -4375,7 +4377,7 @@ void vk_pipeline_prewarm(void) {
 }
 static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLayout layout) {
     static pipe_ent *last;   /* entries never move or die; only the recording thread reads this memo */
-    static pipe_ent *memo[64];   /* bounded exact-key front cache for alternating shaders/topologies */
+    static pipe_ent *memo[256];   /* bounded exact-key front cache for alternating separable shaders/topologies */
     pipe_ent *e = last; pipe_key k;
     g_draw_fast = 0;
     int screen_aspect = pipe_screen_class() != 0;
@@ -4383,7 +4385,8 @@ static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLay
     if (g_pipe_dirty || !e || e->layout != layout || e->k.vs != vs || e->k.fs != fs || e->k.topo_class != topo_class(prim)) {
         pipe_key_fill(&k, &S, vs, fs, prim); g_pipe_dirty = 0;
         if (!e || e->layout != layout || memcmp(&e->k, &k, sizeof k)) {
-            unsigned h = (unsigned)(((uintptr_t)vs >> 4) ^ ((uintptr_t)fs >> 8) ^ k.topo_class) & 63u;
+            unsigned mask = ktglmemo_draw_on() ? 255u : 63u;
+            unsigned h = (unsigned)(((uintptr_t)vs >> 4) ^ ((uintptr_t)fs >> 8) ^ k.topo_class) & mask;
             pipe_ent *candidate = memo[h];
             e = candidate && candidate->layout == layout && !memcmp(&candidate->k, &k, sizeof k) ?
                 candidate : nvn_hm_get(&g_pipes, &k);
@@ -5204,6 +5207,14 @@ static VkPipeline quad_indirect_pipeline(void) {
 static vk_qi_cache g_qi_cache;
 static uint64_t g_qi_batches, g_qi_batched_items, g_qi_cache_hits;
 static int quadbatch_on(void) { static int on = -1; if (on < 0) on = !vk_off("quadbatch"); return on; }
+static void qi_phase_barrier(VkCommandBuffer cb, int phase) {
+    if (!ktglmemo_draw_on()) { vk_barrier_all(cb); return; }
+    vk_qi_bar2_spec sp = vk_qi_barrier_spec(phase, 0);
+    VkMemoryBarrier2 mb = {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, .srcStageMask = sp.src_stage, .srcAccessMask = sp.src_access,
+                           .dstStageMask = sp.dst_stage, .dstAccessMask = sp.dst_access};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+}
 static int quad_indirect_convert_batch(const uint64_t *inds, int n) {
     assert(inds != NULL && n > 0 && n <= VK_QI_BATCH_MAX);
     VkPipeline pipe = quad_indirect_pipeline();
@@ -5235,7 +5246,7 @@ static int quad_indirect_convert_batch(const uint64_t *inds, int n) {
         ws[k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[k], .dstBinding = 0,
                                        .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bis[k]};
     }
-    vk_barrier_all(cb);
+    qi_phase_barrier(cb, 1);
     vkUpdateDescriptorSets(V.dev, (uint32_t)nv, ws, 0, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     uint32_t max_quads = MAX_INDIRECT_QUADS;
@@ -5248,7 +5259,7 @@ static int quad_indirect_convert_batch(const uint64_t *inds, int n) {
         vkCmdDispatch(cb, 1, 1, 1);
         vk_qi_cache_put(&g_qi_cache, valid[k], (uint64_t)(uintptr_t)sb, (uint64_t)(d + 32));
     }
-    vk_barrier_all(cb);
+    qi_phase_barrier(cb, 2);
     g_bound_pipe = VK_NULL_HANDLE;
     memset(g_bound_set[1], 0, sizeof g_bound_set[1]);
     g_qi_batches++; g_qi_batched_items += (uint64_t)nv;
@@ -5276,7 +5287,7 @@ static int quad_indirect_convert(VkBuffer ind_buf, VkDeviceSize ind_off, VkBuffe
     vk_barrier_all(cb);
     VkBufferCopy cp = {ind_off, so, 16};
     vkCmdCopyBuffer(cb, ind_buf, sb, 1, &cp);
-    vk_barrier_all(cb);
+    qi_phase_barrier(cb, 1);
     VkDescriptorSet set = vk_alloc_set(g_qi_dsl);
     VkDescriptorBufferInfo bi = {sb, so, 48};
     VkWriteDescriptorSet w = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = 0,
@@ -5287,7 +5298,7 @@ static int quad_indirect_convert(VkBuffer ind_buf, VkDeviceSize ind_off, VkBuffe
     uint32_t max_quads = MAX_INDIRECT_QUADS;
     vkCmdPushConstants(cb, g_qi_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof max_quads, &max_quads);
     vkCmdDispatch(cb, 1, 1, 1);
-    vk_barrier_all(cb);
+    qi_phase_barrier(cb, 2);
     g_bound_pipe = VK_NULL_HANDLE;
     memset(g_bound_set[1], 0, sizeof g_bound_set[1]);
     *out_buf = sb; *out_off = so + 32;
@@ -6015,12 +6026,20 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     if (S.has_sc) { int32_t x1 = MINV((int32_t)R.w, S.sc.x + S.sc.w), y1 = MINV((int32_t)R.h, S.sc.y + S.sc.h); if (x1 <= MAXV(0, S.sc.x) || y1 <= MAXV(0, S.sc.y)) { g_stat_skips[6]++; pd_draw_note("      draw skipped: empty scissor"); return; } }
     VkPipelineLayout layout; VkPipeline p;
     static struct { vk_shader *vs, *fs; VkPipelineLayout layout; } last_layout;
+    static vk_lay_memo g_ktgl_lay;
     VK_REC_DO(VK_REC_PIPE,
         if (g_load_pipeline) {
             layout = g_load_layout; p = g_load_pipeline;
         } else {
             if (!last_layout.layout || last_layout.vs != sh[0] || last_layout.fs != sh[1]) {
-                last_layout.layout = vk_layout_of(sh[0], sh[1]); last_layout.vs = sh[0]; last_layout.fs = sh[1];
+                uint64_t cached_lay = ktglmemo_draw_on() ? vk_lay_memo_get(&g_ktgl_lay, sh[0], sh[1]) : 0;
+                if (cached_lay) {
+                    last_layout.layout = (VkPipelineLayout)(uintptr_t)cached_lay;
+                } else {
+                    last_layout.layout = vk_layout_of(sh[0], sh[1]);
+                    if (ktglmemo_draw_on()) vk_lay_memo_put(&g_ktgl_lay, sh[0], sh[1], (uint64_t)(uintptr_t)last_layout.layout);
+                }
+                last_layout.vs = sh[0]; last_layout.fs = sh[1];
             }
             layout = last_layout.layout;
             p = pipe_get(sh[0], sh[1], prim, layout);

@@ -1,0 +1,92 @@
+#ifndef TOTK_VK_KTGL_MEMO_H
+#define TOTK_VK_KTGL_MEMO_H
+/* KTGL separable shader program (512x4 = 2,048) & pipeline layout (256x4 = 1,024) front-memos
+   + narrow VkMemoryBarrier2 specs for indirect QUADS. Recording-thread owned. */
+#include <stdint.h>
+
+enum {
+    VK_KTGL_PROGC_SETS = 512,
+    VK_KTGL_PROGC_WAYS = 4,
+    VK_KTGL_LAY_SETS = 512,
+    VK_KTGL_LAY_WAYS = 4
+};
+
+typedef struct { uint64_t serial; void *pr; } vk_progc_slot;
+typedef struct { vk_progc_slot ways[VK_KTGL_PROGC_WAYS]; uint8_t next; } vk_progc_set_t;
+typedef struct { vk_progc_set_t sets[VK_KTGL_PROGC_SETS]; } vk_progc_memo;
+
+typedef struct { const void *vs; const void *fs; uint64_t layout; } vk_lay_slot;
+typedef struct { vk_lay_slot ways[VK_KTGL_LAY_WAYS]; uint8_t next; } vk_lay_set_t;
+typedef struct { vk_lay_set_t sets[VK_KTGL_LAY_SETS]; } vk_lay_memo;
+
+typedef struct { uint64_t src_stage, src_access, dst_stage, dst_access; } vk_qi_bar2_spec;
+
+static inline uint32_t vk_progc_set_idx(uint64_t serial) {
+    return (uint32_t)(((serial * 11400714819323198485ull) >> 55) & (VK_KTGL_PROGC_SETS - 1));
+}
+
+static inline uint32_t vk_lay_set_idx(const void *vs, const void *fs) {
+    uint64_t h = (uint64_t)(uintptr_t)vs * 11400714819323198485ull + (uint64_t)(uintptr_t)fs;
+    h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ull;
+    h = (h ^ (h >> 27)) * 0x94d049bb133111ebull;
+    return (uint32_t)((h ^ (h >> 31)) >> 55) & (VK_KTGL_LAY_SETS - 1);
+}
+
+static inline void *vk_progc_peek(const vk_progc_memo *m, uint64_t serial) {
+    if (!m || !serial) return 0;
+    const vk_progc_slot *ways = m->sets[vk_progc_set_idx(serial)].ways;
+    for (int w = 0; w < VK_KTGL_PROGC_WAYS; w++) if (ways[w].serial == serial) return ways[w].pr;
+    return 0;
+}
+
+static inline void *vk_progc_get(const vk_progc_memo *m, uint64_t serial) {
+    return vk_progc_peek(m, serial);
+}
+
+static inline void vk_progc_put(vk_progc_memo *m, uint64_t serial, void *pr) {
+    if (!m || !serial || !pr) return;
+    vk_progc_set_t *s = &m->sets[vk_progc_set_idx(serial)];
+    int slot = -1;
+    for (int w = 0; w < VK_KTGL_PROGC_WAYS; w++) {
+        if (!s->ways[w].serial || s->ways[w].serial == serial) { slot = w; break; }
+    }
+    if (slot < 0) { slot = s->next & (VK_KTGL_PROGC_WAYS - 1); s->next = (uint8_t)(s->next + 1); }
+    s->ways[slot].serial = serial;
+    s->ways[slot].pr = pr;
+}
+
+static inline uint64_t vk_lay_memo_get(const vk_lay_memo *m, const void *vs, const void *fs) {
+    if (!m || !vs) return 0;
+    const vk_lay_slot *ways = m->sets[vk_lay_set_idx(vs, fs)].ways;
+    for (int w = 0; w < VK_KTGL_LAY_WAYS; w++) {
+        if (ways[w].layout && ways[w].vs == vs && ways[w].fs == fs) return ways[w].layout;
+    }
+    return 0;
+}
+
+static inline void vk_lay_memo_put(vk_lay_memo *m, const void *vs, const void *fs, uint64_t layout) {
+    if (!m || !vs || !layout) return;
+    vk_lay_set_t *s = &m->sets[vk_lay_set_idx(vs, fs)];
+    int slot = -1;
+    for (int w = 0; w < VK_KTGL_LAY_WAYS; w++) {
+        if (!s->ways[w].layout || (s->ways[w].vs == vs && s->ways[w].fs == fs)) { slot = w; break; }
+    }
+    if (slot < 0) { slot = s->next & (VK_KTGL_LAY_WAYS - 1); s->next = (uint8_t)(s->next + 1); }
+    s->ways[slot].vs = vs;
+    s->ways[slot].fs = fs;
+    s->ways[slot].layout = layout;
+}
+
+static inline vk_qi_bar2_spec vk_qi_barrier_spec(int phase, int fault_all) {
+    enum {
+        QI_STAGE_DRAW_INDIRECT = 0x00000002u, QI_STAGE_COMPUTE = 0x00000800u,
+        QI_STAGE_TRANSFER = 0x00001000u, QI_STAGE_ALL = 0x00010000u,
+        QI_ACC_INDIRECT = 0x00000001u, QI_ACC_SHADER_R = 0x00000020u,
+        QI_ACC_SHADER_W = 0x00000040u, QI_ACC_XFER_W = 0x00001000u
+    };
+    if (fault_all) return (vk_qi_bar2_spec){QI_STAGE_ALL, QI_ACC_XFER_W, QI_STAGE_ALL, QI_ACC_SHADER_R};
+    if (phase == 1) return (vk_qi_bar2_spec){QI_STAGE_TRANSFER, QI_ACC_XFER_W, QI_STAGE_COMPUTE, QI_ACC_SHADER_R | QI_ACC_SHADER_W};
+    return (vk_qi_bar2_spec){QI_STAGE_COMPUTE, QI_ACC_SHADER_W, QI_STAGE_DRAW_INDIRECT, QI_ACC_INDIRECT};
+}
+
+#endif

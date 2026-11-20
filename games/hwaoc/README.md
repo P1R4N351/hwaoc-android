@@ -120,7 +120,7 @@ Inspected directly from `/sdcard/Games/Switch 2/Hyrule_Warriors_Age_of_Imprisonm
 | Graphics / Shaders | **NVN2** (`729` `nvn*` strings, `nvnNativeImage*`, `CopyEngineNVX`), **161** Ampere (`0x98761234`) + **322** GLSLC (`0x00220015`) hits | Same NVN2 + Ampere counts |
 | RomFS | `b6e28c40/`: `1,842` `.fdata` (`PDRK0000`/`IDRK0000`, `10.39 GB`); `ebc8c781/`: `106` `.bin` (EBML `.webm`, `23.85 GB`) | `b6e28c40/`: `1,930` `.fdata` (`10.59 GB`); `ebc8c781/`: `106` `.bin` (`23.85 GB`) |
 
-**Cross-venture status:** Switch 2 bring-up now ships separately in **[AoI Native](https://github.com/P1R4N351/hwaoi-android)** (`v0.1.0-beta.1`, playable first-field on AYN Thor). Shared KTGL engine architecture (`KIDSTask`, `KTSL2`, `.rdb`/`.fdata`, VP9 NEON `vst2q_u8`, indirect `QUADS` compute conversion, shared-page texture sub-allocation) and cross-pollinated Vulkan optimizations (`edgeguard`, `quadbatch`, `DM_VK_EDGE_UNPIN`) are tracked in [docs/ktgl-commonalities.md](../../docs/ktgl-commonalities.md).
+**Cross-venture status:** Switch 2 bring-up now ships separately in **[AoI Native](https://github.com/P1R4N351/hwaoi-android)** (`v0.1.0-beta.1`, playable first-field on AYN Thor). Shared KTGL engine architecture (`KIDSTask`, `KTSL2`, `.rdb`/`.fdata`, VP9 NEON `vst2q_u8`, indirect `QUADS` compute conversion, shared-page texture sub-allocation) and cross-pollinated Vulkan & VP9 optimizations (`edgeguard`, `quadbatch`, `ktglmemo`, `TOTK_MOVIE_MT`, `DM_VK_EDGE_UNPIN`, `DM_VK_KTGL_CACHE`) are tracked in [docs/ktgl-commonalities.md](../../docs/ktgl-commonalities.md).
 
 
 ## Support

@@ -3,6 +3,7 @@
  *   2) vk_quad_batch.h look-ahead op-stream scanner, mid-pass hazard invalidation, and cache hits */
 #include "vk_edge_guard.h"
 #include "vk_quad_batch.h"
+#include "test_vk_ktgl_opt_w2.h"
 #include "nvn_dirty.h"
 #include <assert.h>
 #include <stdint.h>
@@ -253,6 +254,7 @@ int main(void) {
     bench_shared_page(pg, 1);
     test_straddling_mirrored(pg);
     test_quad_batch_scanner();
+    if (run_ktgl_w2_tests(g_fault_mode) != 0) g_fail++;
     printf("ktglopttest: fault_mode=%d failures=%d\n", g_fault_mode, g_fail);
     return g_fail != 0;
 }

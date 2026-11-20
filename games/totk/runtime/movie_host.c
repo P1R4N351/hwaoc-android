@@ -45,6 +45,23 @@ int movie_host_active(void) { return 0; }
 #else
 #include <vpx/vp8dx.h>
 #include <vpx/vpx_decoder.h>
+#include "movie_nv12.h"
+
+static int fast_nv12_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_MOVIE_FAST_NV12"); v = !(e && *e == '0'); }
+    return v;
+}
+static int movie_mt_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("TOTK_MOVIE_MT"); v = !(e && *e == '0'); }
+    return v;
+}
+static void configure_vp9_mt(vpx_codec_ctx_t *vpx) {
+    if (!movie_mt_on()) return;
+    (void)vpx_codec_control(vpx, VP9D_SET_ROW_MT, 1);
+    (void)vpx_codec_control(vpx, VP9D_SET_LOOP_FILTER_OPT, 1);
+}
 
 enum { IN_BUFS = 4, IN_CAP = 2 << 20, OUT_BUFS = 8, MAX_MOVIES = 16 };
 enum { TYPE_VP9 = 3, MODE_BUFFER = 1, FORMAT_NV12 = 4, FLAG_EOS = 4 };
@@ -156,16 +173,10 @@ static int frame_bytes(const Movie *m) { return m->w * m->h + (m->w / 2) * (m->h
 
 /* I420 (libvpx) -> packed NV12: Y rows, then rows of interleaved U, V. */
 static void to_nv12(const vpx_image_t *img, uint8_t *dst, int w, int h) {
-    for (int y = 0; y < h; y++) memcpy(dst + (size_t)y * w, img->planes[VPX_PLANE_Y] + (size_t)y * img->stride[VPX_PLANE_Y], (size_t)w);
-    uint8_t *uv = dst + (size_t)w * h;
-    for (int y = 0; y < h / 2; y++) {
-        const uint8_t *u = img->planes[VPX_PLANE_U] + (size_t)y * img->stride[VPX_PLANE_U];
-        const uint8_t *v = img->planes[VPX_PLANE_V] + (size_t)y * img->stride[VPX_PLANE_V];
-        uint8_t *o = uv + (size_t)y * w; int x = 0;
-        if (negative() == 1) { const uint8_t *t = u; u = v; v = t; }
-        for (; x + 16 <= w / 2; x += 16) { uint8x16x2_t p = {{vld1q_u8(u + x), vld1q_u8(v + x)}}; vst2q_u8(o + 2 * x, p); }
-        for (; x < w / 2; x++) { o[2 * x] = u[x]; o[2 * x + 1] = v[x]; }
-    }
+    totk_movie_to_nv12(img->planes[VPX_PLANE_Y], img->stride[VPX_PLANE_Y],
+                       img->planes[VPX_PLANE_U], img->stride[VPX_PLANE_U],
+                       img->planes[VPX_PLANE_V], img->stride[VPX_PLANE_V],
+                       dst, w, h, negative() == 1, fast_nv12_on());
 }
 static int free_out(const Movie *m) { for (int i = 0; i < OUT_BUFS; i++) if (!m->out_held[i]) return i; return -1; }
 static void push_ready(Movie *m, Signals *s, int slot, unsigned flags, int64_t time, int bytes) {
@@ -320,6 +331,7 @@ static int h_configure(void *obj, void *format) {
     release_codec(m); m->w = w; m->h = h;
     vpx_codec_dec_cfg_t cfg = {.threads = 4, .w = (unsigned)w, .h = (unsigned)h};
     if (vpx_codec_dec_init(&m->vpx, vpx_codec_vp9_dx(), &cfg, 0) != VPX_CODEC_OK) runtime_fail("libvpx VP9 decoder initialisation");
+    configure_vp9_mt(&m->vpx);
     m->vpx_live = 1;
     for (int i = 0; i < IN_BUFS; i++) if (!(m->in[i] = malloc(IN_CAP))) runtime_fail("movie input buffers");
     for (int i = 0; i < OUT_BUFS; i++) if (!(m->out[i] = malloc((size_t)frame_bytes(m)))) runtime_fail("movie output buffers");
@@ -379,6 +391,7 @@ static int h_flush(void *obj) {
         vpx_codec_destroy(&m->vpx); m->vpx_live = 0;
         vpx_codec_dec_cfg_t cfg = {.threads = 4, .w = (unsigned)m->w, .h = (unsigned)m->h};
         if (vpx_codec_dec_init(&m->vpx, vpx_codec_vp9_dx(), &cfg, 0) != VPX_CODEC_OK) runtime_fail("libvpx VP9 decoder re-initialisation");
+        configure_vp9_mt(&m->vpx);
         m->vpx_live = 1; reset_queues(m);
     }
     pthread_mutex_unlock(&m->mu);

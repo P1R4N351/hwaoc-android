@@ -196,7 +196,7 @@ class CompanionStateTests(unittest.TestCase):
         # Tears of the Kingdom: the host's fresh sample first, its own reader until there is one, without the host, or
         # once the host's sample is older than the app takes (the host stopped). Run: test_companion_gate (jni_probe.c).
         jni = (TOTK / 'runtime/companion_jni.c').read_text()
-        self.assertIn('int hosted = runtime_duo_state(&s, &age);\n#ifdef GAME_BOTW\n    if (!hosted) return JNI_FALSE;', jni)
+        self.assertIn('int hosted = runtime_duo_state(&s, &age);\n#if defined(GAME_BOTW) || defined(GAME_HWAOC)\n    if (!hosted) return JNI_FALSE;', jni)
         self.assertIn('if (!hosted || age > DUO_STATE_MAX_AGE_MS) {', jni)
         java_age = re.search(r'MAX_AGE_MS = (\d+);', JAVA.read_text()).group(1)
         self.assertEqual(re.search(r'#define DUO_STATE_MAX_AGE_MS (\d+)', link).group(1), java_age)
