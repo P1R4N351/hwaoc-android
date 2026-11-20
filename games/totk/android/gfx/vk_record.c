@@ -4,6 +4,7 @@
 #include "nvn_hmap.h"
 #include "vk_shader_fast.h"
 #include "vk_dsc_fast.h"
+#include "vk_stage_fast.h"
 #include "../../runtime/frame_timeline.h"
 #include <errno.h>
 #include <sys/mman.h>
@@ -97,6 +98,7 @@ typedef struct rec_context {
     VkDescriptorBufferInfo zero;
     vk_record_descriptor *info; uint32_t capinfo;
     const vk_record_spans *spans; int hints[64];
+    totk_rec_slice_memo4 slice_memo; uint64_t slice_seq;
 } rec_context;
 static rec_context *contexts[REC_WORKERS + 1][REC_RING]; /* context zero belongs to the walking thread */
 typedef struct {
@@ -1051,6 +1053,17 @@ static inline __attribute__((always_inline)) void record_dynamic_emit_inner(VkCo
 void vk_record_dynamic_emit(VkCommandBuffer cb, const vk_record_dynamic *state, vk_record_dynamic *previous, int all) {
     record_dynamic_emit_inner(cb, state, previous, all, 1);
 }
+static inline VkDescriptorSet rec_descriptor_set_fast(rec_context *c, rec_job *j, uint64_t sseq,
+        VkDescriptorSetLayout layout, VkDescriptorUpdateTemplate update, uint32_t first, uint32_t count, uint64_t ticket) {
+    if (ds_off || !totk_vk_stage_fast_on() || !sseq)
+        return descriptor_set(c, j, layout, update, j->info + first, count, ticket);
+    uint64_t su = 0, lu = (uint64_t)(uintptr_t)layout, spu = (uint64_t)(uintptr_t)c->spans;
+    if (totk_rec_slice4_find(&c->slice_memo, sseq, first, count, lu, spu, ticket, &su))
+        return (VkDescriptorSet)(uintptr_t)su;
+    VkDescriptorSet set = descriptor_set(c, j, layout, update, j->info + first, count, ticket);
+    totk_rec_slice4_put(&c->slice_memo, sseq, first, count, lu, spu, ticket, (uint64_t)(uintptr_t)set);
+    return set;
+}
 static void record_job(rec_job *j, unsigned worker) {
     if (j->registering) {
         j->reset_time = 0;
@@ -1093,6 +1106,7 @@ static void record_job(rec_job *j, unsigned worker) {
     uint64_t addresses[17], raw_sizes[17]; const vk_record_spans *vertex_spans[17];
     uint32_t vertex_valid = 0, raw_valid = 0; VkIndexType index_type = VK_INDEX_TYPE_UINT32;
     uint32_t event = 0; uint64_t draws = 0;
+    uint64_t sseq = ++c->slice_seq; if (!sseq) { memset(&c->slice_memo, 0, sizeof c->slice_memo); sseq = c->slice_seq = 1; }
     for (uint32_t i = 0; i <= j->count; i++) {
         while (event < j->nevent && j->event[event].before == i) {
             const rec_event *e = &j->event[event++];
@@ -1107,7 +1121,7 @@ static void record_job(rec_job *j, unsigned worker) {
         record_dynamic_emit_inner(j->cb, &d->dynamic, &dynamic, i == 0 || dyn_off, 0);
         /* Chunk-local binding memos are valid only while the exact pipeline layout stays unchanged. */
         for (uint32_t s = 0; s < 2; s++) if (d->sets[s].count) {
-            VkDescriptorSet set = descriptor_set(c, j, d->sets[s].layout, d->sets[s].update, j->info + d->sets[s].first, d->sets[s].count, d->lag_ticket);
+            VkDescriptorSet set = rec_descriptor_set_fast(c, j, sseq, d->sets[s].layout, d->sets[s].update, d->sets[s].first, d->sets[s].count, d->lag_ticket);
             if (ds_off || bound_set[s] != set) {
                 (vkCmdBindDescriptorSets)(j->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->layout, s, 1, &set, 0, NULL); bound_set[s] = set;
             }

@@ -26,6 +26,7 @@
 #include "vk_ktgl_memo.h"
 #include "vk_dsc_fast.h"
 #include "vk_vb_fast.h"
+#include "vk_stage_fast.h"
 static int ktglmemo_draw_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "../../runtime/present_clock.h"
 #include "../../runtime/present_predict.h"
@@ -4895,6 +4896,52 @@ struct freeze_key {
 };
 static struct { struct freeze_key key; __typeof__(g_record_draw->sets[0]) set; record_binding *bindings; int cap, valid; } g_freeze_memo[128];
 #include "vk_xlate_draw_stats.h"
+static totk_stage_freeze4 g_stage_freeze4;
+static totk_stage_freeze_slot *g_stage_freeze_slots;
+typedef struct { vk_shader *sh; int stage; } stage_uni_ctx;
+static int stage_uni_unchanged_cb(void *ctx, uint64_t cached_uni) {
+    const stage_uni_ctx *u = (const stage_uni_ctx *)ctx;
+    int same = record_uniforms_unchanged(u->sh, u->stage, cached_uni);
+    if (same) vk_record_memo_saved(VK_REC_M_UNIFORM);
+    return same;
+}
+static inline void stage_env_pack(totk_stage_env *out, const struct freeze_key *k, vk_shader *sh, int stage) {
+    *out = (totk_stage_env){
+        k->chunk, k->submission, k->uniforms, k->resources, k->samplers, k->cpu_dirty, k->dirty_epoch,
+        (uint64_t)(uintptr_t)k->spans, (uint64_t)(uintptr_t)sh, (uint64_t)(uintptr_t)k->native_sample,
+        k->feedback_pass, (uint64_t)(uintptr_t)k->native_image, k->width, k->height, (uint32_t)stage, (uint32_t)sh->nb
+    };
+}
+static int record_stage_fast_hit(vk_shader *sh, int stage, uint32_t set, const struct freeze_key *k,
+                                 __typeof__(g_freeze_memo[0]) *last) {
+    if (!g_stage_freeze_slots) g_stage_freeze_slots = calloc(TOTK_STAGE_FREEZE_SLOTS, sizeof *g_stage_freeze_slots);
+    if (!g_stage_freeze_slots) return 0;
+    record_binding cur[TOTK_STAGE_MAX_NB];
+    for (int i = 0; i < sh->nb; i++) record_binding_of(&sh->b[i], stage, &cur[i]);
+    uint64_t sig = totk_stage_bind_hash((uint64_t)(uintptr_t)sh, (uint32_t)stage, cur, (uint32_t)sh->nb);
+    totk_stage_env env; stage_env_pack(&env, k, sh, stage);
+    stage_uni_ctx uctx = {sh, stage};
+    totk_stage_set_ref ref = {0};
+    if (!totk_stage_freeze4_find(&g_stage_freeze4, g_stage_freeze_slots, &env, sig, cur, stage_uni_unchanged_cb, &uctx, &ref)) return 0;
+    g_record_draw->sets[set].layout = (VkDescriptorSetLayout)(uintptr_t)ref.layout_u;
+    g_record_draw->sets[set].update = (VkDescriptorUpdateTemplate)(uintptr_t)ref.update_u;
+    g_record_draw->sets[set].first = ref.first; g_record_draw->sets[set].count = ref.count;
+    if (last->cap < sh->nb) { last->cap = sh->nb; last->bindings = realloc(last->bindings, (size_t)last->cap * sizeof *last->bindings); }
+    memcpy(last->bindings, cur, (size_t)sh->nb * sizeof *cur);
+    last->key = *k; last->set = g_record_draw->sets[set]; last->valid = 1;
+    vk_record_memo_saved(VK_REC_M_BINDING);
+    g_record_freeze_hits++;
+    return 1;
+}
+static void record_stage_fast_put(vk_shader *sh, int stage, const struct freeze_key *k,
+                                  const record_binding *bindings, const __typeof__(g_record_draw->sets[0]) *set_ref) {
+    if (!g_stage_freeze_slots) g_stage_freeze_slots = calloc(TOTK_STAGE_FREEZE_SLOTS, sizeof *g_stage_freeze_slots);
+    if (!g_stage_freeze_slots) return;
+    uint64_t sig = totk_stage_bind_hash((uint64_t)(uintptr_t)sh, (uint32_t)stage, bindings, (uint32_t)sh->nb);
+    totk_stage_env env; stage_env_pack(&env, k, sh, stage);
+    totk_stage_set_ref ref = {(uint64_t)(uintptr_t)set_ref->layout, (uint64_t)(uintptr_t)set_ref->update, set_ref->first, set_ref->count};
+    totk_stage_freeze4_put(&g_stage_freeze4, g_stage_freeze_slots, &env, sig, bindings, &ref);
+}
 /* Constant-specialized entry points keep all diagnostic work out of the normal binding walk. */
 static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh, int stage, uint32_t set, int stats) {
     static int c1off = -1; if (c1off < 0) c1off = vk_off("block");
@@ -4927,6 +4974,8 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
             return 1;
         }
     }
+    if (!stats && !c1off && totk_vk_stage_fast_on() && sh->nb > 0 && sh->nb <= TOTK_STAGE_MAX_NB &&
+        record_stage_fast_hit(sh, stage, set, &key, last)) return 1;
     if (c1off) causes |= 1u << VK_REC_M_DISABLED;
     else if (!last->valid) causes |= 1u << VK_REC_M_COLD;
     else {
@@ -5021,12 +5070,18 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
         if (last->cap < sh->nb) { last->cap = sh->nb; last->bindings = realloc(last->bindings, (size_t)last->cap * sizeof *last->bindings); }
         for (int i = 0; i < sh->nb; i++) record_binding_of(&sh->b[i], stage, &last->bindings[i]);
         last->key = key; last->set = g_record_draw->sets[set]; last->valid = 1;
+        if (!stats && totk_vk_stage_fast_on() && sh->nb > 0 && sh->nb <= TOTK_STAGE_MAX_NB) record_stage_fast_put(sh, stage, &key, last->bindings, &last->set);
     } else if (!cacheable) vk_record_memo_miss(0, 1u << VK_REC_M_DISABLED);
     return R.open;
 }
 static VkDescriptorSet dsc_resolve(vk_shader *sh, dinfo *info, size_t total, uint64_t sub, int dsoff) {
     uint64_t h[2] = {0xcbf29ce484222325ull, 0x6a09e667f3bcc909ull};
-    hash_words(&sh->dsl, sizeof sh->dsl, h); hash_words(info, total * sizeof *info, h);
+    if (totk_vk_dsc_fast_on()) {
+        totk_hash_dual64(info, total * sizeof *info, h);
+        uint64_t lk = (uint64_t)(uintptr_t)sh->dsl;
+        h[0] ^= lk * 0x9e3779b97f4a7c15ull;
+        h[1] ^= (lk * 0xc2b2ae3d27d4eb4full) >> 31;
+    } else { hash_words(&sh->dsl, sizeof sh->dsl, h); hash_words(info, total * sizeof *info, h); }
     unsigned slot = (unsigned)(h[0] % DS_CACHE);
     if (!dsoff && g_dsc[slot].sub == sub && g_dsc[slot].hash[0] == h[0] && g_dsc[slot].hash[1] == h[1] && g_dsc[slot].dsl == sh->dsl && g_dsc[slot].n == total) {
         g_stat_sets_reused++; return g_dsc[slot].set;
