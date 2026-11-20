@@ -60,7 +60,19 @@ typedef struct {
 } lag_unit_t;
 /* exact is a watch-bit byte: exact GPU write-back pages and baseline texture dirty watches.
    Extra lag/private-copy protections carry neither bit and can be drained without losing baseline authority. */
-typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic uint8_t *exact; lag_unit_t *lag; size_t cap; _Atomic int live; _Atomic uint64_t latest, identity; } range_t;   // latest: highest page generation; identity: globally unique slot incarnation birth
+typedef struct { uintptr_t base, end; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic uint64_t *cmax; _Atomic uint8_t *exact; lag_unit_t *lag; size_t cap; _Atomic int live; _Atomic uint64_t latest, identity; } range_t;   // latest: highest page generation; identity: globally unique slot incarnation birth
+static _Atomic int g_totk_dirty_fast_cached;
+static inline int totk_dirty_fast_on(void) {
+    int v = atomic_load_explicit(&g_totk_dirty_fast_cached, memory_order_relaxed);
+    if (!v) { const char *e = getenv("TOTK_DIRTY_FAST"); v = (e && !strcmp(e, "0")) ? -1 : 1; atomic_store_explicit(&g_totk_dirty_fast_cached, v, memory_order_relaxed); }
+    return v > 0;
+}
+static inline void totk_dirty_max_up(_Atomic uint64_t *dst, uint64_t g) {
+    uint64_t cur = atomic_load_explicit(dst, memory_order_relaxed);
+    for (unsigned spin = 0; spin < 1024u && cur < g; spin++) {
+        if (atomic_compare_exchange_strong_explicit(dst, &cur, g, memory_order_release, memory_order_acquire)) break;
+    }
+}
 static range_t g_r[MAX_RANGE];
 /* Write-back watches are storage ranges, not GPU readers: they never publish a lag ticket. A first CPU
    write disarms the WHOLE rendering, so exact-page exclusions cannot turn later CPU frames into fault storms.
@@ -890,7 +902,8 @@ static void vma_unprotect_unit(range_t *r, uintptr_t index) {
         if (run < p) {
             mp(unit_addr(r, run), unit_len(r, run, p - run), PROT_READ | PROT_WRITE, NVN_DIRTY_MP_DRAIN);
             if (!generation) generation = atomic_fetch_add(&g_now, 1) + 1;
-            for (uintptr_t k = run; k < p; k++) { atomic_store(&r->gen[k], generation); atomic_store(&r->state[k], PG_NONE); }
+            if (r->cmax) for (uintptr_t ch = run >> 6; ch <= (p - 1u) >> 6; ch++) totk_dirty_max_up(&r->cmax[ch], generation);
+            for (uintptr_t k = run; k < p; k++) { atomic_store_explicit(&r->gen[k], generation, memory_order_release); atomic_store(&r->state[k], PG_NONE); }
         }
         run = p + 1;
     }
@@ -939,9 +952,15 @@ static void unprotect_unit(range_t *r, uintptr_t p, int host) {
         if (!took && open) {
             mp(r->base + (run << g_shift), (i - run) << g_shift, PROT_READ | PROT_WRITE,
                host ? NVN_DIRTY_MP_PREPARE : NVN_DIRTY_MP_FAULT);
-            uint64_t g = atomic_fetch_add(&g_now, 1) + 1, l = atomic_load(&r->latest);
-            for (uintptr_t k = run; k < i; k++) { atomic_store(&r->gen[k], g); atomic_store(&r->exact[k], 0); }
-            while (l < g && !atomic_compare_exchange_weak(&r->latest, &l, g)) {}
+            uint64_t g = atomic_fetch_add(&g_now, 1) + 1;
+            totk_dirty_max_up(&r->latest, g);
+#ifdef W6_TEST_HOOKS
+            { const char *fe = getenv("TOTK_KTGL_OPT_FAULT");
+              if (r->cmax && (!fe || atoi(fe) != 15)) for (uintptr_t ch = run >> 6; ch <= (i - 1u) >> 6; ch++) totk_dirty_max_up(&r->cmax[ch], g); }
+#else
+            if (r->cmax) for (uintptr_t ch = run >> 6; ch <= (i - 1u) >> 6; ch++) totk_dirty_max_up(&r->cmax[ch], g);
+#endif
+            for (uintptr_t k = run; k < i; k++) { atomic_store_explicit(&r->gen[k], g, memory_order_release); atomic_store(&r->exact[k], 0); }
             /* A checker can sample now between the generation allocation and page stores. Advance again
                before publishing writable state, so that sample cannot hide a later real CPU write. */
             atomic_fetch_add(&g_now, 1);
@@ -1217,27 +1236,27 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     { int lv = atomic_fetch_add(&g_live, 1) + 1, pk = atomic_load(&g_live_peak); while (lv > pk && !atomic_compare_exchange_weak(&g_live_peak, &pk, lv)) {} }
     range_t *r = &g_r[slot];
     uintptr_t base = (uintptr_t)mem & ~(g_pg - 1), end = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
-    size_t np = (end - base + g_pg - 1) >> g_shift;
+    size_t np = (end - base + g_pg - 1) >> g_shift, nc = (np + 63u) >> 6;
     _Atomic uint8_t *state = r->state;
-    _Atomic uint64_t *gen = r->gen;
+    _Atomic uint64_t *gen = r->gen, *cmax = r->cmax;
     _Atomic uint8_t *exact = r->exact;
     lag_unit_t *lag = r->lag;
     if (r->cap < np) {
-        state = calloc(np, 1); gen = calloc(np, sizeof *gen); exact = calloc(np, 1);
+        state = calloc(np, 1); gen = calloc(np, sizeof *gen); cmax = calloc(nc, sizeof *cmax); exact = calloc(np, 1);
         lag = g_lag_enabled ? calloc((np + g_unit - 1) / g_unit, sizeof *lag) : NULL;
-        if (!state || !gen || !exact || (g_lag_enabled && !lag)) die("脏页表分配失败（%zu 页）", np);
+        if (!state || !gen || !cmax || !exact || (g_lag_enabled && !lag)) die("脏页表分配失败（%zu 页）", np);
         /* Old arrays stay allocated for signal readers. Lag-off keeps only the original 10 bytes/page;
            lag-on adds one sticky/history record per protection unit, not another per-page array. */
         r->cap = np;
     } else {
-        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)exact, 0, np);
+        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)cmax, 0, nc * sizeof *cmax); memset((void *)exact, 0, np);
         if (g_lag_enabled && !lag) lag = calloc((r->cap + g_unit - 1) / g_unit, sizeof *lag);
         if (g_lag_enabled && !lag) die("脏页表分配失败（%zu 页）", np);
         if (lag) memset(lag, 0, ((np + g_unit - 1) / g_unit) * sizeof *lag);
     }
     /* base/end are read without the live acquire by rix_find's search, hence atomic stores (relaxed: live publishes). */
     __atomic_store_n(&r->base, base, __ATOMIC_RELAXED); __atomic_store_n(&r->end, end, __ATOMIC_RELAXED);
-    r->state = state; r->gen = gen; r->exact = exact; r->lag = lag; atomic_store(&r->latest, 0);
+    r->state = state; r->gen = gen; r->cmax = cmax; r->exact = exact; r->lag = lag; atomic_store(&r->latest, 0);
     uint64_t identity = atomic_load_explicit(&g_range_epoch, memory_order_relaxed) + 1;
     atomic_store_explicit(&r->identity, identity, memory_order_release);
     if (slot == n) atomic_store(&g_nr, n + 1);
@@ -1607,8 +1626,9 @@ static void protect_pages(const void *addr, size_t len, int exact) {
 void nvn_dirty_protect(const void *addr, size_t len) { protect_pages(addr, len, 0); }
 void nvn_dirty_protect_exact(const void *addr, size_t len) { protect_pages(addr, len, 1); }
 void *nvn_dirty_wb_watch(const void *addr, size_t len, uint64_t stamp) {
-    if (!len || !nvn_dirty_tracked(addr, len)) return NULL;
+    if (!len || len > UINTPTR_MAX - (uintptr_t)addr) return NULL;
     range_t *r = find((uintptr_t)addr);
+    if (!r || len > r->end - (uintptr_t)addr) return NULL;
     for (unsigned i = 0; i < WB_WATCH_MAX; i++) {
         wb_watch *w = &g_wb_watch[i]; unsigned state = WB_FREE;
         if (!atomic_compare_exchange_strong(&w->state, &state, WB_INIT)) continue;
@@ -1663,8 +1683,9 @@ void nvn_dirty_wb_stats(uint64_t *faults, uint64_t *preps) {
 }
 /* Use the same whole-unit bounds as normal dirty protection, clipped at the pool's final system page. */
 int nvn_dirty_unit_info(const void *addr, size_t len, uintptr_t *unit_lo, size_t *unit_bytes) {
-    if (!len || !unit_lo || !unit_bytes || !nvn_dirty_tracked(addr, len)) return 0;
+    if (!len || !unit_lo || !unit_bytes || len > UINTPTR_MAX - (uintptr_t)addr) return 0;
     range_t *r = find((uintptr_t)addr);
+    if (!r || len > r->end - (uintptr_t)addr) return 0;
     uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift;
     uintptr_t u0 = (p / g_unit) * g_unit;
     *unit_lo = unit_addr(r, u0);
@@ -1672,8 +1693,9 @@ int nvn_dirty_unit_info(const void *addr, size_t len, uintptr_t *unit_lo, size_t
     return 1;
 }
 int nvn_dirty_lag_bounds(const void *addr, size_t len, uintptr_t *lo, uintptr_t *hi) {
-    if (!len || !nvn_dirty_tracked(addr, len)) return 0;
-    range_t *r = find((uintptr_t)addr); if (!r->lag) return 0;
+    if (!len || len > UINTPTR_MAX - (uintptr_t)addr) return 0;
+    range_t *r = find((uintptr_t)addr);
+    if (!r || len > r->end - (uintptr_t)addr || !r->lag) return 0;
     uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift, q = ((uintptr_t)addr + len - 1 - r->base) >> g_shift;
     p = p / g_unit * g_unit; q = (q / g_unit + 1) * g_unit;
     uintptr_t np = range_pages(r); if (q > np) q = np;
@@ -1801,8 +1823,20 @@ int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp) {
     if (!len) return 0;
     range_t *r = find((uintptr_t)addr);
     if (!r || len > r->end - (uintptr_t)addr) return 1; /* untracked remains conservatively dirty */
-    if (atomic_load(&r->latest) <= stamp) return 0;   // TOTK: nothing in the whole pool was written since the stamp (no per-page scan)
+    if (atomic_load_explicit(&r->latest, memory_order_acquire) <= stamp) return 0;   // TOTK: nothing in the whole pool was written since the stamp (no per-page scan)
     uintptr_t a = (uintptr_t)addr, p = (a - r->base) >> g_shift, q = (a + len - 1 - r->base) >> g_shift;
+    if (totk_dirty_fast_on() && r->cmax) {
+        for (uintptr_t i = p; i <= q;) {
+            uintptr_t ch = i >> 6, ch_end = ((ch + 1u) << 6) - 1u;
+            if (ch_end > q) ch_end = q;
+            if (atomic_load_explicit(&r->cmax[ch], memory_order_acquire) > stamp) {
+                for (; i <= ch_end; i++) if (atomic_load_explicit(&r->gen[i], memory_order_acquire) > stamp) return 1;
+            } else {
+                i = ch_end + 1u;
+            }
+        }
+        return 0;
+    }
     for (uintptr_t i = p; i <= q; i++) if (atomic_load(&r->gen[i]) > stamp) return 1;   // 上传前最后一次写的代号 ≤ 戳；之后的写必 > 戳 | The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     return 0;
 }
@@ -1865,3 +1899,10 @@ void nvn_dirty_mp_report(uint64_t frame) {
         }
     }
 }
+
+#ifdef W6_TEST_HOOKS
+void nvn_dirty_w6_set_fast(int on);
+void nvn_dirty_w6_set_fast(int on) {
+    atomic_store_explicit(&g_totk_dirty_fast_cached, on ? 1 : -1, memory_order_relaxed);
+}
+#endif

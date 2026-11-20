@@ -9,6 +9,7 @@
 //   block = 1 GOB wide × 2^tileH GOBs high × 2^tileD GOBs deep, ordered y first then z within a block; blocks fill the level in x → y → z row-major order.
 // Level / layer start offsets and the actual block height and block depth of this level come from nvn_tex.c; here we only do intra-level addressing and copying.
 #include "nvn_deswizzle.h"
+#include "nvn_deswizzle_fast.h"
 #include <string.h>
 
 static uint32_t gob_off(uint32_t x, uint32_t y) {
@@ -79,6 +80,10 @@ static int move(const nvn_texdesc *d, unsigned level, unsigned layer, uint8_t *b
     if (first >= total) return 0;
     uint64_t end = count < total - first ? first + count : total;
     bl += base;
+    if (totk_deswz_fast_on()) {
+        totk_deswz_move_fast(bl, lin, pitch, row_bytes, rows, slices, th, td, to_linear, first, end);
+        return 0;
+    }
     for (uint64_t gob = first / 512; gob < end / 512; gob++) {
         uint64_t block = gob / (bh * bd), within = gob % (bh * bd);
         uint32_t x = (uint32_t)(block % gx * 64), y = (uint32_t)(block / gx % by * 8 * bh + within % bh * 8);
@@ -130,6 +135,10 @@ static int move_region(const nvn_texdesc *d, unsigned level, unsigned layer,
         z > slices || depth > slices - z || pitch < width ||
         (height && pitch > SIZE_MAX / height) || image_pitch < pitch * height) return -1;
     bl += base;
+    if (!stride && totk_deswz_fast_on()) {
+        totk_deswz_region_bl(bl, lin, pitch, image_pitch, row_bytes, rows, th, td, x, y, z, width, height, depth, to_linear);
+        return 0;
+    }
     uint64_t block_bytes = UINT64_C(512) << (th + td);
     for (uint32_t zz = 0; zz < depth; zz++) for (uint32_t yy = 0; yy < height; yy++) {
         uint8_t *row = lin + (size_t)zz * image_pitch + (size_t)yy * pitch;
@@ -161,3 +170,10 @@ int nvn_deswizzle_region(const nvn_texdesc *d, unsigned level, unsigned layer,
                          const void *src, void *dst, size_t pitch, size_t image_pitch) {
     return move_region(d, level, layer, x, y, z, width, height, depth, (uint8_t *)src, dst, pitch, image_pitch, 1);
 }
+
+#ifdef W6_TEST_HOOKS
+void nvn_deswizzle_w6_set_fast(int on);
+void nvn_deswizzle_w6_set_fast(int on) {
+    atomic_store_explicit(&g_totk_deswz_fast_cached, on ? 1 : -1, memory_order_relaxed);
+}
+#endif

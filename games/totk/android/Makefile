@@ -296,9 +296,9 @@ vktest: $(OUT)/vkseedpacktest $(OUT)/vkseediotest
 vktest: $(OUT)/vkcomputestoretest
 vktest: $(OUT)/ktglopttest
 ktglopttest: $(OUT)/ktglopttest
-$(OUT)/ktglopttest: $(TOTK)/android/gfx/test_vk_ktgl_opt.c $(TOTK)/android/gfx/host_test_support.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h $(TOTK)/android/gfx/vk_ktgl_memo.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w2.h $(TOTK)/runtime/movie_nv12.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w3.h $(TOTK)/runtime/romfs_handles.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w5.h
+$(OUT)/ktglopttest: $(TOTK)/android/gfx/test_vk_ktgl_opt.c $(TOTK)/android/gfx/host_test_support.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h $(TOTK)/android/gfx/vk_ktgl_memo.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w2.h $(TOTK)/runtime/movie_nv12.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w3.h $(TOTK)/runtime/romfs_handles.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w5.h $(TOTK)/android/gfx/test_vk_ktgl_opt_w6.h $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle_fast.h
 	@mkdir -p $(dir $@)
-	$(CC) -O2 -g $(WARN) -Wno-unused-parameter -D_GNU_SOURCE -I$(TOTK)/runtime -I$(TOTK)/third_party/d2r_gfx/gfx/nvn -I$(TOTK)/third_party/d2r_gfx/gfx/nvn/include $(COMPAT) -o $@ $(filter %.c,$^) $(if $(filter linux,$(TARGET)),-lpthread)
+	$(CC) -O2 -g $(WARN) -Wno-unused-parameter -D_GNU_SOURCE -DW6_TEST_HOOKS -I$(TOTK)/runtime -I$(TOTK)/third_party/d2r_gfx/gfx/nvn -I$(TOTK)/third_party/d2r_gfx/gfx/nvn/include -I$(TOTK)/third_party/d2r_gfx/gfx/tex $(COMPAT) -o $@ $(filter %.c,$^) $(if $(filter linux,$(TARGET)),-lpthread)
 vktest: $(OUT)/vksubgrouptest
 vksubgrouptest: $(OUT)/vksubgrouptest
 $(OUT)/vksubgrouptest: $(TOTK)/android/gfx/test_vk_subgroup.c $(TOTK)/android/gfx/vk_subgroup.h
@@ -338,7 +338,7 @@ $(OUT)/vkpcachetest: $(TOTK)/android/gfx/test_vkpcache.c $(VKTEST_SRC) $(TOTK)/a
 	@mkdir -p $(dir $@)
 	$(CC) $(VKTEST_FLAGS) -o $@ $(filter %.c,$^) $(VKTEST_LIBS)
 texelregiontest: $(OUT)/texelregiontest
-$(OUT)/texelregiontest: $(TOTK)/android/gfx/test_texel_region.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.h
+$(OUT)/texelregiontest: $(TOTK)/android/gfx/test_texel_region.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.h $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle_fast.h
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -g $(WARN) -o $@ $(filter %.c,$^)
 # Parallel upload deswizzle: byte identity against the serial decoder with 0/1/3 helpers (no Vulkan). Under
@@ -346,7 +346,7 @@ $(OUT)/texelregiontest: $(TOTK)/android/gfx/test_texel_region.c $(TOTK)/third_pa
 vktest: $(OUT)/uploadpooltest
 uploadpooltest: $(OUT)/uploadpooltest
 $(OUT)/uploadpooltest: $(TOTK)/android/gfx/test_upload_pool.c $(TOTK)/android/gfx/vk_upload_pool.c $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.c \
-  $(TOTK)/android/gfx/vk_upload_pool.h $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.h
+  $(TOTK)/android/gfx/vk_upload_pool.h $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_tex.h $(TOTK)/third_party/d2r_gfx/gfx/tex/nvn_deswizzle_fast.h
 	@mkdir -p $(dir $@)
 	$(CC) -O2 -g $(WARN) -D_GNU_SOURCE -o $@ $(filter %.c,$^) $(if $(filter linux,$(TARGET)),-lpthread)
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest): $(TOTK)/android/gfx/vk_seed_io.h $(TOTK)/android/gfx/vk_seed_pack.h
