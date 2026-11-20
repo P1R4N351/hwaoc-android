@@ -20,6 +20,7 @@
 #include "test_vk_ktgl_opt_w16.h"
 #include "test_vk_ktgl_opt_w17.h"
 #include "test_vk_ktgl_opt_w18.h"
+#include "test_vk_ktgl_opt_w19.h"
 #include "nvn_dirty.h"
 #include <assert.h>
 #include <stdint.h>
@@ -286,6 +287,7 @@ int main(void) {
     if (run_ktgl_w16_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w17_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w18_tests(g_fault_mode) != 0) g_fail++;
+    if (run_ktgl_w19_tests(g_fault_mode) != 0) g_fail++;
     printf("ktglopttest: fault_mode=%d failures=%d\n", g_fault_mode, g_fail);
     return g_fail != 0;
 }

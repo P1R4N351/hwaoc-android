@@ -25,6 +25,7 @@
 #include "nvn_tex.h"
 #include "nvn_hmap.h"
 #include "totk_nvn_sub_fast.h"
+#include "totk_nvn_hle_fast.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
 #include "nvn_diag_range.h"
@@ -1116,10 +1117,12 @@ static pthread_mutex_t g_copy_mu = PTHREAD_MUTEX_INITIALIZER;
    TOTK_NVN_CALL_NOCOPY marker still names it (dropped once that recording's EndRecording copied the body, or the
    recording was abandoned). The memory goes with the last reference; the handle itself dies at its release as before. */
 #ifdef GAME_BOTW
-typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; uint32_t def_lo, def_hi; _Atomic uint32_t used; _Atomic uint32_t refs; } copy_prefix;   // used: called or submitted at least once (NVN 53 lifetime, release_copies)
+typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; uint32_t def_lo, def_hi; uint32_t pin_lo, pin_hi; _Atomic uint32_t used; _Atomic uint32_t refs; } copy_prefix;   // used: called or submitted at least once (NVN 53 lifetime, release_copies)
 #else
-typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; uint32_t def_lo, def_hi; _Atomic uint32_t refs; uint32_t pad_; } copy_prefix;
+typedef struct { uint64_t magic; _Atomic uint64_t used_at; uint64_t made_at; uint32_t body_bytes, last_size; uint32_t def_lo, def_hi; uint32_t pin_lo, pin_hi; _Atomic uint32_t refs; uint32_t pad_; } copy_prefix;
 #endif
+_Static_assert((sizeof(copy_prefix) & 7u) == 0u, "copy_prefix keeps 8-byte alignment");
+static totk_ctl_copy_summary g_ctl_copy_sum = {.min_lo = UINTPTR_MAX};
 static _Atomic uint64_t g_copy_bytes;   /* live recording-copy bytes (logged with the copy count) */
 static copy_prefix *copy_of(NVNcommandHandle h) { copy_prefix *c = (copy_prefix *)(uintptr_t)h - 1; return c; }
 static void copy_unref(copy_prefix *pf) {   /* any thread, no lock: the last reference frees the memory */
@@ -1164,20 +1167,26 @@ static inline void flatten_note_def(totk_def_span *ds, size_t rec_off, const uin
         if (bh->src && bh->n > 0 && bh->n <= 32) totk_def_span_note_op(ds, rec_off, h.size);
     }
 }
+static inline void flatten_note_pin(totk_pin_span *ps, size_t rec_off, op_hdr h) {
+    if (h.op == OP_SET_RT || h.op == OP_COPY_B2T || h.op == OP_COPY_T2B || h.op == OP_CLEAR_TEX || h.op == OP_COPY_T2T) {
+        totk_pin_span_note_op(ps, rec_off, h.size);
+    }
+}
 static uint8_t *flatten_recording(const uint8_t *p0) {
     size_t n = sizeof(copy_prefix);
     int bulk_ok = 1, jumped = 0, called = 0; uint32_t last_size = 0, end_size = 0;
     totk_def_span ds; totk_def_span_init(&ds);
+    totk_pin_span ps; totk_pin_span_init(&ps);
     for (const uint8_t *p = p0;;) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7)) die("corrupt recording at %p (op %u size %u)", (const void *)p, h.op, h.size);
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); jumped = 1; continue; }
         const copy_prefix *t = call_marker_target(p, h);
-        if (t) { totk_def_span_note_marker(&ds, n - sizeof(copy_prefix), t->def_lo, t->def_hi); n += t->body_bytes; last_size = t->last_size; called = 1; p += h.size; continue; }   /* checked bulk records */
+        if (t) { totk_def_span_note_marker(&ds, n - sizeof(copy_prefix), t->def_lo, t->def_hi); totk_pin_span_note_marker(&ps, n - sizeof(copy_prefix), t->pin_lo, t->pin_hi); n += t->body_bytes; last_size = t->last_size; called = 1; p += h.size; continue; }   /* checked bulk records */
         if (h.op >= OP_COUNT_ || h.size > (64u << 20)) bulk_ok = 0;
         if (n == sizeof(copy_prefix)) { if (h.op != OP_BEGIN || h.size != 8) bulk_ok = 0; }
         else if (h.op == OP_BEGIN) bulk_ok = 0;
-        else if (h.op != OP_END) { last_size = h.size; flatten_note_def(&ds, n - sizeof(copy_prefix), p, h); }
+        else if (h.op != OP_END) { last_size = h.size; flatten_note_def(&ds, n - sizeof(copy_prefix), p, h); flatten_note_pin(&ps, n - sizeof(copy_prefix), h); }
         n += h.size;
         if (h.op == OP_END) { end_size = h.size; break; }
         p += h.size;
@@ -1211,6 +1220,7 @@ static uint8_t *flatten_recording(const uint8_t *p0) {
     c->body_bytes = bulk_ok && end_size == 8 && body <= UINT32_MAX ? (uint32_t)body : 0;
     c->last_size = c->body_bytes ? last_size : 0;
     c->def_lo = ds.lo; c->def_hi = ds.hi;
+    c->pin_lo = ps.lo; c->pin_hi = ps.hi;
     g_copy_bytes += malloc_size(out); return out + sizeof(copy_prefix);
 }
 /* Track handle use for diagnostics; lifetime depends on control-memory reuse, never elapsed frames. */
@@ -1236,12 +1246,15 @@ static void copy_drop(copy_bucket *b, uint32_t i, int by_token) {   /* g_copy_mu
     copy_prefix *pf = (copy_prefix *)(c->copy - sizeof(copy_prefix));
     if (cmdlog_env()) LOG("[cmd] free copy=%p%s", (void *)c->copy, by_token ? " (its mark in the control memory is gone)" : "");
     g_freed[g_nfreed++ % FREED_RING] = (typeof(g_freed[0])){(uintptr_t)c->copy, g_submits, c->stale_at, pf->used_at, pf->made_at, c->ctl_lo};
+    uintptr_t drop_lo = c->ctl_lo, drop_hi = c->ctl_hi;
     pf->magic = 0; copy_unref(pf); b->v[i] = b->v[--b->n]; g_ncopies--;   /* a recording's call marker may keep the memory a while */
+    totk_ctl_copy_note_drop(&g_ctl_copy_sum, drop_lo, drop_hi);
     if (by_token) g_copy_drop_token++; else g_copy_drop_readd++;
     if (!b->n && !b->empty) { b->empty = 1; g_cbk_empty++; }
 }
 static void release_copies(uintptr_t lo, uintptr_t hi) {
     if (hi <= lo) return;
+    if (totk_nvn_hle_fast_on() && !totk_ctl_copy_may_overlap(&g_ctl_copy_sum, lo, hi)) return;
     pthread_mutex_lock(&g_copy_mu);
     for (uintptr_t pg = lo >> COPY_PAGE_SHIFT; pg <= (hi - 1) >> COPY_PAGE_SHIFT; pg++) {
         copy_bucket *b = cbk_get(pg, 0); if (!b) continue;
@@ -1336,7 +1349,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
 #endif
       if (b->empty) { b->empty = 0; g_cbk_empty--; }
       if (b->n == b->cap) { b->cap = b->cap ? b->cap * 2 : 8; b->v = realloc(b->v, b->cap * sizeof *b->v); if (!b->v) die("command copy table"); }
-      b->v[b->n++] = (cmd_copy){lo, hi, copy, 0, (uint32_t)token}; g_ncopies++; }
+      b->v[b->n++] = (cmd_copy){lo, hi, copy, 0, (uint32_t)token}; g_ncopies++; totk_ctl_copy_note_add(&g_ctl_copy_sum, lo, hi); }
     { static uint64_t made; if (++made % 20000 == 0)
         LOG("[cmd] recording copies: %llu made, %zu live, %.1f MiB, submit %llu; released %llu at a re-added control memory, %llu whose mark there was gone (%llu unmapped); index %zu buckets (%zu empty) of %zu, compacted %llu times; TOTK_NVN_CALL_NOCOPY markers %llu, %.1f MiB not copied at the call",
             (unsigned long long)made, g_ncopies, g_copy_bytes / 1048576.0, (unsigned long long)g_submits, (unsigned long long)g_copy_drop_readd, (unsigned long long)g_copy_drop_token, (unsigned long long)g_copy_mark_faults,
@@ -1574,6 +1587,8 @@ static pthread_mutex_t g_pin_mu = PTHREAD_MUTEX_INITIALIZER;   /* lock order: g_
 static pin_t **g_pin_tab; static size_t g_pin_cap, g_pin_n;
 static pin_set g_pin_ptrs;
 static uint64_t g_pin_sweep_id = 1, g_pin_freed, g_pin_marks;
+static totk_pin_sync g_pin_sync = {.epoch = 1u};
+static __thread totk_pin_memo4 *t_pin_memo;
 static size_t pin_slot(uint64_t serial, size_t cap) { return (size_t)((serial * 0x9E3779B97F4A7C15ull) & (cap - 1)); }
 static size_t ptr_slot(const void *p, size_t cap) { return (size_t)((((uintptr_t)p >> 4) * 0x9E3779B97F4A7C15ull) >> 16) & (cap - 1); }
 static void ptrs_put(pin_set *s, pin_t *p) { size_t j = ptr_slot(p, s->cap); while (s->v[j]) j = (j + 1) & (s->cap - 1); s->v[j] = p; s->n++; }
@@ -1591,6 +1606,14 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
     const tex_t *t = (const tex_t *)nt;
     if (!t) return NULL;
     if (!t->serial) die("recording references an uninitialized texture object %p", (const void *)t);
+    uint64_t cur_sub = __atomic_load_n(&g_submits, __ATOMIC_RELAXED);
+    int fast = totk_nvn_hle_fast_on();
+    if (fast) {
+        const tex_t *fr = (const tex_t *)totk_pin_fast_get(&t_pin_memo, &g_pin_sync, t->serial, cur_sub);
+        if (fr) return fr;
+    }
+    uint32_t w0 = 0; uint64_t e0 = 0;
+    if (fast) totk_pin_snap(&g_pin_sync, &w0, &e0);
     pthread_mutex_lock(&g_pin_mu);
     if ((g_pin_n + 1) * 2 > g_pin_cap) pin_rebuild(g_pin_cap ? g_pin_cap * 2 : 4096);
     size_t j = pin_slot(t->serial, g_pin_cap);
@@ -1599,10 +1622,13 @@ static const tex_t *tex_pin(const NVNtexture *nt) {
         pin_t *c = malloc(sizeof *c); if (!c) die("texture pin copy");
         c->t = *t; c->alive_sweep = g_pin_sweep_id; g_pin_tab[j] = c; g_pin_n++;
         ptrs_put(&g_pin_ptrs, c);   /* same capacity as the serial table, so it has room */
+        totk_pin_sync_note_insert(&g_pin_sync, t->serial, g_pin_n);
     }
-    g_pin_tab[j]->last_pin = __atomic_load_n(&g_submits, __ATOMIC_RELAXED);
+    g_pin_tab[j]->last_pin = cur_sub;
+    g_pin_tab[j]->alive_sweep = g_pin_sweep_id;
     const tex_t *r = &g_pin_tab[j]->t;
     pthread_mutex_unlock(&g_pin_mu);
+    if (fast) totk_pin_fast_put(&t_pin_memo, &g_pin_sync, w0, e0, t->serial, r, cur_sub);
     return r;
 }
 static void pin_mark(const void *p) {   /* g_pin_mu held */
@@ -1628,6 +1654,32 @@ static void pin_mark_ops(const uint8_t *p) {   /* one recording copy: OP_BEGIN .
         p += h.size;
     }
 }
+static void pin_mark_ops_range(const uint8_t *p, const uint8_t *end) {
+    while (p + sizeof(op_hdr) <= end) {
+        op_hdr h; memcpy(&h, p, sizeof h);
+        if (h.op == OP_END || h.size < 8 || (size_t)(end - p) < h.size) return;
+        const uint8_t *a = p + 8;
+        switch (h.op) {
+            case OP_SET_RT: { if (pin_negative()) break;
+                              const p_set_rt *r = (const void *)a; int n = r->n < 0 ? 0 : r->n > 8 ? 8 : r->n;
+                              for (int i = 0; i < n; i++) pin_mark(r->color[i]); pin_mark(r->depth); break; }
+            case OP_COPY_B2T: case OP_COPY_T2B: pin_mark(((const p_copy_b2t *)(const void *)a)->tex); break;
+            case OP_CLEAR_TEX: pin_mark(((const p_clear_tex *)(const void *)a)->tex); break;
+            case OP_COPY_T2T: { const p_copy_t2t *c = (const void *)a; pin_mark(c->src); pin_mark(c->dst); break; }
+            default: break;
+        }
+        p += h.size;
+    }
+}
+static void pin_mark_ops_copy(const uint8_t *copy) {
+    if (!totk_nvn_hle_fast_on()) { pin_mark_ops(copy); return; }
+    const copy_prefix *pf = (const copy_prefix *)(const void *)copy - 1;
+    uint32_t lo = 0, hi = 0;
+    int kind = totk_pin_span_slice(pf->pin_lo, pf->pin_hi, &lo, &hi);
+    if (kind == 0) return;
+    if (kind == 2) { pin_mark_ops(copy); return; }
+    pin_mark_ops_range(copy + lo, copy + hi);
+}
 void mtl_pin_refs(void (*mark)(const void *));   /* nvn_mtl.m: the replay state that outlives a submit */
 static int pin_sweep_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_PIN_SWEEP"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[nvn] TOTK_PIN_SWEEP=0：录制里的贴图副本一直保留（旧行为，长局内存会涨）"); } return v; }
 /* One window: the copy buckets are walked in slices (pin_scan), then pin_decide frees what no recording, no replay state
@@ -1650,7 +1702,7 @@ static void pin_scan(size_t buckets) {   /* g_copy_mu and g_pin_mu held */
         copy_bucket *b = &g_cbk[k]; if (!b->used) continue;
         while (i < b->n) {
             if (b->v[i].token && !copy_token_intact(&b->v[i])) { copy_drop(b, i, 1); continue; }   /* its control memory was reused: the copy goes */
-            pin_mark_ops(b->v[i].copy); g_pin_scanned++; i++;
+            pin_mark_ops_copy(b->v[i].copy); g_pin_scanned++; i++;
         }
     }
     g_mark_jb = NULL;
@@ -1690,17 +1742,24 @@ int dm_nvn_pin_rekey(const tex_t *copy, const tex_t *live) {
     size_t j = 0; int found = 0;
     if (g_pin_cap) for (j = pin_slot(copy->serial, g_pin_cap); g_pin_tab[j]; j = (j + 1) & (g_pin_cap - 1)) if (&g_pin_tab[j]->t == copy) { found = 1; break; }
     if (found) {
+        totk_pin_wbegin(&g_pin_sync);
         pin_t *p = g_pin_tab[j];
         probe_delete(g_pin_tab, g_pin_cap, j, home_serial);
         p->t = *live;
         for (j = pin_slot(p->t.serial, g_pin_cap); g_pin_tab[j]; j = (j + 1) & (g_pin_cap - 1)) {}
         g_pin_tab[j] = p;
+        totk_pin_sync_note_insert(&g_pin_sync, p->t.serial, g_pin_n);
+        totk_pin_wend(&g_pin_sync);
     }
     pthread_mutex_unlock(&g_pin_mu);
     return found;
 }
 #endif
 int dm_nvn_pin_has_serial(uint64_t serial) {   /* nvn_mtl.m (texture finalize): a recording may still bring this serial to the replay */
+    if (totk_nvn_hle_fast_on()) {
+        int fast_has = totk_pin_serial_may_exist(&g_pin_sync, serial, t_pin_memo);
+        if (fast_has >= 0) return fast_has;
+    }
     pthread_mutex_lock(&g_pin_mu);
     int has = 0;
     if (g_pin_cap) for (size_t j = pin_slot(serial, g_pin_cap); g_pin_tab[j]; j = (j + 1) & (g_pin_cap - 1)) if (g_pin_tab[j]->t.serial == serial) { has = 1; break; }
@@ -1709,6 +1768,7 @@ int dm_nvn_pin_has_serial(uint64_t serial) {   /* nvn_mtl.m (texture finalize): 
 }
 static size_t home_ptr(const pin_t *p, size_t cap) { return ptr_slot(p, cap); }
 static size_t pin_decide(uint64_t now, size_t *recent_out) {   /* g_pin_mu held; the window's walk is complete */
+    totk_pin_wbegin(&g_pin_sync);
     mtl_pin_refs(pin_mark);
     size_t recent = 0, nf = 0;
     static pin_t **gone; static size_t gone_cap;
@@ -1730,6 +1790,14 @@ static size_t pin_decide(uint64_t now, size_t *recent_out) {   /* g_pin_mu held;
         g_pin_gone[g_pin_gone_n++] = p->t.serial;
         g_pin_ptrs.n--; g_pin_n--; free(p);
     }
+    if (nf > 0u) {
+        uint64_t sb[4] = {0, 0, 0, 0};
+        for (size_t i = 0; i < g_pin_cap; i++) {
+            if (g_pin_tab[i]) { uint32_t b = totk_pin_bloom_bit(g_pin_tab[i]->t.serial); sb[b >> 6] |= 1ull << (b & 63u); }
+        }
+        totk_pin_sync_set_bloom(&g_pin_sync, sb, g_pin_n);
+    }
+    totk_pin_wend(&g_pin_sync);
     g_pin_freed += nf; g_pin_sweep_id++; *recent_out = recent;
     return nf;
 }
