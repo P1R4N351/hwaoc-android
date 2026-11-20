@@ -16,6 +16,7 @@
 #include "test_vk_ktgl_opt_w12.h"
 #include "test_vk_ktgl_opt_w13.h"
 #include "test_vk_ktgl_opt_w14.h"
+#include "test_vk_ktgl_opt_w15.h"
 #include "nvn_dirty.h"
 #include <assert.h>
 #include <stdint.h>
@@ -278,6 +279,7 @@ int main(void) {
     if (run_ktgl_w12_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w13_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w14_tests(g_fault_mode) != 0) g_fail++;
+    if (run_ktgl_w15_tests(g_fault_mode) != 0) g_fail++;
     printf("ktglopttest: fault_mode=%d failures=%d\n", g_fault_mode, g_fail);
     return g_fail != 0;
 }

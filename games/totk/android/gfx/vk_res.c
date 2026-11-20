@@ -31,6 +31,7 @@
 #include "vk_upload_pool.h"
 #include "vk_edge_guard.h"
 #include "vk_res_fast.h"
+#include "vk_tbuf_fast.h"
 static int res_fast_on(void) {
     static _Atomic int on = -1;
     int v = atomic_load_explicit(&on, memory_order_relaxed);
@@ -344,12 +345,15 @@ static void retire_img(vk_img *im) {
     for (unsigned j=0;j<3;j++) if (im->scene_aa[j]) retire_img(im->scene_aa[j]);
     retire((retired_t){.img = im->img, .mem = im->mem, .views = im->views, .nviews = im->nviews, .host = im});
 }
-static void retire_bview(VkBufferView bv, VkBuffer buffer) { if (bv) retire((retired_t){.bv = bv, .bv_buffer = buffer}); }
+static _Atomic uint64_t g_tbv_evict_gen = 1;
+static __thread totk_tbuf_memo4 *T_tbuf_memo;
+static void retire_bview(VkBufferView bv, VkBuffer buffer) { if (bv) { atomic_fetch_add_explicit(&g_tbv_evict_gen, 1, memory_order_release); retire((retired_t){.bv = bv, .bv_buffer = buffer}); } }
 static void retire_host(void *p) { if (p) retire((retired_t){.host = p}); }
 /* Caller has retired every recording/GPU use of this arena buffer. Cached
    texel views must not survive its destruction or the lag-off cutover. */
 void vk_res_buffer_released(VkBuffer buffer) {
     pthread_mutex_lock(&g_tex_mu);
+    atomic_fetch_add_explicit(&g_tbv_evict_gen, 1, memory_order_release);
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         vk_tex *x = g_by_serial.vals ? g_by_serial.vals[i] : NULL;
         if (!x || x->tb_buffer != buffer) continue;
@@ -2462,44 +2466,77 @@ VkImageView vk_tex_by_id(int tid, int *target_out, vk_tex **x_out) {
     if (x_out) *x_out = x;
     return v;
 }
+static inline uint64_t tbuf_epoch_now(void) {
+    return totk_tbuf_epoch(vk_treg_revision(), atomic_load_explicit(&g_tex_ident_rev, memory_order_acquire),
+                           vk_span_gen(), atomic_load_explicit(&g_tbv_evict_gen, memory_order_acquire));
+}
+static int tbuf_fast_try(totk_tbuf_memo4 *m, int tid, uint64_t ep, int writable,
+                         VkDescriptorBufferInfo *live, uint32_t *reason,
+                         VkBufferView *out_bv, int *did_touch,
+                         int *did_lag, int *fhit_out, VkDescriptorBufferInfo *frozen_out) {
+    totk_tbuf_ent ent;
+    if (!m || !totk_tbuf_memo4_get(m, (uint32_t)tid, ep, &ent)) return 0;
+    if (live) { memset(live, 0, sizeof *live); *reason = 0; }
+    if (ent.addr && ent.touch_bytes) { vk_ub_touch(ent.addr, ent.touch_bytes); *did_touch = 1; }
+    if (!vk_lag_capture_on()) { *out_bv = (VkBufferView)(uintptr_t)ent.bv_u; return 1; }
+    if (writable) {
+        if (live) { vk_gpu_write_record(ent.addr, ent.size); *reason = NVN_DIRTY_LAG_GPU | NVN_DIRTY_LAG_WRITABLE; *live = (VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)ent.buf_u, ent.off, ent.size}; }
+        else vk_gpu_write(ent.addr, ent.size);
+        *out_bv = (VkBufferView)(uintptr_t)ent.bv_u; return 1;
+    }
+    int fhit = live ? vk_lag_read_record(ent.addr, ent.size, V.props.limits.minTexelBufferOffsetAlignment, frozen_out, reason, VK_LAG_TEXEL)
+                    : vk_lag_read(ent.addr, ent.size, V.props.limits.minTexelBufferOffsetAlignment, frozen_out, VK_LAG_TEXEL);
+    *did_lag = 1; *fhit_out = fhit;
+    if (fhit) return 0;
+    if (live && *reason) *live = (VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)ent.buf_u, ent.off, ent.size};
+    *out_bv = (VkBufferView)(uintptr_t)ent.bv_u; return 1;
+}
 static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *live, uint32_t *reason) {
+    int fast_on = totk_tbuf_fast_on() && tid > 0 && tid < TID_GEN_N;
+    totk_tbuf_memo4 *m = fast_on ? T_tbuf_memo : NULL;
+    if (fast_on && !m) m = T_tbuf_memo = calloc(1, sizeof *m);
+    uint64_t ep0 = fast_on ? tbuf_epoch_now() : 0ull;
+    int touched = 0, did_lag = 0, fhit = 0; VkBufferView fbv = VK_NULL_HANDLE; VkDescriptorBufferInfo frozen = {0};
+    if (fast_on && tbuf_fast_try(m, tid, ep0, writable, live, reason, &fbv, &touched, &did_lag, &fhit, &frozen)) return fbv;
     vk_treg rc, *r = &rc;
     if (!vk_treg_get(tid, r) || r->t.d.target != 10) return VK_NULL_HANDLE;
-    if (live) { memset(live, 0, sizeof *live); *reason = 0; }
+    if (!did_lag && live) { memset(live, 0, sizeof *live); *reason = 0; }
     uint64_t address = (uint64_t)(uintptr_t)r->t.mem;
     int block_w, block_h, bytes_per_texel = nvn_fmt_bpb(r->t.d.format, &block_w, &block_h);
-    if (address && bytes_per_texel > 0) vk_ub_touch(address, (uint64_t)r->t.d.width * bytes_per_texel);
+    uint64_t touch_bytes = (address && bytes_per_texel > 0) ? (uint64_t)r->t.d.width * bytes_per_texel : 0u;
+    if (touch_bytes && !touched) vk_ub_touch(address, touch_bytes);
     vk_tex *x = vk_tex_get(&r->t);
     pthread_mutex_lock(&g_tex_mu);
     if (!x) { x = nvn_hm_get(&g_by_serial, &r->t.serial); }
-    if (x && x->tbv && !vk_lag_capture_on()) { VkBufferView cached = x->tbv; pthread_mutex_unlock(&g_tex_mu); return cached; }
-    VkBufferView bv = VK_NULL_HANDLE;
+    if (x && x->tbv && !vk_lag_capture_on()) {
+        VkBufferView cached = x->tbv;
+        if (m && fast_on && x->tb_buffer && x->tb_range && tbuf_epoch_now() == ep0)
+            totk_tbuf_memo4_put(m, (uint32_t)tid, ep0, 0, (uint64_t)(uintptr_t)cached, (uint64_t)(uintptr_t)x->tb_buffer, x->tb_offset, x->tb_range, address, touch_bytes);
+        pthread_mutex_unlock(&g_tex_mu); return cached;
+    }
+    VkBufferView bv = VK_NULL_HANDLE; VkBuffer b = VK_NULL_HANDLE; uint64_t off = 0, size = 0;
     if (x) {
-        int bw, bh, bpb = nvn_fmt_bpb(r->t.d.format, &bw, &bh); VkFormat f; VkBuffer b; uint64_t off;
-        uint64_t addr = (uint64_t)(uintptr_t)r->t.mem, size = (uint64_t)r->t.d.width * bpb;
+        int bw, bh, bpb = nvn_fmt_bpb(r->t.d.format, &bw, &bh); VkFormat f;
+        size = (uint64_t)r->t.d.width * bpb;
         if (!vk_fmt(r->t.d.format, &f, NULL) || !f || !bpb) RED(4, "buffer texture format %#x has no Vulkan format", r->t.d.format);
-        else if (!vk_resolve(addr, size, &b, &off)) RED(4, "buffer texture storage is outside the memory pools");
+        else if (!vk_resolve(address, size, &b, &off)) RED(4, "buffer texture storage is outside the memory pools");
         else {
             size = MINV(size, (uint64_t)V.props.limits.maxTexelBufferElements * bpb);
-            VkDescriptorBufferInfo frozen;
-            if (writable && vk_lag_capture_on()) {
-                if (live) { vk_gpu_write_record(addr, size); *reason = NVN_DIRTY_LAG_GPU | NVN_DIRTY_LAG_WRITABLE; }
-                else vk_gpu_write(addr, size);
-            } else if (live ? vk_lag_read_record(addr, size, V.props.limits.minTexelBufferOffsetAlignment, &frozen, reason, VK_LAG_TEXEL) :
-                vk_lag_read(addr, size, V.props.limits.minTexelBufferOffsetAlignment, &frozen, VK_LAG_TEXEL)) { b = frozen.buffer; off = frozen.offset; }
+            if (did_lag) { if (fhit) { b = frozen.buffer; off = frozen.offset; } }
+            else if (writable && vk_lag_capture_on()) { if (live) { vk_gpu_write_record(address, size); *reason = NVN_DIRTY_LAG_GPU | NVN_DIRTY_LAG_WRITABLE; } else vk_gpu_write(address, size); }
+            else if ((fhit = (live ? vk_lag_read_record(address, size, V.props.limits.minTexelBufferOffsetAlignment, &frozen, reason, VK_LAG_TEXEL) :
+                vk_lag_read(address, size, V.props.limits.minTexelBufferOffsetAlignment, &frozen, VK_LAG_TEXEL)))) { b = frozen.buffer; off = frozen.offset; }
             if (live && *reason) *live = (VkDescriptorBufferInfo){b, off, size};
             if (off % V.props.limits.minTexelBufferOffsetAlignment) RED(4, "buffer texture offset %#llx is not aligned", (unsigned long long)off);
             else {
                 if (x->tbv && (x->tb_buffer != b || x->tb_offset != off || x->tb_range != size)) { retire_bview(x->tbv, x->tb_buffer); x->tbv = VK_NULL_HANDLE; }
-                if (!x->tbv) {
-                    VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f, .offset = off, .range = size};
-                    if (!vkCreateBufferView(V.dev, &ci, NULL, &x->tbv)) { x->tb_buffer = b; x->tb_offset = off; x->tb_range = size; }
-                }
+                if (!x->tbv) { VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f, .offset = off, .range = size}; if (!vkCreateBufferView(V.dev, &ci, NULL, &x->tbv)) { x->tb_buffer = b; x->tb_offset = off; x->tb_range = size; } }
                 bv = x->tbv;
             }
         }
     }
     pthread_mutex_unlock(&g_tex_mu);
+    if (m && fast_on && bv && tbuf_epoch_now() == ep0) totk_tbuf_memo4_put(m, (uint32_t)tid, ep0, fhit, (uint64_t)(uintptr_t)bv, (uint64_t)(uintptr_t)b, off, size, address, touch_bytes);
     return bv;
 }
 VkBufferView vk_tbuf_by_id(int tid, int writable) { return tbuf_by_id(tid, writable, NULL, NULL); }
