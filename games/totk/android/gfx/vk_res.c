@@ -29,6 +29,9 @@
 #include "totk_lifelog.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include "vk_upload_pool.h"
+#include "vk_edge_guard.h"
+#include <assert.h>
+#include <unistd.h>
 #include "../../runtime/frame_timeline.h"
 #ifdef __linux__
 #include <sys/syscall.h>
@@ -227,6 +230,7 @@ struct vk_tex {
     uint64_t serial; tex_t t; vk_img *im;
     tex_stamp identity;
     int mirrored; uint64_t stamp, csub;   /* mirrored: dirty-page stamp of the uploaded content, last submission checked */
+    vk_edge_state edge;
     _Atomic uint64_t memo_sub;            /* TOTK_VK_TEX_MEMO: last submission whose tex_get_inner work for it is done */
     int cpu_pool;                         /* tex_mirrored at creation: GPU writes re-arm settled/opt-in invalidate write-back */
     int canvas_window;                   /* registration cached at object creation, not on every draw */
@@ -248,7 +252,62 @@ static uint64_t g_stat_uploads, g_stat_reuploads, g_stat_upload_bytes, g_stat_im
    a persistent sampling object describes, as nvn_mtl.m's storage sharing notes) would read its own stale upload: the
    deferred lighting then read empty G-buffer textures and drew lit geometry black. So a GPU-written mirrored image is
    published under its storage key, and every serial at that storage reads it from then on. */
+static uint64_t g_stat_edge_skips, g_stat_edge_unpins;
 static int mirshare_on(void) { static int on = -1; if (on < 0) on = !vk_off("mirshare"); return on; }
+static int edgeguard_on(void) { static int on = -1; if (on < 0) on = !vk_off("edgeguard"); return on; }
+static int tex_edge_geom_of(const tex_t *t, vk_edge_geom *g) {
+    uintptr_t unit_lo = 0; size_t unit = 0;
+    if (!t || !t->mem || !t->L.size || !nvn_dirty_unit_info(t->mem, t->L.size, &unit_lo, &unit)) return 0;
+    vk_edge_split(unit_lo, (uintptr_t)t->mem, t->L.size, unit, g);
+    return 1;
+}
+static void tex_protect_mirrored(vk_tex *x) {
+    assert(x != NULL);
+    const tex_t *t = &x->t;
+    vk_edge_geom g;
+    if (!edgeguard_on() || !tex_edge_geom_of(t, &g)) {
+        x->edge.armed = x->edge.unpinned = x->edge.streaks = x->edge.in_hashed = 0;
+        nvn_dirty_protect(t->mem, t->L.size);
+        return;
+    }
+    vk_edge_snapshot(&g, &x->edge);
+    if (x->edge.unpinned) {
+        if (g.ie > g.ia) nvn_dirty_protect((const void *)g.ia, g.ie - g.ia);
+    } else {
+        nvn_dirty_protect(t->mem, t->L.size);
+    }
+}
+static int tex_mirrored_dirty(vk_tex *x) {
+    assert(x != NULL);
+    const tex_t *t = &x->t;
+    vk_edge_geom g;
+    if (!edgeguard_on() || !x->edge.armed || !tex_edge_geom_of(t, &g))
+        return !nvn_dirty_tracked(t->mem, t->L.size) || nvn_dirty_since(t->mem, t->L.size, x->stamp);
+    int h0_bad = 0, h1_bad = 0;
+    int e_dirty = vk_edge_changed(&g, &x->edge, &h0_bad, &h1_bad);
+    if (x->edge.unpinned) {
+        int in_dirty = (g.ie > g.ia) && (!nvn_dirty_tracked((const void *)g.ia, g.ie - g.ia) ||
+                                         nvn_dirty_since((const void *)g.ia, g.ie - g.ia, x->stamp));
+        if (in_dirty || e_dirty) { x->edge.streaks = 0; return 1; }
+        g_stat_edge_skips++; return 0;
+    }
+    if (!nvn_dirty_tracked(t->mem, t->L.size)) { x->edge.streaks = 0; return 1; }
+    if (!nvn_dirty_since(t->mem, t->L.size, x->stamp)) return 0;
+    uint64_t st = nvn_dirty_now();
+    int in_dirty = (g.ie > g.ia && nvn_dirty_since((const void *)g.ia, g.ie - g.ia, x->stamp));
+    if (in_dirty && !e_dirty && x->edge.in_hashed) {
+        int ep = (g.r[0][1] > g.r[0][0] && nvn_dirty_since((const void *)g.r[0][0], g.r[0][1] - g.r[0][0], x->stamp)) ||
+                 (g.r[1][1] > g.r[1][0] && nvn_dirty_since((const void *)g.r[1][0], g.r[1][1] - g.r[1][0], x->stamp));
+        if (vk_edge_interior_collateral(&g, &x->edge, ep)) in_dirty = 0;
+    }
+    if (in_dirty || e_dirty) { x->edge.streaks = 0; return 1; }
+    g_stat_edge_skips++;
+    if (x->edge.streaks < 255) x->edge.streaks++;
+    if (x->edge.streaks >= VK_EDGE_UNPIN_AFTER) { x->edge.unpinned = 1; g_stat_edge_unpins++; }
+    x->stamp = st;
+    tex_protect_mirrored(x);
+    return 0;
+}
 
 static void wb_age_locked(void);   /* GPU write-back records (below) */
 static void wb_sweep_locked(void);
@@ -602,8 +661,9 @@ static void upload_inner(vk_tex *x) {
             (unsigned long long)t->L.size, totk_texcopy_nonzero(t->mem, (size_t)t->L.size));
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb) return;
+    x->edge.streaks = 0;
     x->stamp = nvn_dirty_now();   /* before the copy: a write during it is newer than this content */
-    nvn_dirty_protect(t->mem, t->L.size);
+    tex_protect_mirrored(x);
     int is3d = im->type == VK_IMAGE_TYPE_3D, linear = nvn_tex_is_linear(&t->d);
     VkCommandBuffer cb = vk_pre_cb();
     vk_barrier_all(cb);
@@ -696,7 +756,7 @@ static vk_tex *tex_get_inner(const tex_t *t) {
             retire_img(x->im); x->im = g; g->refs++; __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_switched++;   /* the GPU renders this storage now */
             tex_stamp_bump(&x->identity);
             texcopy_resource("switch", x);
-        } else if (!nvn_dirty_tracked(t->mem, t->L.size) || nvn_dirty_since(t->mem, t->L.size, x->stamp)) {
+        } else if (tex_mirrored_dirty(x)) {
             texcopy_resource("reupload", x); upload(x); g_stat_reuploads++;
         }
     }

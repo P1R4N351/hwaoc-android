@@ -104,6 +104,7 @@ int nvn_dirty_lag_protect(const void *addr, size_t len, uint64_t fence);   // re
    diagnostics or other side effects. Does not reserve the range against a subsequent CPU writer. */
 int nvn_dirty_lag_registered(const void *addr, size_t len, uint64_t fence);
 int nvn_dirty_lag_bounds(const void *addr, size_t len, uintptr_t *lo, uintptr_t *hi);
+int nvn_dirty_unit_info(const void *addr, size_t len, uintptr_t *unit_lo, size_t *unit_bytes);
 /* Diagnostic submission watermark only: call immediately after a successful vkQueueSubmit2, before publishing the
    queue entry. Atomic-max ignores older tickets; lag-off returns without touching the watermark.
    Ticket/gate waits >=500 ms emit one async-signal-safe stderr record per wait episode, without ending the wait:

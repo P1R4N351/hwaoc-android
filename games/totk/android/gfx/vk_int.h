@@ -237,6 +237,8 @@ void vk_ub_touch(uint64_t addr, uint64_t n);   /* a non-uniform GPU access of [a
 void vk_ub_flush(void);
 void vk_gpu_write(uint64_t addr, uint64_t n);   /* the GPU writes [addr, +n) in this submission: no uniform snapshot of it (now or while in flight) */
 int vk_gpu_write_pending(uint64_t addr, uint64_t n);   /* 1 if a GPU write in flight (or pending un-logged write) overlaps [addr, +n) */
+uint64_t vk_gpu_write_gen(void);   /* monotonic counter bumped whenever the GPU writes/updates buffers */
+void vk_gpu_write_bump(void);
 /* TOTK_VK_OFF=<name>,<name>,...: turn individual optimisations off (to find which one misbehaves). Names: rename (uniform
    renaming), ds (descriptor-set reuse), dyn (dynamic-state skipping), block (driver bank / c1 reuse), ts (GPU
    timestamps), span (pool index; off = the old linear scan), all. */

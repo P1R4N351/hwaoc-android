@@ -1486,6 +1486,13 @@ static uint32_t load_coverage_mask(void) {
 void vk_draw_test_load_counts(uint64_t out[2]) { out[0] = g_load_proven; out[1] = g_load_elided; }
 #endif
 /* Open the pass for the current targets with the pending clears as load operations. 0 when nothing can be attached. */
+static void quad_indirect_prescan(uint64_t cur_ind);
+static void maybe_submit_chunk_before_pass(void) {
+    long lim = vk_frame_chunk_limit();
+    g_split_reopen += (uint64_t)g_split_submit;
+    if (lim > 0 && (g_chunk_draws >= (uint64_t)lim || g_split_submit)) { g_chunk_draws = 0; vk_submit_chunk(); }
+    g_split_submit = 0;
+}
 static int begin_rendering_inner(int draw_tail) {
     if (R.open) return 1;
     fg_extract_refresh(1);   /* configuration/late-state lookup at pass boundaries only */
@@ -1493,10 +1500,8 @@ static int begin_rendering_inner(int draw_tail) {
     if (g_split_game != game) { g_split_game = game; g_split_cut = g_split_unrepairable = 0; }
     /* The default follows resolved lag, including the native-pressure cutover.
        An explicit threshold (including disabled=0) remains authoritative. */
-    { long lim = vk_frame_chunk_limit();
-      g_split_reopen += (uint64_t)g_split_submit;
-      if (lim > 0 && (g_chunk_draws >= (uint64_t)lim || g_split_submit)) { g_chunk_draws = 0; vk_submit_chunk(); }
-      g_split_submit = 0; }
+    maybe_submit_chunk_before_pass();
+    if (draw_tail && !R.open && !g_indirect.on) quad_indirect_prescan(0);
     VkRenderingAttachmentInfo ca[8], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sa = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     uint32_t w = 16384, h = 16384, nc = 0; int have = 0;
     g_pipe_dirty = 1;
@@ -5166,6 +5171,8 @@ static void quad_indices(uint32_t quads) {
     g_quad_ib = b; g_quad_max = n;   /* the old buffer (if any) is left alive: it may be in flight */
 }
 #include "vk_quad_indirect_spv.h"
+#include "vk_quad_batch.h"
+#include <assert.h>
 static VkDescriptorSetLayout g_qi_dsl;
 static VkPipelineLayout g_qi_layout;
 static VkShaderModule g_qi_mod;
@@ -5193,6 +5200,68 @@ static VkPipeline quad_indirect_pipeline(void) {
         .layout = g_qi_layout};
     if (vk_pcache_compute(&ci, &g_qi_pipe)) { g_qi_pipe = VK_NULL_HANDLE; return VK_NULL_HANDLE; }
     return g_qi_pipe;
+}
+static vk_qi_cache g_qi_cache;
+static uint64_t g_qi_batches, g_qi_batched_items, g_qi_cache_hits;
+static int quadbatch_on(void) { static int on = -1; if (on < 0) on = !vk_off("quadbatch"); return on; }
+static int quad_indirect_convert_batch(const uint64_t *inds, int n) {
+    assert(inds != NULL && n > 0 && n <= VK_QI_BATCH_MAX);
+    VkPipeline pipe = quad_indirect_pipeline();
+    if (!pipe) return 0;
+    VkDeviceSize align = V.props.limits.minStorageBufferOffsetAlignment;
+    if (align < 64) align = 64;
+    VkBuffer bufs[VK_QI_BATCH_MAX]; VkDeviceSize offs[VK_QI_BATCH_MAX]; uint64_t valid[VK_QI_BATCH_MAX];
+    int nv = 0;
+    for (int k = 0; k < n && k < VK_QI_BATCH_MAX; k++) {
+        VkBuffer b; uint64_t o;
+        if (!vk_resolve_for(inds[k], 16, &b, &o, NULL, VK_LOOKUP_VERTEX)) continue;
+        bufs[nv] = b; offs[nv] = (VkDeviceSize)o; valid[nv] = inds[k]; nv++;
+    }
+    if (!nv) return 0;
+    VkBuffer sb; VkDeviceSize so;
+    void *zero = vk_transient((size_t)((VkDeviceSize)nv * align), (size_t)align, &sb, &so);
+    memset(zero, 0, (size_t)((VkDeviceSize)nv * align));
+    vk_end_rendering_at(VK_PASS_END_COMPUTE, 0);
+    VkCommandBuffer cb = vk_cb();
+    vk_barrier_all(cb);
+    VkDescriptorBufferInfo bis[VK_QI_BATCH_MAX]; VkWriteDescriptorSet ws[VK_QI_BATCH_MAX];
+    VkDescriptorSet sets[VK_QI_BATCH_MAX];
+    for (int k = 0; k < nv; k++) {
+        VkDeviceSize d = so + (VkDeviceSize)k * align;
+        VkBufferCopy cp = {offs[k], d, 16};
+        vkCmdCopyBuffer(cb, bufs[k], sb, 1, &cp);
+        sets[k] = vk_alloc_set(g_qi_dsl);
+        bis[k] = (VkDescriptorBufferInfo){sb, d, 48};
+        ws[k] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = sets[k], .dstBinding = 0,
+                                       .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .pBufferInfo = &bis[k]};
+    }
+    vk_barrier_all(cb);
+    vkUpdateDescriptorSets(V.dev, (uint32_t)nv, ws, 0, NULL);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    uint32_t max_quads = MAX_INDIRECT_QUADS;
+    vkCmdPushConstants(cb, g_qi_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof max_quads, &max_quads);
+    uint64_t sub = vk_submit_serial(), wgen = vk_gpu_write_gen();
+    if (!vk_qi_cache_valid(&g_qi_cache, sub, wgen)) vk_qi_cache_reset(&g_qi_cache, sub, wgen);
+    for (int k = 0; k < nv; k++) {
+        VkDeviceSize d = so + (VkDeviceSize)k * align;
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, g_qi_layout, 0, 1, &sets[k], 0, NULL);
+        vkCmdDispatch(cb, 1, 1, 1);
+        vk_qi_cache_put(&g_qi_cache, valid[k], (uint64_t)(uintptr_t)sb, (uint64_t)(d + 32));
+    }
+    vk_barrier_all(cb);
+    g_bound_pipe = VK_NULL_HANDLE;
+    memset(g_bound_set[1], 0, sizeof g_bound_set[1]);
+    g_qi_batches++; g_qi_batched_items += (uint64_t)nv;
+    return nv;
+}
+static void quad_indirect_prescan(uint64_t cur_ind) {
+    if (!quadbatch_on()) return;
+    uint64_t sub = vk_submit_serial(), wgen = vk_gpu_write_gen();
+    uint64_t inds[VK_QI_BATCH_MAX];
+    const p_set_rt *rt = S.has_rt ? &S.rt : NULL;
+    int nq = vk_qi_scan_ops(vk_exec_draw_next(), cur_ind, rt, rt_same, vk_gpu_write_pending,
+                            &g_qi_cache, sub, wgen, inds, VK_QI_BATCH_MAX);
+    if (nq > 0) (void)quad_indirect_convert_batch(inds, nq);
 }
 static int quad_indirect_convert(VkBuffer ind_buf, VkDeviceSize ind_off, VkBuffer *out_buf, VkDeviceSize *out_off) {
     VkPipeline pipe = quad_indirect_pipeline();
@@ -6113,6 +6182,20 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
     if (vk_fg_extract_active) FGX.record = NULL;
     g_record_draw = NULL;
 }
+static int quad_indirect_resolve(uint64_t ind_addr, VkBuffer ind_buf, VkDeviceSize ind_off,
+                                 VkBuffer *cmd_buf, VkDeviceSize *cmd_off) {
+    quad_indices(MAX_INDIRECT_QUADS);
+    if (!quadbatch_on()) return quad_indirect_convert(ind_buf, ind_off, cmd_buf, cmd_off);
+    uint64_t cbuf = 0, coff = 0, sub = vk_submit_serial(), wgen = vk_gpu_write_gen();
+    if (!vk_qi_cache_find(&g_qi_cache, sub, wgen, ind_addr, &cbuf, &coff)) {
+        if (!R.open) maybe_submit_chunk_before_pass();
+        quad_indirect_prescan(ind_addr);
+        sub = vk_submit_serial(); wgen = vk_gpu_write_gen();
+        (void)vk_qi_cache_find(&g_qi_cache, sub, wgen, ind_addr, &cbuf, &coff);
+    }
+    if (cbuf) { *cmd_buf = (VkBuffer)(uintptr_t)cbuf; *cmd_off = (VkDeviceSize)coff; g_qi_cache_hits++; return 1; }
+    return quad_indirect_convert(ind_buf, ind_off, cmd_buf, cmd_off);
+}
 static void draw_indirect(const p_draw_indirect *iw, const p_draw_idx_indirect *ii) {
     uint64_t ind_addr = iw ? iw->buf : ii->buf;
     uint64_t ind_sz = iw ? 16 : 20;
@@ -6150,10 +6233,7 @@ static void draw_indirect(const p_draw_indirect *iw, const p_draw_idx_indirect *
         g_stat_skips[8]++; return;
     }
     VkBuffer cmd_buf = ind_buf; VkDeviceSize cmd_off = ind_off;
-    if (iw && prim == 7) {
-        quad_indices(MAX_INDIRECT_QUADS);
-        if (!quad_indirect_convert(ind_buf, ind_off, &cmd_buf, &cmd_off)) return;
-    }
+    if (iw && prim == 7 && !quad_indirect_resolve(ind_addr, ind_buf, ind_off, &cmd_buf, &cmd_off)) return;
     memset(&g_indirect, 0, sizeof g_indirect);
     g_indirect.on = 1; g_indirect.indexed = ii != NULL; g_indirect.quad_ib = iw && prim == 7;
     g_indirect.itype = ii ? (uint32_t)ii->itype : 0; g_indirect.ibuf = ii ? ii->ibuf : 0;
@@ -6163,6 +6243,7 @@ static void draw_indirect(const p_draw_indirect *iw, const p_draw_idx_indirect *
     g_indirect.on = 0;
 }
 static void dispatch(const p_dispatch *dp) {
+    vk_gpu_write_bump();
     if (!vk_lag_uniform_private()) vk_ub_flush();   /* private UBOs materialize only for actual non-UBO consumers */
     if (!S.prog[5]) return;
     vk_shader *sh[6];

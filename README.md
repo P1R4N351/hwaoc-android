@@ -23,7 +23,7 @@ opening, the Great Plateau and the menus. Setup on the device is not ported yet:
 
 The same code base also builds **TotK Native (fork)**, the Tears of the Kingdom app with this fork's additions
 ([docs/totk-native.md](docs/totk-native.md)), and **AoC Native** (`io.github.p1r4n351.hwaoc`, `0.1.0-beta.1`) for *Hyrule Warriors: Age of Calamity* 1.3.0
-([P1R4N351/hwaoc-android](https://github.com/P1R4N351/hwaoc-android), [games/hwaoc/README.md](games/hwaoc/README.md), [ANDROID.md](games/hwaoc/ANDROID.md)).
+([P1R4N351/hwaoc-android](https://github.com/P1R4N351/hwaoc-android), [games/hwaoc/README.md](games/hwaoc/README.md), [ANDROID.md](games/hwaoc/ANDROID.md), [docs/ktgl-commonalities.md](docs/ktgl-commonalities.md)).
 
 - [Nintendo, if you're reading this](#nintendo-if-youre-reading-this)
 - [Features](#features)
@@ -226,6 +226,7 @@ bug report.
 - [games/totk/android/BOTW.md](games/totk/android/BOTW.md): what is ported for Breath of the Wild, and the game folder.
 - [docs/research/](docs/research/README.md): findings with their evidence (graphics, LEDs, stamina and cutscene
   signals, per-LED control).
+- [docs/ktgl-commonalities.md](docs/ktgl-commonalities.md): KTGL engine commonalities & cross-venture optimizations (`AoC` + `AoI`).
 - [docs/companion-waist.md](docs/companion-waist.md): the second-screen ledger.
 - [docs/architecture.md](docs/architecture.md), [docs/building.md](docs/building.md),
   [docs/developer-settings.md](docs/developer-settings.md): how the port works, building and `totk.env` switches.

@@ -1662,6 +1662,15 @@ void nvn_dirty_wb_stats(uint64_t *faults, uint64_t *preps) {
     *faults = atomic_load(&g_wb_faults); *preps = atomic_load(&g_wb_preps);
 }
 /* Use the same whole-unit bounds as normal dirty protection, clipped at the pool's final system page. */
+int nvn_dirty_unit_info(const void *addr, size_t len, uintptr_t *unit_lo, size_t *unit_bytes) {
+    if (!len || !unit_lo || !unit_bytes || !nvn_dirty_tracked(addr, len)) return 0;
+    range_t *r = find((uintptr_t)addr);
+    uintptr_t p = ((uintptr_t)addr - r->base) >> g_shift;
+    uintptr_t u0 = (p / g_unit) * g_unit;
+    *unit_lo = unit_addr(r, u0);
+    *unit_bytes = (size_t)(g_unit << g_shift);
+    return 1;
+}
 int nvn_dirty_lag_bounds(const void *addr, size_t len, uintptr_t *lo, uintptr_t *hi) {
     if (!len || !nvn_dirty_tracked(addr, len)) return 0;
     range_t *r = find((uintptr_t)addr); if (!r->lag) return 0;

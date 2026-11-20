@@ -4131,8 +4131,12 @@ void vk_record_test_gpu_write_pause(_Atomic int *ready, _Atomic int *resume) {
 }
 uint64_t vk_record_test_gpu_write_guards(void) { return g_test_gpu_write_guards; }
 #endif
+static _Atomic uint64_t g_gpu_write_gen;
+uint64_t vk_gpu_write_gen(void) { return atomic_load_explicit(&g_gpu_write_gen, memory_order_acquire); }
+void vk_gpu_write_bump(void) { atomic_fetch_add_explicit(&g_gpu_write_gen, 1, memory_order_release); }
 static void gpu_write_inner(uint64_t a, uint64_t n, int guard) {
     if (!n) return;
+    vk_gpu_write_bump();
     vk_wb_gpu_wrote(a, n);
     int replay=vk_fg_enabled();
     if (ub_private_on() || replay) vk_ub_touch(a, n);
@@ -5781,6 +5785,7 @@ void vk_ub_read_record(uint64_t addr, void *dst, size_t size) {
 uint64_t vk_record_test_pointer_hits(void) { return g_rec.pointer_hits; }
 #endif
 static void update_ub(uint64_t dst, const uint8_t *data, uint64_t n) {
+    vk_gpu_write_bump();
     VkBuffer db; uint64_t dof;
     if (n <= 64) vk_pd_write_note("inline update", dst, n, data);
     int ok = vk_resolve(dst, n, &db, &dof);

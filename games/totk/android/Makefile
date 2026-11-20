@@ -283,6 +283,7 @@ $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vk
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest vkrectest vkcanvastest): $(TOTK)/android/gfx/pso_trace_key.h
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_screen_classify.h
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_alpha_test.h
+$(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vknativeuitest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_pso_keys.h $(TOTK)/android/gfx/vk_pso_runtime.inc
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest vkrectest vkcanvastest): $(TOTK)/android/gfx/pso_trace_key.h
 $(addprefix $(OUT)/,vktest vkdrawtest vkrecspantest vkpipetest vkdrawtest-app vkoverlaytest vkposttest vkframegentest vknativeuitest vkxlatetest vkpcachetest poolfintest vkreplaypintest): $(TOTK)/android/gfx/vk_screen_classify.h
@@ -293,6 +294,11 @@ vktest: $(OUT)/vktest $(OUT)/vkdrawtest $(OUT)/vkrectest $(OUT)/vkrecspantest $(
 vktest: $(OUT)/vkcanvastest
 vktest: $(OUT)/vkseedpacktest $(OUT)/vkseediotest
 vktest: $(OUT)/vkcomputestoretest
+vktest: $(OUT)/ktglopttest
+ktglopttest: $(OUT)/ktglopttest
+$(OUT)/ktglopttest: $(TOTK)/android/gfx/test_vk_ktgl_opt.c $(TOTK)/android/gfx/host_test_support.c $(TOTK)/third_party/d2r_gfx/gfx/nvn/nvn_dirty.c $(TOTK)/android/gfx/vk_edge_guard.h $(TOTK)/android/gfx/vk_quad_batch.h
+	@mkdir -p $(dir $@)
+	$(CC) -O2 -g $(WARN) -Wno-unused-parameter -D_GNU_SOURCE -I$(TOTK)/runtime -I$(TOTK)/third_party/d2r_gfx/gfx/nvn -I$(TOTK)/third_party/d2r_gfx/gfx/nvn/include $(COMPAT) -o $@ $(filter %.c,$^) $(if $(filter linux,$(TARGET)),-lpthread)
 vktest: $(OUT)/vksubgrouptest
 vksubgrouptest: $(OUT)/vksubgrouptest
 $(OUT)/vksubgrouptest: $(TOTK)/android/gfx/test_vk_subgroup.c $(TOTK)/android/gfx/vk_subgroup.h
@@ -619,6 +625,7 @@ clean:
 	rm -f $(OUT)/texelregiontest
 	rm -f $(OUT)/vkcanvastest
 	rm -f $(OUT)/poolfintest
+	rm -f $(OUT)/ktglopttest
 	rm -f $(VKTEST_FRONTEND) $(VKTEST_FRONTEND:.o=.d)
 .PHONY: all clean vkprobe vktest vktest-app threadplacetest frametimelinetest framefencetest acquireclocktest displaypacetest displayclocktest acquireslacktest predictpacetest predictbudgettest adrenogmemtest fpsautotest fpsautoscenetest fpsautoblocktest presentfencetest vktest-overlay vkposttest companiontest FORCE psotracetest
 .PHONY: framegenslottest presentslottest vkframegentest framegenmathtest framegenbudgettest framegendeptest gpuitimingtest
@@ -629,7 +636,7 @@ clean:
 .PHONY: vktest-native-ui
 .PHONY: poolfintest
 .PHONY: vkpipetest screenclassifytest
-.PHONY: vksubgrouptest
+.PHONY: vksubgrouptest ktglopttest
 
 # The on-device setup library (libtotk_setup.so, the hactool executable libhactool.so, host totk-setup): targets
 # setup-android / setup-host; it needs HACTOOL_SRC and the capstone prefixes from the setup deps helpers
