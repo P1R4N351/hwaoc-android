@@ -27,6 +27,7 @@
 #include "vk_dsc_fast.h"
 #include "vk_vb_fast.h"
 #include "vk_stage_fast.h"
+#include "vk_state_fast.h"
 static int ktglmemo_draw_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "../../runtime/present_clock.h"
 #include "../../runtime/present_predict.h"
@@ -112,8 +113,28 @@ void vk_record_test_counts_get(vk_record_test_counts *out) {
 }
 #endif
 
+static uint64_t g_dyn_input_rev = 1;
+static totk_dyn_memo g_dyn_memo;
+
+static inline int state_blend_eq(const blend_st *a, const blend_st *b) {
+    return a->target == b->target && a->src_rgb == b->src_rgb && a->dst_rgb == b->dst_rgb &&
+           a->src_a == b->src_a && a->dst_a == b->dst_a && a->eq_rgb == b->eq_rgb && a->eq_a == b->eq_a;
+}
+static inline int state_color_eq(const color_st *a, const color_st *b) {
+    return a->blend_en == b->blend_en && a->logic_op == b->logic_op && a->alpha_func == b->alpha_func;
+}
+static inline int state_poly_eq(const poly_st *a, const poly_st *b) {
+    return a->cull == b->cull && a->front == b->front && a->mode == b->mode && a->offset_en == b->offset_en;
+}
+static inline int state_ds_eq(const ds_st *a, const ds_st *b) {
+    return a->dt == b->dt && a->dw == b->dw && a->df == b->df && a->st == b->st &&
+           a->sf_f == b->sf_f && a->sf_b == b->sf_b && a->fail_f == b->fail_f &&
+           a->zfail_f == b->zfail_f && a->zpass_f == b->zpass_f &&
+           a->fail_b == b->fail_b && a->zfail_b == b->zfail_b && a->zpass_b == b->zpass_b;
+}
+
 static void state_reset(void) {
-    g_pipe_dirty = 1;
+    g_pipe_dirty = 1; g_dyn_input_rev++;
     vk_stage_sig_invalidate(0x3fu);
     for (int b = 0; b < 2; b++) for (int st = 0; st < 6; st++) g_driver_revision[b][st]++;
     memset(&S, 0, sizeof S);
@@ -1670,7 +1691,7 @@ static int begin_rendering_inner(int draw_tail) {
     }
     vkCmdBeginRendering(cb, &ri);
     totk_ft_count(FT_COUNT_PASSES, 1);
-    R.open = 1; g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; g_stat_passes++; R.draws0 = g_stat_draws; pass_inputs_reset(); g_pops.disabled_at_start = S.render_disabled;
+    R.open = 1; g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; g_dyn_input_rev++; g_stat_passes++; R.draws0 = g_stat_draws; pass_inputs_reset(); g_pops.disabled_at_start = S.render_disabled;
     pso_life_pass_write(1);
     g_overlay_scene_dirty = 1;
     if (vk_fg_extract_active) fg_extract_pass_begin((R.cleared & 255u) |
@@ -5404,49 +5425,70 @@ static int quad_indirect_convert(VkBuffer ind_buf, VkDeviceSize ind_off, VkBuffe
     *out_buf = sb; *out_off = so + 32;
     return 1;
 }
-static void dynamic_state(VkCommandBuffer cb, int prim) {
-    /* everything the draw sets dynamically, compared with what this command buffer last set (unchanged: nothing issued) */
-    vk_record_dynamic D;
-    memset(&D, 0, sizeof D);
+static void dynamic_state_pack(vk_record_dynamic *out, int prim) {
+    memset(out, 0, sizeof *out);
     float vx = S.has_vp ? S.vp[0][0] : 0, vy = S.has_vp ? S.vp[0][1] : 0, vw = S.has_vp ? S.vp[0][2] : (float)R.w, vh = S.has_vp ? S.vp[0][3] : (float)R.h;
     if (g_ui_aspect_on) vk_ui_aspect_viewport(&g_ui_aspect, &vx, &vy, &vw, &vh);   /* TOTK_ASPECT: HUD quad about the canvas centre */
-    D.vp = (VkViewport){vx, vy + vh, vw, -vh, S.dr[0], S.dr[1]};
-    if (D.vp.minDepth < 0) D.vp.minDepth = 0; if (D.vp.maxDepth > 1) D.vp.maxDepth = 1;
+    out->vp = (VkViewport){vx, vy + vh, vw, -vh, S.dr[0], S.dr[1]};
+    if (out->vp.minDepth < 0) out->vp.minDepth = 0; if (out->vp.maxDepth > 1) out->vp.maxDepth = 1;
     int32_t x0 = 0, y0 = 0, x1 = (int32_t)R.w, y1 = (int32_t)R.h;
     if (S.has_sc) { x0 = MAXV(0, S.sc.x); y0 = MAXV(0, S.sc.y); x1 = MINV(x1, S.sc.x + S.sc.w); y1 = MINV(y1, S.sc.y + S.sc.h); }
     if (g_ui_aspect_on && S.has_sc) {   /* the pane's clip follows its squeezed content */
         vk_ui_aspect_rect(&g_ui_aspect, &x0, &y0, &x1, &y1);
         x0 = MAXV(0, x0); y0 = MAXV(0, y0); x1 = MINV(x1, (int32_t)R.w); y1 = MINV(y1, (int32_t)R.h);
     }
-    D.sc = (VkRect2D){{x0, y0}, {(uint32_t)MAXV(0, x1 - x0), (uint32_t)MAXV(0, y1 - y0)}};
+    out->sc = (VkRect2D){{x0, y0}, {(uint32_t)MAXV(0, x1 - x0), (uint32_t)MAXV(0, y1 - y0)}};
     if (R.native) {
         float sx = (float)R.host_w/R.native_w, sy = (float)R.host_h/R.native_h;
-        D.vp.x *= sx; D.vp.width *= sx; D.vp.y *= sy; D.vp.height *= sy;
-        D.sc = native_rect(D.sc);
+        out->vp.x *= sx; out->vp.width *= sx; out->vp.y *= sy; out->vp.height *= sy;
+        out->sc = native_rect(out->sc);
     }
-    D.bias_en = (S.poly.offset_en & 4) != 0; D.bias[0] = S.po.units; D.bias[1] = S.po.clamp; D.bias[2] = S.po.factor;
+    out->bias_en = (S.poly.offset_en & 4) != 0; out->bias[0] = S.po.units; out->bias[1] = S.po.clamp; out->bias[2] = S.po.factor;
     if (R.dfmt == VK_FORMAT_D16_UNORM && d16tie_on()) {   /* see d16tie_on */
-        if (!D.bias_en) { D.bias[0] = D.bias[1] = D.bias[2] = 0; D.bias_en = 1; }
-        D.bias[0] += D16_NUDGE_UNITS;
+        if (!out->bias_en) { out->bias[0] = out->bias[1] = out->bias[2] = 0; out->bias_en = 1; }
+        out->bias[0] += D16_NUDGE_UNITS;
     }
-    memcpy(D.blend, S.blend_color, sizeof D.blend);
-    for (int f = 0; f < 2; f++) { D.cmask[f] = S.st_vmask[f]; D.wmask[f] = S.st_wmask[f]; D.ref[f] = S.st_ref[f]; }
+    memcpy(out->blend, S.blend_color, sizeof out->blend);
+    for (int f = 0; f < 2; f++) { out->cmask[f] = S.st_vmask[f]; out->wmask[f] = S.st_wmask[f]; out->ref[f] = S.st_ref[f]; }
     static int flip = -1; if (flip < 0) { const char *e = getenv("TOTK_VK_WINDING_FLIP"); flip = e && atoi(e); }
-    D.cull = S.poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : S.poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
-    D.front = ((S.poly.front == NVN_FRONT_FACE_CCW) != (flip != 0)) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
-    D.topo = topology(prim);
+    out->cull = S.poly.cull == NVN_FACE_FRONT ? VK_CULL_MODE_FRONT_BIT : S.poly.cull == NVN_FACE_BACK ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE;
+    out->front = ((S.poly.front == NVN_FRONT_FACE_CCW) != (flip != 0)) ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE;
+    out->topo = topology(prim);
     int has_d = R.dfmt != VK_FORMAT_UNDEFINED, has_s = R.sfmt != VK_FORMAT_UNDEFINED;
-    D.dt = has_d && S.ds.dt; D.dw = has_d && S.ds.dw; D.dc = vk_compare(S.ds.df); D.st = has_s && S.ds.st;
-    D.sop[0][0] = vk_stencil_op(S.ds.fail_f); D.sop[0][1] = vk_stencil_op(S.ds.zpass_f); D.sop[0][2] = vk_stencil_op(S.ds.zfail_f); D.sop[0][3] = vk_compare(S.ds.sf_f);
-    D.sop[1][0] = vk_stencil_op(S.ds.fail_b); D.sop[1][1] = vk_stencil_op(S.ds.zpass_b); D.sop[1][2] = vk_stencil_op(S.ds.zfail_b); D.sop[1][3] = vk_compare(S.ds.sf_b);
-    D.restart = prim == 3 || prim == 5;
+    out->dt = has_d && S.ds.dt; out->dw = has_d && S.ds.dw; out->dc = vk_compare(S.ds.df); out->st = has_s && S.ds.st;
+    out->sop[0][0] = vk_stencil_op(S.ds.fail_f); out->sop[0][1] = vk_stencil_op(S.ds.zpass_f); out->sop[0][2] = vk_stencil_op(S.ds.zfail_f); out->sop[0][3] = vk_compare(S.ds.sf_f);
+    out->sop[1][0] = vk_stencil_op(S.ds.fail_b); out->sop[1][1] = vk_stencil_op(S.ds.zpass_b); out->sop[1][2] = vk_stencil_op(S.ds.zfail_b); out->sop[1][3] = vk_compare(S.ds.sf_b);
+    out->restart = prim == 3 || prim == 5;
+}
+
+static void dynamic_state(VkCommandBuffer cb, int prim) {
+    /* everything the draw sets dynamically, compared with what this command buffer last set (unchanged: nothing issued) */
+    vk_record_dynamic D;
+    int use_memo = totk_vk_state_fast_on() && !g_ui_aspect_on;
+    if (use_memo) {
+        totk_dyn_rpass_key rk = {R.w, R.h, R.host_w, R.host_h, R.native_w, R.native_h, (int32_t)R.dfmt, (int32_t)R.sfmt, R.native, 0};
+        int d16_tie = R.dfmt == VK_FORMAT_D16_UNORM && d16tie_on();
+        int32_t pk = (int32_t)(((uint32_t)topology(prim) << 1) | (uint32_t)(prim == 3 || prim == 5));
+        if (!totk_dyn_memo_get(&g_dyn_memo, g_dyn_input_rev, &rk, d16_tie, pk, &D, sizeof D)) {
+            dynamic_state_pack(&D, prim);
+            totk_dyn_memo_put(&g_dyn_memo, g_dyn_input_rev, &rk, d16_tie, pk, &D, sizeof D);
+        }
+    } else {
+        dynamic_state_pack(&D, prim);
+        g_dyn_memo.last_seq = 0;
+    }
     if (g_record_draw) { g_record_draw->dynamic = D; return; }
     if (vk_fg_extract_active && FGX.record) FGX.record->draw.dynamic = D;
     static __typeof__(D) last;
     static int dynoff = -1; if (dynoff < 0) dynoff = vk_off("dyn");
-    if (!dynoff && !g_dyn_dirty && !memcmp(&D, &last, sizeof D)) return;
+    if (use_memo && !dynoff && !g_dyn_dirty && g_dyn_memo.last_seq == g_dyn_memo.seq) return;
+    if (!dynoff && !g_dyn_dirty && !memcmp(&D, &last, sizeof D)) {
+        if (use_memo) g_dyn_memo.last_seq = g_dyn_memo.seq;
+        return;
+    }
     int all = g_dyn_dirty || dynoff; g_dyn_dirty = 0;
     vk_record_dynamic_emit(cb, &D, &last, all);
+    if (use_memo) g_dyn_memo.last_seq = g_dyn_memo.seq;
 }
 /* Every stage's writable aliases precede any read-only preparation/capture. Repeated bindings still publish
    producer invalidations: unchanged addresses do not mean unchanged GPU contents. Only mapping lookup is reusable. */
@@ -6919,7 +6961,10 @@ void vk_draw_exec(uint32_t op, const void *a) {
                 g_stat_inpass_barriers++;
             }   /* the next draw reopens the pass (load) */
             break; }
-        case OP_SCISSOR: S.sc = *(const p_scissor *)a; S.has_sc = 1; break;
+        case OP_SCISSOR: {
+            const p_scissor *ns = a;
+            if (!S.has_sc || memcmp(&S.sc, ns, sizeof S.sc) != 0) { S.sc = *ns; S.has_sc = 1; g_dyn_input_rev++; }
+            break; }
         case OP_BIND_PROGRAM: {
             const p_bind_program *b = a;
             if (bind_stage_programs(S.prog, b)) {
@@ -6930,17 +6975,23 @@ void vk_draw_exec(uint32_t op, const void *a) {
             break;
         }
         case OP_BIND_STATE: {
-            const p_bind_state *b = a; blend_st bs;
-            if (b->kind >= 0 && b->kind < 5) g_pipe_dirty = 1;
+            const p_bind_state *b = a; blend_st bs; int fast = totk_vk_state_fast_on(), ch = !fast;
             if (vk_fg_extract_active && (b->kind == 2 || b->kind == 5)) fg_extract_state_change(1);
             switch (b->kind) {
-                case 0: memcpy(&bs, b->bytes, sizeof bs); S.blend[bs.target & 7] = bs; break;
-                case 1: memcpy(&S.color, b->bytes, sizeof S.color); break;
-                case 2: memcpy(&S.chmask, b->bytes, sizeof S.chmask); break;
-                case 3: memcpy(&S.ms, b->bytes, sizeof S.ms); break;
-                case 4: memcpy(&S.poly, b->bytes, sizeof S.poly); break;
-                case 5: memcpy(&S.ds, b->bytes, sizeof S.ds); break;
+                case 0: { memcpy(&bs, b->bytes, sizeof bs);
+                    if (!fast || !state_blend_eq(&S.blend[bs.target & 7], &bs)) { S.blend[bs.target & 7] = bs; ch = 1; } break; }
+                case 1: { color_st cs; memcpy(&cs, b->bytes, sizeof cs);
+                    if (!fast || !state_color_eq(&S.color, &cs)) { S.color = cs; ch = 1; } break; }
+                case 2: { chmask_st cm; memcpy(&cm, b->bytes, sizeof cm);
+                    if (!fast || S.chmask.mask != cm.mask) { S.chmask = cm; ch = 1; } break; }
+                case 3: { ms_st ms; memcpy(&ms, b->bytes, sizeof ms);
+                    if (!fast || memcmp(&S.ms, &ms, sizeof ms)) { S.ms = ms; ch = 1; } break; }
+                case 4: { poly_st po; memcpy(&po, b->bytes, sizeof po);
+                    if (!state_poly_eq(&S.poly, &po)) { S.poly = po; ch = 1; g_dyn_input_rev++; } break; }
+                case 5: { ds_st ds; memcpy(&ds, b->bytes, sizeof ds);
+                    if (!state_ds_eq(&S.ds, &ds)) { S.ds = ds; ch = 1; g_dyn_input_rev++; } break; }
             }
+            if (b->kind >= 0 && b->kind < 5 && totk_state_dirty_gate(ch)) g_pipe_dirty = 1;
             if (vk_fg_extract_active && R.open) {
                 if (b->kind == 2 || FGX.pass.depth_write != (unsigned)(R.dfmt != VK_FORMAT_UNDEFINED && S.ds.dt && S.ds.dw))
                     fg_pass_guard_invalidate(&FGX.guard);
@@ -6949,11 +7000,17 @@ void vk_draw_exec(uint32_t op, const void *a) {
             break;
         }
         case OP_BIND_VATTR: { const p_bind_vattr *b = a; if (b->n >= 0 && b->n <= 16) {
-            int changed = !vk_record_enabled() || S.nattr != b->n || memcmp(S.attr, b->st, 4 * (size_t)b->n);
-            memcpy(S.attr, b->st, 4 * (size_t)b->n); S.nattr = b->n; g_pipe_dirty = 1;
+            int fast = totk_vk_state_fast_on();
+            int exact_ch = S.nattr != b->n || memcmp(S.attr, b->st, 4 * (size_t)b->n);
+            int changed = !vk_record_enabled() || exact_ch;
+            if (!fast || exact_ch) { memcpy(S.attr, b->st, 4 * (size_t)b->n); S.nattr = b->n; g_pipe_dirty = 1; }
             if (changed) vk_stage_sig_invalidate(1u << 0);
         } break; }
-        case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; if (b->n >= 0 && b->n <= 16) { memcpy(S.stream, b->st, 8 * (size_t)b->n); S.nstream = b->n; g_pipe_dirty = 1; } break; }
+        case OP_BIND_VSTREAM: { const p_bind_vstream *b = a; if (b->n >= 0 && b->n <= 16) {
+            if (!totk_vk_state_fast_on() || S.nstream != b->n || memcmp(S.stream, b->st, 8 * (size_t)b->n)) {
+                memcpy(S.stream, b->st, 8 * (size_t)b->n); S.nstream = b->n; g_pipe_dirty = 1;
+            }
+        } break; }
         case OP_BIND_VBUF: { const p_bind_vbuf *b = a; if (b->first >= 0 && b->first + b->n <= 16) memcpy(&S.vbuf[b->first], b->r, sizeof *b->r * (size_t)b->n); break; }
         case OP_BIND_UBO: { const p_bind_buf *b = a; if (b->stage >= 0 && b->stage < 6 && b->index >= 0 && b->index < 16) {
             p_bind_buf *old = &S.ubo[b->stage][b->index];
@@ -6977,6 +7034,8 @@ void vk_draw_exec(uint32_t op, const void *a) {
         } break; }
         case OP_BIND_TEX: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) {
             int changed = memcmp(&S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n) || b->first + b->n > S.tex_hi[b->stage];
+            if (totk_vk_state_fast_on() && !changed && vk_record_enabled() &&
+                !(vk_native_ui_enabled() && vk_native_descriptor_revision())) break;
             if (vk_fg_extract_active && R.open && changed) fg_extract_state_change(1);
             if (vk_record_enabled() && changed) g_record_bind_revision[b->stage]++;
             int signature_changed = !vk_record_enabled();
@@ -6988,36 +7047,48 @@ void vk_draw_exec(uint32_t op, const void *a) {
             if (signature_changed) vk_stage_sig_invalidate(1u << b->stage);
         } break; }
         case OP_BIND_SAMP: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) {
-            if (vk_record_enabled() && memcmp(&S.samp[b->stage][b->first], b->h, 8 * (size_t)b->n)) g_record_bind_revision[b->stage]++;
+            int ch = memcmp(&S.samp[b->stage][b->first], b->h, 8 * (size_t)b->n) != 0;
+            if (totk_vk_state_fast_on() && !ch) break;
+            if (vk_record_enabled() && ch) g_record_bind_revision[b->stage]++;
             for (int i = 0; i < b->n; i++) if ((uint32_t)S.samp[b->stage][b->first + i] != (uint32_t)b->h[i]) { g_driver_revision[1][b->stage]++; break; }
             memcpy(&S.samp[b->stage][b->first], b->h, 8 * (size_t)b->n);
         } break; }
         case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 32) {
-            if (vk_fg_extract_active && R.open && memcmp(&S.img[b->stage][b->first], b->h, 8 * (size_t)b->n))
-                fg_extract_state_change(1);
-            if (vk_record_enabled() && memcmp(&S.img[b->stage][b->first], b->h, 8 * (size_t)b->n)) g_record_bind_revision[b->stage]++;
+            int ch = memcmp(&S.img[b->stage][b->first], b->h, 8 * (size_t)b->n) != 0;
+            if (totk_vk_state_fast_on() && !ch && !(vk_native_ui_enabled() && vk_native_descriptor_revision())) break;
+            if (vk_fg_extract_active && R.open && ch) fg_extract_state_change(1);
+            if (vk_record_enabled() && ch) g_record_bind_revision[b->stage]++;
             memcpy(&S.img[b->stage][b->first], b->h, 8 * (size_t)b->n);
             if (vk_native_ui_enabled() && vk_native_descriptor_revision()) native_bound_update(b->stage,1,b->first,b->n);
         } break; }
-        case OP_STENCIL: { const p_stencil *b = a; for (int f = 0; f < 2; f++) if (b->face & (1 << f)) { if (b->which == 0) S.st_vmask[f] = (uint32_t)b->value_mask; else if (b->which == 1) S.st_wmask[f] = (uint32_t)b->mask; else S.st_ref[f] = (uint32_t)b->ref; } break; }
-        case OP_POLY_OFFSET: S.po = *(const p_poly_offset *)a; break;
+        case OP_STENCIL: { const p_stencil *b = a; int ch = 0;
+            for (int f = 0; f < 2; f++) if (b->face & (1 << f)) {
+                uint32_t v = b->which == 0 ? (uint32_t)b->value_mask : b->which == 1 ? (uint32_t)b->mask : (uint32_t)b->ref;
+                uint32_t *dst = b->which == 0 ? &S.st_vmask[f] : b->which == 1 ? &S.st_wmask[f] : &S.st_ref[f];
+                if (*dst != v) { *dst = v; ch = 1; }
+            }
+            if (ch) g_dyn_input_rev++;
+            break; }
+        case OP_POLY_OFFSET: if (memcmp(&S.po, a, sizeof S.po) != 0) { S.po = *(const p_poly_offset *)a; g_dyn_input_rev++; } break;
         case OP_VIEWPORTS: { const p_viewports *b = a;
+            int vp0_ch = b->first == 0 && b->n > 0 && (!S.has_vp || memcmp(S.vp[0], b->v[0], 16) != 0);
             if (vk_fg_extract_active && R.open && FGX.pass.camera_addr && b->first == 0 && b->n > 0 &&
                 memcmp(S.vp[0], b->v[0], 16)) {
                 fg_pass_guard_invalidate(&FGX.guard);
             }
-            if (g_overlay_enabled && b->first == 0 && b->n > 0 &&
-                (!S.has_vp || memcmp(S.vp[0], b->v[0], 16))) g_overlay_scene_dirty = 1;
+            if (g_overlay_enabled && vp0_ch) g_overlay_scene_dirty = 1;
             for (int i = 0; i < b->n && b->first + i < 16; i++) memcpy(S.vp[b->first + i], b->v[i], 16);
+            if (!S.has_vp || vp0_ch) g_dyn_input_rev++;
             S.has_vp = 1; break;
         }
         case OP_DEPTH_RANGE: {
-            const p_depth_range *b=a;
+            const p_depth_range *b=a; float dr[2] = {b->n, b->f};
             if (vk_fg_extract_active && R.open && (S.dr[0]!=b->n || S.dr[1]!=b->f))
                 fg_pass_guard_invalidate(&FGX.guard);
-            S.dr[0]=b->n; S.dr[1]=b->f; break;
+            if (memcmp(S.dr, dr, sizeof dr) != 0) { S.dr[0]=b->n; S.dr[1]=b->f; g_dyn_input_rev++; }
+            break;
         }
-        case OP_BLEND_COLOR: memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); break;
+        case OP_BLEND_COLOR: if (memcmp(S.blend_color, ((const p_blend_color *)a)->rgba, 16) != 0) { memcpy(S.blend_color, ((const p_blend_color *)a)->rgba, 16); g_dyn_input_rev++; } break;
         case OP_ALPHA_REF: {
             float value=((const p_alpha_ref *)a)->value;
             value=fminf(1,fmaxf(0,value));
@@ -7026,7 +7097,7 @@ void vk_draw_exec(uint32_t op, const void *a) {
         }
         case OP_COPY_STRIDE: S.copy_stride = ((const p_copy_stride *)a)->stride; break;
         case OP_COPY_IMAGE_STRIDE: S.copy_image_stride = ((const p_copy_stride *)a)->stride; break;
-        case OP_DEPTH_CLAMP: S.depth_clamp = ((const p_flag *)a)->value; g_pipe_dirty = 1; break;
+        case OP_DEPTH_CLAMP: { int v = ((const p_flag *)a)->value; if (!totk_vk_state_fast_on() || S.depth_clamp != v) { S.depth_clamp = v; if (!TOTK_STATE_FAST_FAULT(29)) g_pipe_dirty = 1; } break; }
         case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value;
             if (PD.active) { char l[64]; pd_note(l, snprintf(l, sizeof l, "  render enable %d\n", !S.render_disabled)); }
             break;
