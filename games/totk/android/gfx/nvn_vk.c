@@ -1454,6 +1454,8 @@ int vk_record_resolve(const vk_record_spans *s, uint64_t a, uint64_t n, VkBuffer
 int vk_resolve_for(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off, uint64_t *avail, int kind) { return VK_REC_VALUE(VK_REC_RESOLVE, resolve_local(addr, len, buf, off, avail, kind)); }
 int vk_resolve_span(uint64_t addr, VkBuffer *buf, uint64_t *off, uint64_t *avail) { return vk_resolve_for(addr, 1, buf, off, avail, VK_LOOKUP_OTHER); }
 int vk_resolve(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off) { return vk_resolve_for(addr, len, buf, off, NULL, VK_LOOKUP_OTHER); }
+uint64_t vk_span_gen(void) { return atomic_load_explicit(&g_span_gen, memory_order_acquire); }
+int vk_lookup_stats_on(void) { return g_lookup_stats; }
 static uint64_t lag_va_threshold(uint64_t addr, uint64_t physical, uint64_t edge) {
     if (edge <= physical) { uint64_t d = physical - edge; return d <= addr ? addr - d : 0; }
     uint64_t d = edge - physical;

@@ -384,6 +384,8 @@ int vk_resolve_span(uint64_t addr, VkBuffer *buf, uint64_t *off, uint64_t *avail
 enum { VK_LOOKUP_UBO, VK_LOOKUP_VERTEX, VK_LOOKUP_TOUCH, VK_LOOKUP_OTHER };
 int vk_resolve_for(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off, uint64_t *avail, int kind);   /* same lookup, tagged for TOTK_VK_LOOKUP_STATS */
 void vk_lookup_stats(uint64_t frame);   /* present's 300-frame report; no work unless enabled at device init */
+uint64_t vk_span_gen(void);
+int vk_lookup_stats_on(void);
 
 /* ---------- submissions (nvn_vk.c) ----------
    A submission records into two command buffers of its ring slot: "pre" (texture uploads, image creation barriers:

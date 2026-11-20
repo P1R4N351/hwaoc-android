@@ -25,6 +25,7 @@
 #include "../../runtime/frame_timeline.h"
 #include "vk_ktgl_memo.h"
 #include "vk_dsc_fast.h"
+#include "vk_vb_fast.h"
 static int ktglmemo_draw_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "../../runtime/present_clock.h"
 #include "../../runtime/present_predict.h"
@@ -4679,7 +4680,9 @@ static void alpha_desc(VkDescriptorBufferInfo *out) {
 enum { DS_CACHE = 2048 };
 static struct { uint64_t sub, hash[2]; VkDescriptorSetLayout dsl; size_t n; VkDescriptorSet set; } g_dsc[DS_CACHE];
 static struct { uint64_t sub; VkPipelineLayout layout; VkDescriptorSet set; } g_bound_set[2][6];   /* [graphics, compute][set index] */
-static void descriptor_unbind(void) { memset(g_bound_set, 0, sizeof g_bound_set); }
+static totk_vb_state g_vb_state;
+static totk_vbuf_memo4 g_vbuf_memo4;
+static void descriptor_unbind(void) { memset(g_bound_set, 0, sizeof g_bound_set); totk_vb_invalidate(&g_vb_state); }
 /* A fresh walker secondary inherits no pipeline, dynamic or descriptor state.
  * Descriptor contents remain cached; only binding-elision state is invalid. */
 void vk_draw_secondary_reset(void) {
@@ -5810,10 +5813,75 @@ static int fg_terminal_geometry_read(unsigned role,unsigned stream,uint64_t addr
     } else *out=source;
     return 1;
 }
-static int draw_indirect_buffers(VkCommandBuffer cb) {
+_Static_assert(ZERO_BINDING == 16 && ZERO_BINDING < TOTK_VB_SLOTS, "vb slots");
+static int vbuf_resolve_fast(uint64_t addr, VkBuffer *b, uint64_t *o, uint64_t *avail, int vbfast) {
+    if (!addr) return 0;
+    if (!vbfast || vk_lookup_stats_on()) return vk_resolve_for(addr, 1, b, o, avail, VK_LOOKUP_VERTEX);
+    uint64_t gen = vk_span_gen(), bu = 0;
+    if (totk_vbuf_memo4_find(&g_vbuf_memo4, gen, addr, &bu, o, avail)) { *b = (VkBuffer)(uintptr_t)bu; return 1; }
+    if (!vk_resolve_for(addr, 1, b, o, avail, VK_LOOKUP_VERTEX)) return 0;
+    totk_vbuf_memo4_put(&g_vbuf_memo4, gen, addr, (uint64_t)(uintptr_t)*b, *o, *avail);
+    return 1;
+}
+static void zero_vbo_sub(uint64_t sub, int vbfast, VkBuffer *zb, VkDeviceSize *zo) {
+    if (vbfast && g_vb_state.zero_sub == sub && g_vb_state.zero_buf_u) {
+        *zb = (VkBuffer)(uintptr_t)g_vb_state.zero_buf_u; *zo = (VkDeviceSize)g_vb_state.zero_off; return;
+    }
+    void *z = vk_transient(64, 16, zb, zo); memset(z, 0, 64);
+    if (vbfast) { g_vb_state.zero_sub = sub; g_vb_state.zero_buf_u = (uint64_t)(uintptr_t)*zb; g_vb_state.zero_off = (uint64_t)*zo; }
+}
+static inline void ib_bind_fast(VkCommandBuffer cb, uint64_t sub, VkBuffer ib, VkDeviceSize io, VkIndexType it, int vbfast) {
+    if (!vbfast || totk_ib_need_bind(&g_vb_state, (uint64_t)(uintptr_t)cb, sub, (uint64_t)(uintptr_t)ib, (uint64_t)io, (uint32_t)it))
+        vkCmdBindIndexBuffer(cb, ib, io, it);
+}
+static void draw_bind_vbufs(VkCommandBuffer cb, vk_shader *sh, uint64_t sub, int vbfast, vk_record_draw *replay, int owned_geometry) {
+    VkBuffer vb[TOTK_VB_SLOTS]; VkDeviceSize vo[TOTK_VB_SLOTS], vsz[TOTK_VB_SLOTS], vst[TOTK_VB_SLOTS];
+    uint32_t used = 0, dirty = 0;
+    for (int a = 0; a < 16; a++) if ((sh->vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) used |= 1u << (S.attr[a].stream & 15);
+    for (uint32_t s = 0; s < 16; s++) if (used >> s & 1) {
+        VkBuffer b; uint64_t o, avail; uint64_t sz = S.vbuf[s].size ? S.vbuf[s].size : 16;
+        int pool_backed = vbuf_resolve_fast(S.vbuf[s].address, &b, &o, &avail, vbfast);
+        if (!pool_backed) { VkDeviceSize to; void *z = vk_transient(64, 16, &b, &to); memset(z, 0, 64); o = to; sz = 64; RED(4, "vertex stream %u is not in a memory pool", s); }
+        else sz = MINV(sz, avail);
+        VkDescriptorBufferInfo frozen;
+        int lag_frozen = S.vbuf[s].address && vk_lag_read(S.vbuf[s].address, sz, 16, &frozen, VK_LAG_VERTEX);
+        if (lag_frozen) { b = frozen.buffer; o = frozen.offset; }
+        VkDeviceSize stride = S.stream[s].stride;
+        if (g_load_override && s == g_load_stream) {
+            b = g_load_geometry.buffer; o = g_load_geometry.offset; sz = g_load_geometry.range; stride = g_load_vertex_bytes;
+        }
+        vb[s] = b; vo[s] = o; vsz[s] = sz; vst[s] = stride;
+        if (!vbfast) { VK_REC_DO(VK_REC_CMD, vkCmdBindVertexBuffers2(cb, s, 1, &vb[s], &vo[s], &vsz[s], &vst[s])); }
+        else if (totk_vb_slot_changed(&g_vb_state, (uint64_t)(uintptr_t)cb, sub, s, (uint64_t)(uintptr_t)b, o, sz, stride)) dirty |= 1u << s;
+        if (replay) {
+            replay->vertex_mask |= 1u << s; replay->vertex[s].buffer = b; replay->vertex[s].offset = o; replay->vertex[s].size = sz; replay->vertex[s].stride = stride;
+            if (owned_geometry && fg_terminal_geometry_read(VK_FG_TERMINAL_INPUT_VERTEX, s,
+                    pool_backed || lag_frozen ? S.vbuf[s].address : 0, (VkDescriptorBufferInfo){b, o, sz}, &frozen)) {
+                replay->vertex[s].buffer = frozen.buffer; replay->vertex[s].offset = frozen.offset;
+            }
+        }
+    }
+    if (sh->vin_mask) {
+        VkBuffer zb; VkDeviceSize zo; zero_vbo_sub(sub, vbfast, &zb, &zo);
+        vb[ZERO_BINDING] = zb; vo[ZERO_BINDING] = zo; vsz[ZERO_BINDING] = 64; vst[ZERO_BINDING] = 0;
+        if (!vbfast) { VK_REC_DO(VK_REC_CMD, vkCmdBindVertexBuffers2(cb, ZERO_BINDING, 1, &zb, &zo, &vsz[ZERO_BINDING], &vst[ZERO_BINDING])); }
+        else if (totk_vb_slot_changed(&g_vb_state, (uint64_t)(uintptr_t)cb, sub, ZERO_BINDING, (uint64_t)(uintptr_t)zb, (uint64_t)zo, 64u, 0u)) dirty |= 1u << ZERO_BINDING;
+        if (replay) {
+            replay->vertex_mask |= 1u << ZERO_BINDING; replay->vertex[ZERO_BINDING].buffer = zb; replay->vertex[ZERO_BINDING].offset = zo;
+            replay->vertex[ZERO_BINDING].size = 64; replay->vertex[ZERO_BINDING].stride = 0;
+        }
+    }
+    if (vbfast && dirty) {
+        VK_REC_DO(VK_REC_CMD, for (uint32_t m = dirty; m;) {
+            uint32_t first = 0, cnt = 0; totk_vb_next_run(&m, &first, &cnt);
+            vkCmdBindVertexBuffers2(cb, first, cnt, &vb[first], &vo[first], &vsz[first], &vst[first]);
+        });
+    }
+}
+static int draw_indirect_buffers(VkCommandBuffer cb, uint64_t sub, int vbfast) {
     if (g_indirect.quad_ib) {
         VK_REC_DO(VK_REC_CMD,
-            vkCmdBindIndexBuffer(cb, g_quad_ib, 0, VK_INDEX_TYPE_UINT32);
+            ib_bind_fast(cb, sub, g_quad_ib, 0, VK_INDEX_TYPE_UINT32, vbfast);
             vkCmdDrawIndexedIndirect(cb, g_indirect.cmd_buf, g_indirect.cmd_off, 1, 20));
         totk_ft_count(FT_COUNT_DRAWS, 1);
         return 1;
@@ -5831,14 +5899,14 @@ static int draw_indirect_buffers(VkCommandBuffer cb) {
     }
     VkIndexType it = g_indirect.itype == 0 ? VK_INDEX_TYPE_UINT8_EXT : g_indirect.itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
     VK_REC_DO(VK_REC_CMD,
-        vkCmdBindIndexBuffer(cb, ib, io, it);
+        ib_bind_fast(cb, sub, ib, io, it, vbfast);
         vkCmdDrawIndexedIndirect(cb, g_indirect.cmd_buf, g_indirect.cmd_off, 1, 20));
     totk_ft_count(FT_COUNT_DRAWS, 1);
     return 1;
 }
 static inline __attribute__((always_inline)) int draw_buffers(VkCommandBuffer cb, vk_shader *sh, const p_draw *dw, const p_draw_idx *di, int prim, uint32_t count, uint32_t inst, uint32_t base_inst) {
     if (g_record_draw) return record_buffers(sh, dw, di, prim, count, inst, base_inst);
-    VkBuffer vb[17]; VkDeviceSize vo[17], vsz[17], vst[17]; uint32_t used = 0;
+    int vbfast = totk_vk_vb_filter_on(); uint64_t sub = vk_submit_serial();
     vk_record_draw *replay = vk_fg_extract_active && FGX.record ? &FGX.record->draw : NULL;
     int owned_geometry=replay && FGX.record->final &&
         atomic_load_explicit(&vk_fg_terminal_owned_active,memory_order_relaxed);
@@ -5851,48 +5919,13 @@ static inline __attribute__((always_inline)) int draw_buffers(VkCommandBuffer cb
         replay->first = dw && prim != 7 ? (uint32_t)dw->first : 0;
         replay->vertex_offset = dw ? dw->first : di->base_vertex;
     }
-    for (int a = 0; a < 16; a++) if ((sh->vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) used |= 1u << (S.attr[a].stream & 15);
-    for (uint32_t s = 0; s < 16; s++) if (used >> s & 1) {
-        VkBuffer b; uint64_t o, avail; uint64_t sz = S.vbuf[s].size ? S.vbuf[s].size : 16;
-        int pool_backed=S.vbuf[s].address && vk_resolve_for(S.vbuf[s].address, 1, &b, &o, &avail, VK_LOOKUP_VERTEX);
-        if (!pool_backed) { VkDeviceSize to; void *z = vk_transient(64, 16, &b, &to); memset(z, 0, 64); o = to; sz = 64; RED(4, "vertex stream %u is not in a memory pool", s); }
-        else sz = MINV(sz, avail);
-        VkDescriptorBufferInfo frozen;
-        int lag_frozen=S.vbuf[s].address && vk_lag_read(S.vbuf[s].address, sz, 16, &frozen, VK_LAG_VERTEX);
-        if (lag_frozen) { b = frozen.buffer; o = frozen.offset; }
-        VkDeviceSize stride = S.stream[s].stride;
-        if (g_load_override && s == g_load_stream) {
-            b = g_load_geometry.buffer; o = g_load_geometry.offset; sz = g_load_geometry.range;
-            stride = g_load_vertex_bytes;
-        }
-        vb[0] = b; vo[0] = o; vsz[0] = sz; vst[0] = stride;
-        VK_REC_DO(VK_REC_CMD, vkCmdBindVertexBuffers2(cb, s, 1, vb, vo, vsz, vst));
-        if (replay) {
-            replay->vertex_mask |= 1u << s;
-            replay->vertex[s].buffer = b; replay->vertex[s].offset = o;
-            replay->vertex[s].size = sz; replay->vertex[s].stride = stride;
-            if (owned_geometry && fg_terminal_geometry_read(VK_FG_TERMINAL_INPUT_VERTEX,s,
-                    pool_backed || lag_frozen ? S.vbuf[s].address : 0,(VkDescriptorBufferInfo){b,o,sz},&frozen)) {
-                replay->vertex[s].buffer=frozen.buffer; replay->vertex[s].offset=frozen.offset;
-            }
-        }
-    }
-    if (sh->vin_mask) {
-        VkBuffer zb; VkDeviceSize zo; void *z = vk_transient(64, 16, &zb, &zo); memset(z, 0, 64);
-        VkDeviceSize zs = 64, zst = 0;
-        VK_REC_DO(VK_REC_CMD, vkCmdBindVertexBuffers2(cb, ZERO_BINDING, 1, &zb, &zo, &zs, &zst));
-        if (replay) {
-            replay->vertex_mask |= 1u << ZERO_BINDING;
-            replay->vertex[ZERO_BINDING].buffer = zb; replay->vertex[ZERO_BINDING].offset = zo;
-            replay->vertex[ZERO_BINDING].size = zs; replay->vertex[ZERO_BINDING].stride = zst;
-        }
-    }
+    draw_bind_vbufs(cb, sh, sub, vbfast, replay, owned_geometry);
     VK_REC_DO(VK_REC_S, vk_occlusion_draw(cb)); pd_pre_draw(cb);
-    if (g_indirect.on) return draw_indirect_buffers(cb);
+    if (g_indirect.on) return draw_indirect_buffers(cb, sub, vbfast);
     if (dw && prim == 7) {
         if (count >= 4) {
             quad_indices(count / 4);
-            VK_REC_DO(VK_REC_CMD, vkCmdBindIndexBuffer(cb, g_quad_ib, 0, VK_INDEX_TYPE_UINT32); vkCmdDrawIndexed(cb, (count / 4) * 6, inst, 0, dw->first, base_inst));
+            VK_REC_DO(VK_REC_CMD, ib_bind_fast(cb, sub, g_quad_ib, 0, VK_INDEX_TYPE_UINT32, vbfast); vkCmdDrawIndexed(cb, (count / 4) * 6, inst, 0, dw->first, base_inst));
             if (replay) {
                 replay->index = g_quad_ib; replay->index_type = VK_INDEX_TYPE_UINT32;
                 if (owned_geometry) {
@@ -5974,7 +6007,7 @@ static inline __attribute__((always_inline)) int draw_buffers(VkCommandBuffer cb
                 }
             }
         }
-        VK_REC_DO(VK_REC_CMD, vkCmdBindIndexBuffer(cb, ib, io, it); vkCmdDrawIndexed(cb, count, inst, 0, di->base_vertex, base_inst));
+        VK_REC_DO(VK_REC_CMD, ib_bind_fast(cb, sub, ib, io, it, vbfast); vkCmdDrawIndexed(cb, count, inst, 0, di->base_vertex, base_inst));
         totk_ft_count(FT_COUNT_DRAWS, 1);
     }
     return 1;
@@ -9317,7 +9350,7 @@ static int pres_ahb_draw(int i, const tex_t *t, vk_tex *x, int srgb, uint32_t ow
     /* Ownership becomes foreign only after this command stream is submitted;
      * private prepare/cancel must retain the slot's actual prior GPU state. */
     if (!prepared_cb) vk_native_gpu_end(cb,scope);
-    g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; memset(g_bound_set[0], 0, sizeof g_bound_set[0]);
+    g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; memset(g_bound_set[0], 0, sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state);
     return 1;
 fail:
     LOGV("window present: source cannot be sampled for AHB blit; using copy"); atomic_store(&g_ahb_off, 1); return 0;
@@ -10144,7 +10177,7 @@ generated_enqueue:
     /* The real image was submitted before any generated commands. Classify
        this whole ticket range before the real-frame endpoint is sealed. */
     vk_fg_synthetic_range(real->fence+1,b->fence);
-    g_bound_pipe=VK_NULL_HANDLE; g_dyn_dirty=1; memset(g_bound_set[0],0,sizeof g_bound_set[0]);
+    g_bound_pipe=VK_NULL_HANDLE; g_dyn_dirty=1; memset(g_bound_set[0],0,sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state);
     pthread_mutex_lock(&g_win_mu);
     if (g_pres_trace || g_pres_slot_diag || g_pres_timeline) b->enqueue_ns=host_now_ns();
     pres_queue_locked(i); pthread_cond_signal(&g_pres_cv);
@@ -10265,7 +10298,7 @@ void vk_fg_slot_boundary(void) {
         g_slot_prepared_count--;
         atomic_store_explicit(&vk_fg_slot_boundary_active,g_slot_prepared_count!=0,memory_order_relaxed);
         pthread_mutex_unlock(&g_win_mu);
-        g_bound_pipe=VK_NULL_HANDLE; g_dyn_dirty=1; memset(g_bound_set[0],0,sizeof g_bound_set[0]);
+        g_bound_pipe=VK_NULL_HANDLE; g_dyn_dirty=1; memset(g_bound_set[0],0,sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state);
     }
     uint64_t elapsed=host_now_ns()-g_slot_dispatch_stats.first_ns;
     if (elapsed>=UINT64_C(1000000000)) {
@@ -10474,7 +10507,7 @@ static void present_window(const tex_t *t, double period, const int crop[4]) {
         if (vk_post_run(post_cb,(unsigned)i,source,post_result ? post.w : vk_tex_width(x,0),post_result ? post.h : vk_tex_height(x,0),cx,cy,w,h,
                         (uint32_t)dw,(uint32_t)dh,srgb,&post)) {
             post_result = &post; cx = cy = 0; w = post.w; h = post.h;
-            g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; memset(g_bound_set[0],0,sizeof g_bound_set[0]);
+            g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; memset(g_bound_set[0],0,sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state);
         }
         vk_native_gpu_end(post_cb,scope);
     }

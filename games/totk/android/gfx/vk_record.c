@@ -3,6 +3,7 @@
 #include "nvn_dirty.h"
 #include "nvn_hmap.h"
 #include "vk_shader_fast.h"
+#include "vk_dsc_fast.h"
 #include "../../runtime/frame_timeline.h"
 #include <errno.h>
 #include <sys/mman.h>
@@ -969,14 +970,17 @@ static VkDescriptorSet descriptor_set(rec_context *c, rec_job *j, VkDescriptorSe
     }
     uint64_t h[2] = {0xcbf29ce484222325ull, 0x6a09e667f3bcc909ull};
     const uint8_t *bytes = (const uint8_t *)info; size_t n = count * sizeof *info, i = 0;
-    for (; i + 8 <= n; i += 8) {
-        uint64_t word; memcpy(&word, bytes + i, 8);
-        h[0] = (h[0] ^ word) * 0x9e3779b97f4a7c15ull; h[0] ^= h[0] >> 32;
-        h[1] = (h[1] + word) * 0xc2b2ae3d27d4eb4full; h[1] = h[1] << 31 | h[1] >> 33;
-    }
-    for (; i < n; i++) {
-        h[0] = (h[0] ^ bytes[i]) * 0x100000001b3ull;
-        h[1] = (h[1] + bytes[i]) * 0xc2b2ae3d27d4eb4full; h[1] = h[1] << 31 | h[1] >> 33;
+    if (totk_vk_dsc_fast_on()) totk_hash_dual64(bytes, n, h);
+    else {
+        for (; i + 8 <= n; i += 8) {
+            uint64_t word; memcpy(&word, bytes + i, 8);
+            h[0] = (h[0] ^ word) * 0x9e3779b97f4a7c15ull; h[0] ^= h[0] >> 32;
+            h[1] = (h[1] + word) * 0xc2b2ae3d27d4eb4full; h[1] = h[1] << 31 | h[1] >> 33;
+        }
+        for (; i < n; i++) {
+            h[0] = (h[0] ^ bytes[i]) * 0x100000001b3ull;
+            h[1] = (h[1] + bytes[i]) * 0xc2b2ae3d27d4eb4full; h[1] = h[1] << 31 | h[1] >> 33;
+        }
     }
     /* Four-way payload buckets retain guard collection identity per actual ticket and frozen span version. */
     unsigned at = (unsigned)(h[0] % (REC_DS_CACHE / 4)) * 4, replace = at;
