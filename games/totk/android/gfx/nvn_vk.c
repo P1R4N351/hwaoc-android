@@ -17,6 +17,8 @@
    The driver is the system one, or the file named by TOTK_VK_DRIVER (a Turnip build, android/gfx/vk_load.h). */
 #include <malloc.h>
 #include "vk_int.h"
+#include "vk_ktgl_memo.h"
+static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "vk_record.h"
 #include "vk_framegen.h"
 #include "vk_framegen_qcom.h"
@@ -1247,15 +1249,40 @@ static void span_rebuild(void) {   /* caller holds g_pool_mu */
 static int span_hint_matches(const span_seg_t *seg, int nseg, uintptr_t a, int hint) {
     return hint > 0 && hint < nseg && seg[hint - 1].lo <= a && a < seg[hint].lo;
 }
+static int span_bsearch(const span_seg_t *seg, int nseg, uintptr_t a) {
+    int lo = 0, hi = nseg;
+    while (lo < hi) { int m = (lo + hi) >> 1; if (seg[m].lo <= a) lo = m + 1; else hi = m; }
+    return lo;
+}
 static const span_t *span_best(const span_t *s, const span_seg_t *seg, int nseg, uintptr_t a, uintptr_t b, int *hint) {
     int lo = hint ? *hint : 0;
     if (!hint || !span_hint_matches(seg, nseg, a, lo)) {
-        int hi = nseg; lo = 0; while (lo < hi) { int m = (lo + hi) >> 1; if (seg[m].lo <= a) lo = m + 1; else hi = m; }
+        lo = span_bsearch(seg, nseg, a);
         if (hint) *hint = lo;
     }
     if (!lo || seg[lo - 1].best < 0) return NULL;
     const span_t *best = &s[seg[lo - 1].best];
     return best->end >= b ? best : NULL;   /* if the furthest span containing a cannot reach b, none can */
+}
+static const span_t *span_best_fast(const span_t *s, const span_seg_t *seg, int nseg, uintptr_t a, uintptr_t b, int hints[64], int *was_hit) {
+    if (!hints) {
+        if (was_hit) *was_hit = 0;
+        return span_best(s, seg, nseg, a, b, NULL);
+    }
+    int *w = &hints[vk_ktgl_hint_set4(a)];
+    int lo = 0;
+    if (span_hint_matches(seg, nseg, a, w[0])) lo = w[0];
+    else if (span_hint_matches(seg, nseg, a, w[1])) lo = w[1];
+    else if (span_hint_matches(seg, nseg, a, w[2])) lo = w[2];
+    else if (span_hint_matches(seg, nseg, a, w[3])) lo = w[3];
+    if (was_hit) *was_hit = lo != 0;
+    if (!lo) {
+        lo = span_bsearch(seg, nseg, a);
+        w[3] = w[2]; w[2] = w[1]; w[1] = w[0]; w[0] = lo;
+    }
+    if (!lo || seg[lo - 1].best < 0) return NULL;
+    const span_t *best = &s[seg[lo - 1].best];
+    return best->end >= b ? best : NULL;
 }
 static int span_linear(void) { static int linear = -1; if (linear < 0) linear = vk_off("span"); return linear; }
 /* Which buffer holds [addr, addr + len), and how many bytes from addr it holds (*avail): caller holds g_pool_mu. */
@@ -1318,11 +1345,22 @@ static int resolve_local(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *o
         t->nseg = g_nseg; memset(t->hint, 0, sizeof t->hint); t->gen = atomic_load_explicit(&g_span_gen, memory_order_relaxed);
         pthread_mutex_unlock(&g_pool_mu);
     }
-    /* One last-segment hint thrashes between a draw's uniform, vertex and index pools: 69% of resolve_local samples at
-       Lookout Landing were still in the binary search. Keep page-hashed hints; collisions only fall back to that search. */
-    unsigned h = (unsigned)((a >> 12) ^ (a >> 24)) & (SPAN_HINTS - 1);
-    if (g_lookup_stats) lookup_count(kind, t, a, t->hint[h], 1);
-    const span_t *best = span_best(t->s, t->seg, t->nseg, a, b, &t->hint[h]);
+    const span_t *best;
+    if (ktglmemo_nvn_on()) {
+        int was_hit = 0;
+        best = span_best_fast(t->s, t->seg, t->nseg, a, b, t->hint, &was_hit);
+        if (g_lookup_stats) {
+            if ((uintptr_t)pthread_self() == atomic_load_explicit(&g_lookup_thread, memory_order_relaxed)) {
+                atomic_fetch_add_explicit(&g_lookup_calls[kind], 1, memory_order_relaxed);
+                atomic_fetch_add_explicit(&g_lookup_tests, 1, memory_order_relaxed);
+                if (was_hit) atomic_fetch_add_explicit(&g_lookup_hits, 1, memory_order_relaxed);
+            }
+        }
+    } else {
+        unsigned h = (unsigned)((a >> 12) ^ (a >> 24)) & (SPAN_HINTS - 1);
+        if (g_lookup_stats) lookup_count(kind, t, a, t->hint[h], 1);
+        best = span_best(t->s, t->seg, t->nseg, a, b, &t->hint[h]);
+    }
     if (!best) return 0;
     *buf = best->buf; *off = best->off + (a - best->lo); if (avail) *avail = best->end - a;
     return 1;
@@ -1405,6 +1443,7 @@ static int record_resolve_inner(const vk_record_spans *s, uint64_t a, uint64_t n
     if (a + n < a) return 0;
     const span_t *best = NULL;
     if (s->linear) { for (int i = 0; i < s->count; i++) if (s->span[i].lo <= a && s->span[i].end >= a + n) { best = &s->span[i]; break; } }
+    else if (ktglmemo_nvn_on()) { best = span_best_fast(s->span, s->segment, s->segments, a, a + n, hints, NULL); }
     else { unsigned h = (unsigned)((a >> 12) ^ (a >> 24)) & 63u; best = span_best(s->span, s->segment, s->segments, a, a + n, hints ? &hints[h] : NULL); }
     if (!best) return 0;
     *b = best->buf; *o = best->off + a - best->lo; if (available) *available = best->end - a; return 1;
@@ -1415,14 +1454,60 @@ int vk_record_resolve(const vk_record_spans *s, uint64_t a, uint64_t n, VkBuffer
 int vk_resolve_for(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off, uint64_t *avail, int kind) { return VK_REC_VALUE(VK_REC_RESOLVE, resolve_local(addr, len, buf, off, avail, kind)); }
 int vk_resolve_span(uint64_t addr, VkBuffer *buf, uint64_t *off, uint64_t *avail) { return vk_resolve_for(addr, 1, buf, off, avail, VK_LOOKUP_OTHER); }
 int vk_resolve(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off) { return vk_resolve_for(addr, len, buf, off, NULL, VK_LOOKUP_OTHER); }
+static uint64_t lag_va_threshold(uint64_t addr, uint64_t physical, uint64_t edge) {
+    if (edge <= physical) { uint64_t d = physical - edge; return d <= addr ? addr - d : 0; }
+    uint64_t d = edge - physical;
+    return d <= UINT64_MAX - addr ? addr + d : UINT64_MAX;
+}
+static void lag_iv_scan(uint64_t addr, uint64_t *iv_lo_out, uint64_t *iv_hi_out, uint64_t *end_va_out, uint8_t *bounded_out) {
+    uint64_t iv_lo = 0, iv_hi = UINT64_MAX, physical = addr, end_va = UINT64_MAX;
+    uint8_t bounded = 0;
+    for (int i = 0; i < g_nalias; i++) {
+        uint64_t va = g_alias[i].va, end = g_alias[i].end;
+        if (addr >= va && addr < end) {
+            if (va > iv_lo) iv_lo = va;
+            if (end < iv_hi) iv_hi = end;
+            physical = g_alias[i].owner->base + g_alias[i].off + (addr - va);
+            end_va = end; bounded = 1; break;
+        }
+        if (end <= addr) { if (end > iv_lo) iv_lo = end; }
+        else if (va > addr && va < iv_hi) iv_hi = va;
+    }
+    for (int i = 0; i < g_npool; i++) {
+        const pool_ent *p = g_pools[i];
+        if ((p->kind != K_OWN && p->kind != K_VIEW) || p->hi <= p->lo) continue;
+        if (p->hi <= physical) { uint64_t t = lag_va_threshold(addr, physical, p->hi); if (t > iv_lo) iv_lo = t; }
+        else if (p->lo > physical) { uint64_t t = lag_va_threshold(addr, physical, p->lo); if (t < iv_hi) iv_hi = t; }
+        else {
+            uint64_t tlo = lag_va_threshold(addr, physical, p->lo);
+            uint64_t thi = lag_va_threshold(addr, physical, p->hi);
+            if (tlo > iv_lo) iv_lo = tlo;
+            if (thi < iv_hi) iv_hi = thi;
+            if (!bounded || thi < end_va) { end_va = thi; bounded = 1; }
+        }
+    }
+    *iv_lo_out = iv_lo; *iv_hi_out = iv_hi; *end_va_out = end_va; *bounded_out = bounded;
+}
 uint64_t vk_lag_bound(uint64_t addr, uint64_t limit) {
+    static __thread vk_lag_iv_cache T_lag_iv;
     enum { NB = 1024 };
     static struct { uint64_t addr, gen, bound; } cache[NB];
-    uint64_t gen = atomic_load_explicit(&g_span_gen, memory_order_acquire);
+    uint64_t gen = atomic_load_explicit(&g_span_gen, memory_order_acquire), bound = UINT64_MAX;
+    if (ktglmemo_nvn_on()) {
+        if (vk_lag_iv_get(&T_lag_iv, gen, addr, &bound)) return limit < bound ? limit : bound;
+        uint64_t iv_lo = 0, iv_hi = 0, end_va = UINT64_MAX; uint8_t bounded = 0;
+        pthread_mutex_lock(&g_pool_mu);
+        lag_iv_scan(addr, &iv_lo, &iv_hi, &end_va, &bounded);
+        gen = atomic_load_explicit(&g_span_gen, memory_order_relaxed);
+        pthread_mutex_unlock(&g_pool_mu);
+        if (iv_lo <= addr && addr < iv_hi) vk_lag_iv_put(&T_lag_iv, gen, iv_lo, iv_hi, end_va, bounded);
+        bound = bounded ? (end_va - addr) : UINT64_MAX;
+        return limit < bound ? limit : bound;
+    }
     unsigned h = (unsigned)((addr >> 4) ^ (addr >> 20)) % NB;
     if (cache[h].addr == addr && cache[h].gen == gen) return limit < cache[h].bound ? limit : cache[h].bound;
     pthread_mutex_lock(&g_pool_mu);
-    uint64_t physical = addr, bound = UINT64_MAX;
+    uint64_t physical = addr;
     for (int i = 0; i < g_nalias; i++) if (addr >= g_alias[i].va && addr < g_alias[i].end) {
         physical = g_alias[i].owner->base + g_alias[i].off + addr - g_alias[i].va;
         bound = g_alias[i].end - addr; break;

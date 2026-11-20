@@ -4,8 +4,10 @@
    recorded value: none of the 280,723 packets in 1.4.3's English voice streams has it, while a fan dub's encoder
    writes 0 into every packet (all 186,758 of the PKG PT-BR dub, which decode without error). Those are not checked. */
 #include "runtime.h"
+#include "opus_fast.h"
 #include <opus.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -15,19 +17,41 @@
 /* A fixed-capacity host table could terminate a running game when another
  * stream opened. Allocate one stable node per live decoder and free it at
  * Finalize; growing the registry must not move a decoder another thread uses.
- * Registry -> decoder is the lock order. A caller acquires the decoder lock
- * before dropping the registry lock, so Finalize cannot free a borrowed node.
- * Different streams can still decode in parallel. */
+ * Lock order: bucket (or legacy registry lock) -> decoder->use_lock -> stats_lock.
+ * Calling decode/finalize across distinct hash buckets never contends globally. */
 typedef struct Decoder {
     const void *guest;
     OpusDecoder *dec;
     int rate, channels;
-    struct Decoder *next;
+    struct Decoder *next, *prev, *bnext;
     pthread_mutex_t use_lock;
 } Decoder;
+typedef struct {
+    pthread_mutex_t mu;
+    Decoder *head;
+} OpusBucket;
 static Decoder *decoders;
 static size_t decoder_count, decoder_high_water, decoder_created, decoder_finalized, decoder_reinitialized;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t stats_lock = PTHREAD_MUTEX_INITIALIZER;
+static OpusBucket g_buckets[OPUS_BUCKETS];
+static opus_fmt_cache g_fmt_cache;
+static pthread_once_t g_buckets_once = PTHREAD_ONCE_INIT;
+static _Atomic int g_opus_fast = -1;
+static void buckets_init(void) {
+    for (unsigned i = 0; i < OPUS_BUCKETS; i++) pthread_mutex_init(&g_buckets[i].mu, NULL);
+}
+static int opus_fast_on(void) {
+    int f = atomic_load_explicit(&g_opus_fast, memory_order_acquire);
+    if (f < 0) {
+        pthread_once(&g_buckets_once, buckets_init);
+        const char *v = getenv("TOTK_OPUS_FAST");
+        int want = !(v && v[0] == '0' && !v[1]);
+        atomic_store_explicit(&g_opus_fast, want, memory_order_release);
+        return want;
+    }
+    return f;
+}
 
 static void decoder_stats(const char *event) { /* registry lock held */
     fprintf(stderr, "[totk-audio] Opus %s: active %zu, peak %zu, created %zu, finalized %zu, reinitialized %zu (dynamic registry)\n",
@@ -38,11 +62,21 @@ static int codec_trace(void) {
     return v && *v && strcmp(v, "0");
 }
 static Decoder *acquire(const void *guest) {
-    pthread_mutex_lock(&lock);
-    Decoder *d = decoders;
-    while (d && d->guest != guest) d = d->next;
-    if (d) pthread_mutex_lock(&d->use_lock);
-    pthread_mutex_unlock(&lock);
+    Decoder *d;
+    if (opus_fast_on()) {
+        OpusBucket *b = &g_buckets[opus_ptr_bucket(guest)];
+        pthread_mutex_lock(&b->mu);
+        d = b->head;
+        while (d && d->guest != guest) d = d->bnext;
+        if (d) pthread_mutex_lock(&d->use_lock);
+        pthread_mutex_unlock(&b->mu);
+    } else {
+        pthread_mutex_lock(&lock);
+        d = decoders;
+        while (d && d->guest != guest) d = d->next;
+        if (d) pthread_mutex_lock(&d->use_lock);
+        pthread_mutex_unlock(&lock);
+    }
     if (!d) runtime_fail("unknown hardware Opus decoder");
     return d;
 }
@@ -54,62 +88,82 @@ static size_t work_size(int rate, int channels, int option) {
     (void)option; if (!valid_format(rate, channels)) return 0;
     return (size_t)opus_decoder_get_size(channels) + 0x1000;   /* host keeps the state; the game's buffer is reserved but unused */
 }
+static void list_link(Decoder *d) {
+    d->next = decoders; d->prev = NULL;
+    if (decoders) decoders->prev = d;
+    decoders = d; decoder_count++; decoder_created++;
+    int peak = decoder_count > decoder_high_water;
+    if (peak) decoder_high_water = decoder_count;
+    if (codec_trace() || (peak && decoder_count > 64 && (decoder_count == 65 || !(decoder_count & (decoder_count - 1)))))
+        decoder_stats("initialize");
+}
+static void list_unlink(Decoder *d) {
+    if (d->prev) d->prev->next = d->next; else decoders = d->next;
+    if (d->next) d->next->prev = d->prev;
+    d->prev = d->next = NULL; decoder_count--; decoder_finalized++;
+    if (codec_trace()) decoder_stats("finalize");
+}
+static void reinit_stats(const void *guest) {
+    decoder_reinitialized++;
+    if (decoder_reinitialized == 1)
+        fprintf(stderr, "[totk] hardware Opus decoder %p initialized again without Finalize: its slot is reused (logged once)\n", guest);
+    if (codec_trace()) decoder_stats("reinitialize");
+}
 static unsigned initialize(void *guest, int rate, int channels, void *work, size_t size, int option) {
     (void)work; (void)option;
     if (!guest || !valid_format(rate, channels) || size < work_size(rate, channels, 0)) return R_INVALID;
     Decoder *d = calloc(1, sizeof *d);
     if (!d) runtime_fail("hardware Opus decoder allocation");
-    int err = 0;
-    d->dec = opus_decoder_create(rate, channels, &err);
-    if (!d->dec || err != OPUS_OK) {
-        if (d->dec) opus_decoder_destroy(d->dec);
-        free(d); runtime_fail("libopus decoder creation");
-    }
-    if (pthread_mutex_init(&d->use_lock, NULL)) {
-        opus_decoder_destroy(d->dec); free(d); runtime_fail("hardware Opus decoder mutex");
-    }
+    int err = 0; d->dec = opus_decoder_create(rate, channels, &err);
+    if (!d->dec || err != OPUS_OK) { if (d->dec) opus_decoder_destroy(d->dec); free(d); runtime_fail("libopus decoder creation"); }
+    if (pthread_mutex_init(&d->use_lock, NULL)) { opus_decoder_destroy(d->dec); free(d); runtime_fail("hardware Opus decoder mutex"); }
     d->guest = guest; d->rate = rate; d->channels = channels;
-    pthread_mutex_lock(&lock);
-    for (Decoder *old = decoders; old; old = old->next) if (old->guest == guest) {
-        /* Preserve #18: the game may initialize the same object without
-         * Finalize. Replace its state, waiting for any in-flight operation,
-         * rather than adding another entry for the same guest object. */
+    int fast = opus_fast_on();
+    OpusBucket *b = fast ? &g_buckets[opus_ptr_bucket(guest)] : NULL;
+    pthread_mutex_t *rmu = fast ? &b->mu : &lock;
+    pthread_mutex_lock(rmu);
+    Decoder *old = fast ? b->head : decoders;
+    while (old && old->guest != guest) old = fast ? old->bnext : old->next;
+    if (old) {
         pthread_mutex_lock(&old->use_lock);
-        OpusDecoder *previous = old->dec;
-        old->dec = d->dec; old->rate = rate; old->channels = channels;
-        decoder_reinitialized++;
-        if (decoder_reinitialized == 1)
-            fprintf(stderr, "[totk] hardware Opus decoder %p initialized again without Finalize: its slot is reused (logged once)\n", guest);
-        if (codec_trace()) decoder_stats("reinitialize");
-        pthread_mutex_unlock(&lock);
+        OpusDecoder *previous = old->dec; old->dec = d->dec; old->rate = rate; old->channels = channels;
+        if (fast) opus_fmt_put(&g_fmt_cache, guest, rate, channels);
+        pthread_mutex_lock(&stats_lock); reinit_stats(guest); pthread_mutex_unlock(&stats_lock);
+        pthread_mutex_unlock(rmu);
         opus_decoder_destroy(previous); release(old);
-        pthread_mutex_destroy(&d->use_lock); free(d);
-        return 0;
+        pthread_mutex_destroy(&d->use_lock); free(d); return 0;
     }
-    d->next = decoders; decoders = d; decoder_count++; decoder_created++;
-    int peak = decoder_count > decoder_high_water;
-    if (peak) decoder_high_water = decoder_count;
-    /* past the old fixed 64: at 65 and every power of two, so a leak shows in a normal log */
-    if (codec_trace() || (peak && decoder_count > 64 && (decoder_count == 65 || !(decoder_count & (decoder_count - 1)))))
-        decoder_stats("initialize");
-    pthread_mutex_unlock(&lock);
+    if (fast) { d->bnext = b->head; b->head = d; opus_fmt_put(&g_fmt_cache, guest, rate, channels); }
+    pthread_mutex_lock(&stats_lock); list_link(d); pthread_mutex_unlock(&stats_lock);
+    pthread_mutex_unlock(rmu);
     return 0;
 }
 static void finalize(void *guest) {
-    pthread_mutex_lock(&lock);
-    Decoder **slot = &decoders;
-    while (*slot && (*slot)->guest != guest) slot = &(*slot)->next;
+    int fast = opus_fast_on();
+    OpusBucket *b = fast ? &g_buckets[opus_ptr_bucket(guest)] : NULL;
+    pthread_mutex_t *rmu = fast ? &b->mu : &lock;
+    pthread_mutex_lock(rmu);
+    Decoder **slot = fast ? &b->head : &decoders;
+    while (*slot && (*slot)->guest != guest) slot = fast ? &(*slot)->bnext : &(*slot)->next;
     Decoder *d = *slot;
-    if (!d) { pthread_mutex_unlock(&lock); runtime_fail("unknown hardware Opus decoder"); }
+    if (!d) { pthread_mutex_unlock(rmu); runtime_fail("unknown hardware Opus decoder"); }
     pthread_mutex_lock(&d->use_lock);
-    *slot = d->next; decoder_count--; decoder_finalized++;
-    if (codec_trace()) decoder_stats("finalize");
-    pthread_mutex_unlock(&lock);
+    if (fast) { *slot = d->bnext; opus_fmt_del(&g_fmt_cache, guest); }
+    pthread_mutex_lock(&stats_lock); list_unlink(d); pthread_mutex_unlock(&stats_lock);
+    pthread_mutex_unlock(rmu);
     opus_decoder_destroy(d->dec);
     release(d); pthread_mutex_destroy(&d->use_lock); free(d);
 }
-static int sample_rate(const void *guest) { Decoder *d = acquire(guest); int v = d->rate; release(d); return v; }
-static int channel_count(const void *guest) { Decoder *d = acquire(guest); int v = d->channels; release(d); return v; }
+static int sample_rate(const void *guest) {
+    int r = 0;
+    if (opus_fast_on() && opus_fmt_get(&g_fmt_cache, guest, &r, NULL)) return r;
+    Decoder *d = acquire(guest); r = d->rate; release(d); return r;
+}
+static int channel_count(const void *guest) {
+    int c = 0;
+    if (opus_fast_on() && opus_fmt_get(&g_fmt_cache, guest, NULL, &c)) return c;
+    Decoder *d = acquire(guest); c = d->channels; release(d); return c;
+}
 static unsigned reset(void *guest) {
     Decoder *d = acquire(guest); int ok = opus_decoder_ctl(d->dec, OPUS_RESET_STATE); release(d);
     return ok == OPUS_OK ? 0 : R_INVALID;

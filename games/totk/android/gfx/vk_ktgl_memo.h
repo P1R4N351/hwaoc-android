@@ -159,4 +159,83 @@ static inline void vk_cs_memo_put(vk_cs_memo *m, const void *cs, uint64_t pipeli
     if (slot < 0) { slot = s->next & (VK_KTGL_CS_WAYS - 1); s->next = (uint8_t)(s->next + 1); }
     s->ways[slot] = (vk_cs_slot){cs, pipeline, layout};
 }
+
+typedef struct {
+    uint64_t lo, hi, end_va;
+    uint8_t bounded;
+} vk_lag_iv;
+
+enum { VK_LAG_IV_MRU = 4, VK_LAG_IV_SETS = 128, VK_LAG_IV_WAYS = 2 };
+
+typedef struct {
+    uint64_t mru_gen;
+    vk_lag_iv mru[VK_LAG_IV_MRU];
+    uint64_t set_gen[VK_LAG_IV_SETS];
+    uint8_t hand[VK_LAG_IV_SETS];
+    vk_lag_iv ways[VK_LAG_IV_SETS][VK_LAG_IV_WAYS];
+} vk_lag_iv_cache;
+
+static inline unsigned vk_lag_iv_set(uint64_t addr) {
+    uint64_t h = ((addr >> 20) ^ (addr >> 32)) * UINT64_C(0x9e3779b97f4a7c15);
+    return (unsigned)(h >> 57) & (VK_LAG_IV_SETS - 1);
+}
+
+static inline int vk_lag_iv_get(const vk_lag_iv_cache *c, uint64_t gen, uint64_t addr, uint64_t *bound_out) {
+    if (!c || !gen || !bound_out) return 0;
+    if (c->mru_gen == gen) {
+        for (int k = 0; k < VK_LAG_IV_MRU; k++) {
+            const vk_lag_iv *v = &c->mru[k];
+            if (v->hi > v->lo && addr >= v->lo && addr < v->hi) {
+                *bound_out = v->bounded ? (v->end_va - addr) : UINT64_MAX;
+                return 1;
+            }
+        }
+    }
+    unsigned s = vk_lag_iv_set(addr);
+    if (c->set_gen[s] != gen) return 0;
+    const vk_lag_iv *w = c->ways[s];
+    for (int k = 0; k < VK_LAG_IV_WAYS; k++) {
+        if (w[k].hi > w[k].lo && addr >= w[k].lo && addr < w[k].hi) {
+            *bound_out = w[k].bounded ? (w[k].end_va - addr) : UINT64_MAX;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static inline void vk_lag_iv_put(vk_lag_iv_cache *c, uint64_t gen, uint64_t lo, uint64_t hi, uint64_t end_va, uint8_t bounded) {
+    if (!c || !gen || hi <= lo) return;
+    vk_lag_iv entry = {lo, hi, end_va, bounded};
+    if (c->mru_gen != gen) {
+        for (int k = 0; k < VK_LAG_IV_MRU; k++) c->mru[k] = (vk_lag_iv){0};
+        c->mru_gen = gen;
+    } else if (c->mru[0].lo != lo || c->mru[0].hi != hi) {
+        for (int k = VK_LAG_IV_MRU - 1; k > 0; k--) c->mru[k] = c->mru[k - 1];
+    }
+    c->mru[0] = entry;
+    unsigned s = vk_lag_iv_set(lo);
+    if (c->set_gen[s] != gen) {
+        for (int k = 0; k < VK_LAG_IV_WAYS; k++) c->ways[s][k] = (vk_lag_iv){0};
+        c->set_gen[s] = gen;
+        c->hand[s] = 0;
+    }
+    for (int k = 0; k < VK_LAG_IV_WAYS; k++) {
+        if (c->ways[s][k].hi <= c->ways[s][k].lo || (c->ways[s][k].lo == lo && c->ways[s][k].hi == hi)) {
+            c->ways[s][k] = entry;
+            return;
+        }
+    }
+    unsigned victim = (unsigned)(c->hand[s]++ & (VK_LAG_IV_WAYS - 1));
+    c->ways[s][victim] = entry;
+}
+
+static inline unsigned vk_ktgl_hint_set4(uintptr_t a) {
+    uint64_t x = (uint64_t)(a >> 20) ^ (uint64_t)(a >> 28) ^ (uint64_t)(a >> 36);
+    return (unsigned)(((x * UINT64_C(0x9e3779b97f4a7c15)) >> 60) << 2);
+}
+
+static inline int vk_ktgl_hints_peek(int hints[64], const uint64_t *seg_lo, int nseg, uintptr_t a, size_t stride) {
+    /* NOTE: callers with typed structs invoke vk_ktgl_hints_lookup / put macros or helpers directly. */
+    (void)hints; (void)seg_lo; (void)nseg; (void)a; (void)stride; return 0;
+}
 #endif
