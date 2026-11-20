@@ -2,6 +2,7 @@
 #include "vk_record.h"
 #include "nvn_dirty.h"
 #include "nvn_hmap.h"
+#include "vk_shader_fast.h"
 #include "../../runtime/frame_timeline.h"
 #include <errno.h>
 #include <sys/mman.h>
@@ -916,8 +917,18 @@ static void project_guards(rec_job *j) {
 VkDescriptorUpdateTemplate vk_record_template(VkDescriptorSetLayout layout, const vk_record_descriptor *input, uint32_t count) {
     uint64_t start = __builtin_expect(vk_rec_timing_on, 0) ? host_now_ns() : 0; descriptor_templates++;
     static nvn_hmap templates = {.klen = sizeof layout};
+    static totk_tmpl_memo4 g_tmpl_memo4;
+    int fast = totk_vk_shader_fast_on();
+    if (fast) {
+        uint64_t hit = totk_tmpl_memo4_find(&g_tmpl_memo4, (uint64_t)(uintptr_t)layout);
+        if (hit) { if (start) descriptor_template_ns += host_now_ns() - start; return (VkDescriptorUpdateTemplate)(uintptr_t)hit; }
+    }
     VkDescriptorUpdateTemplate *found = nvn_hm_get(&templates, &layout);
-    if (found) { if (start) descriptor_template_ns += host_now_ns() - start; return *found; }
+    if (found) {
+        if (fast) totk_tmpl_memo4_put(&g_tmpl_memo4, (uint64_t)(uintptr_t)layout, (uint64_t)(uintptr_t)(*found));
+        if (start) descriptor_template_ns += host_now_ns() - start;
+        return *found;
+    }
     static VkDescriptorUpdateTemplateEntry *entries; static uint32_t capacity;
     if (count > capacity) { capacity = count + 16; entries = VK_REALLOC(entries, capacity * sizeof *entries); }
     uint32_t n = 0;
@@ -936,6 +947,7 @@ VkDescriptorUpdateTemplate vk_record_template(VkDescriptorSetLayout layout, cons
         .templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET, .descriptorSetLayout = layout};
     found = VK_MALLOC(sizeof *found); VKCHECK(vkCreateDescriptorUpdateTemplate(V.dev, &ci, NULL, found));
     nvn_hm_put(&templates, &layout, found);
+    if (fast) totk_tmpl_memo4_put(&g_tmpl_memo4, (uint64_t)(uintptr_t)layout, (uint64_t)(uintptr_t)(*found));
     if (start) descriptor_template_ns += host_now_ns() - start;
     return *found;
 }

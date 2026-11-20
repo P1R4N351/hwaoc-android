@@ -601,6 +601,9 @@ typedef struct vk_shader {
        reads that this vertex shader does not write added as (0, 0, 0, 1) (vk_vs_module_for). */
     uint32_t vout_mask, fin_mask; uint8_t fin_kind[32]; uint8_t io_known;
     struct vk_vfix *vfix;
+    struct vk_shader *alpha_memo[8];
+    uint64_t alpha_miss_epoch[8];
+    uint16_t alpha_ready_mask, alpha_miss_mask;
 } vk_shader;
 
 /* ---------- opt-in per-slot GPU pass profiler (vk_gpuprof.c) ---------- */

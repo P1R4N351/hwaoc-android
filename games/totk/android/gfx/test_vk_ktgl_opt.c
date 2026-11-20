@@ -8,6 +8,8 @@
 #include "test_vk_ktgl_opt_w5.h"
 #include "test_vk_ktgl_opt_w6.h"
 #include "test_vk_ktgl_opt_w7.h"
+#define TOTK_KTGL_OPT_TEST 1
+#include "test_vk_ktgl_opt_w8.h"
 #include "nvn_dirty.h"
 #include <assert.h>
 #include <stdint.h>
@@ -23,7 +25,7 @@ void mprotect_stats_record_success(void) {}
 void dm_wait_stats_record(const char *reason, uint64_t ns, const void *addr) { (void)reason; (void)ns; (void)addr; }
 
 static int g_fail;
-static int g_fault_mode;
+int g_fault_mode;
 
 #define EXPECT_EQ(msg, want, got) do {     long long w_ = (long long)(want), g_ = (long long)(got);     if (w_ != g_) { fprintf(stderr, "FAIL %-56s expected=%lld got=%lld\n", (msg), w_, g_); g_fail++; } } while (0)
 
@@ -263,6 +265,7 @@ int main(void) {
     if (run_ktgl_w5_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w6_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w7_tests(g_fault_mode) != 0) g_fail++;
+    if (run_ktgl_w8_tests(g_fault_mode) != 0) g_fail++;
     printf("ktglopttest: fault_mode=%d failures=%d\n", g_fault_mode, g_fail);
     return g_fail != 0;
 }

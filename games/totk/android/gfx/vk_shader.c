@@ -24,6 +24,7 @@
 #include "vk_seed_io.h"
 #include "vk_load_proof.h"
 #include "vk_ktgl_memo.h"
+#include "vk_shader_fast.h"
 #include "vk_subgroup.h"
 #include "vk_position.h"
 #include "vk_int_fold.h"
@@ -226,7 +227,7 @@ static int dep_ok(const answers_t *a, const char *kind, int slot, const char *wa
     else return 0;
     return !strcmp(have, want);
 }
-static int deps_match(const char *deps, const answers_t *a) {
+static int deps_match_slow(const char *deps, const answers_t *a) {
     char buf[4096]; snprintf(buf, sizeof buf, "%s", deps);
     for (char *save = NULL, *it = strtok_r(buf, ";", &save); it; it = strtok_r(NULL, ";", &save)) {
         char *colon = strchr(it, ':'), *eq = colon ? strchr(colon, '=') : NULL;
@@ -235,6 +236,15 @@ static int deps_match(const char *deps, const answers_t *a) {
         if (!dep_ok(a, it, atoi(colon + 1), eq + 1)) return 0;
     }
     return 1;
+}
+static int deps_match(const char *deps, const answers_t *a) {
+    if (!totk_vk_shader_fast_on()) return deps_match_slow(deps, a);
+    const char *p = deps; char kind[16], want[64]; int slot = 0, bad = 0;
+    while (totk_deps_next(&p, kind, &slot, want, &bad)) {
+        if (!dep_ok(a, kind, slot, want)) return 0;
+    }
+    if (bad == 2) return deps_match_slow(deps, a);
+    return bad ? 0 : 1;
 }
 
 /* ---------- shaders ---------- */
@@ -554,7 +564,17 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
 vk_shader *vk_shader_alpha(vk_shader *base, unsigned func) {
     if (!base || base->stage!=1 || !func || func==NVN_ALPHA_FUNC_ALWAYS) return base;
     if (func>NVN_ALPHA_FUNC_GEQUAL) return NULL;
-    return shader_load(base->key,base->early_tests | (int)(func<<1));
+    int fast = totk_vk_shader_fast_on() && func < 8;
+    if (fast) {
+        if (base->alpha_ready_mask & (1u << func)) return base->alpha_memo[func];
+        if ((base->alpha_miss_mask & (1u << func)) && base->alpha_miss_epoch[func] == vk_shader_xlate_epoch()) return NULL;
+    }
+    vk_shader *sh = shader_load(base->key, base->early_tests | (int)(func << 1));
+    if (fast) {
+        if (sh) { base->alpha_memo[func] = sh; base->alpha_ready_mask |= (uint16_t)(1u << func); }
+        else { base->alpha_miss_epoch[func] = vk_shader_xlate_epoch(); base->alpha_miss_mask |= (uint16_t)(1u << func); }
+    }
+    return sh;
 }
 /* Startup/replay only: exact persisted or program-known variant; shader/layout maps
    remain single-owner even though compute driver calls run on a worker. */
@@ -763,8 +783,13 @@ void vk_prog_prepare(const prog_t *p) {
 }
 void mtl_prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&g_progs_mu); nvn_hm_del(&g_progs, &p->serial); pthread_mutex_unlock(&g_progs_mu); }   /* the vk_prog leaks a little; programs are few */
 /* ---------- varyings a fragment shader reads that the vertex shader does not write (vk_varyings.h) ---------- */
-struct vk_vfix { uint32_t missing; uint8_t kind[32]; VkShaderModule mod; struct vk_vfix *next; };
+struct vk_vfix { uint32_t missing; uint64_t kind_pack; uint8_t kind[32]; VkShaderModule mod; struct vk_vfix *next; };
 static pthread_mutex_t g_vfix_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local totk_vfix_memo4 *t_vfix4;
+static totk_vfix_memo4 *vfix_tls(void) {
+    if (!t_vfix4) t_vfix4 = calloc(1, sizeof *t_vfix4);
+    return t_vfix4;
+}
 /* The vertex module as shader_load made it, again: read from the seed (seed IO keeps it in memory) with the same
    vertex-stage rewrites in the same order (position precision, NaN rules, 32-lane subgroups). Keep in step with
    shader_load. NULL on failure. */
@@ -786,11 +811,19 @@ VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
     if (!g_varying_fix || !vs || !fs || !vs->io_known || !fs->io_known) return vs ? vs->mod : VK_NULL_HANDLE;
     uint32_t missing = fs->fin_mask & ~vs->vout_mask;
     if (!missing) return vs->mod;
+    int fast = totk_vk_shader_fast_on(); uint64_t hit = 0;
+    totk_vfix_memo4 *tm = fast ? vfix_tls() : NULL;
+    if (tm && totk_vfix_memo4_find(tm, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs, &hit)) return (VkShaderModule)(uintptr_t)hit;
     uint8_t kind[32] = {0};
     for (int l = 0; l < 32; l++) if (missing >> l & 1) kind[l] = fs->fin_kind[l];
+    uint64_t kpack = totk_pack_vfix_kind(missing, kind);
     pthread_mutex_lock(&g_vfix_mu);
     for (struct vk_vfix *f = vs->vfix; f; f = f->next)
-        if (f->missing == missing && !memcmp(f->kind, kind, sizeof kind)) { VkShaderModule m = f->mod; pthread_mutex_unlock(&g_vfix_mu); return m; }
+        if (f->missing == missing && f->kind_pack == kpack) {
+            VkShaderModule m = f->mod; pthread_mutex_unlock(&g_vfix_mu);
+            if (tm) totk_vfix_memo4_put(tm, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs, (uint64_t)(uintptr_t)m);
+            return m;
+        }
     VkShaderModule mod = VK_NULL_HANDLE;
     size_t nw = 0, no = 0; uint32_t *w = vs_words_again(vs, &nw), *o = w ? vk_spirv_add_outputs(w, nw, missing, kind, &no) : NULL;
     if (o) {
@@ -798,14 +831,16 @@ VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
         if (vkCreateShaderModule(V.dev, &mci, NULL, &mod) != VK_SUCCESS) mod = VK_NULL_HANDLE;
     }
     free(w); free(o);
+    VkShaderModule out = mod ? mod : vs->mod;
     struct vk_vfix *f = calloc(1, sizeof *f);
-    if (f) { f->missing = missing; memcpy(f->kind, kind, sizeof kind); f->mod = mod ? mod : vs->mod; f->next = vs->vfix; vs->vfix = f; }
+    if (f) { f->missing = missing; f->kind_pack = kpack; memcpy(f->kind, kind, sizeof kind); f->mod = out; f->next = vs->vfix; vs->vfix = f; }
     pthread_mutex_unlock(&g_vfix_mu);
+    if (tm) totk_vfix_memo4_put(tm, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs, (uint64_t)(uintptr_t)out);
     static _Atomic unsigned logged;
     if (atomic_fetch_add(&logged, 1) < 40)
         LOGV("[varyings] vs %.16s + fs %.16s: the fragment shader reads location(s) %#x the vertex shader does not write; %s",
              vs->key, fs->key, missing, mod ? "added as (0, 0, 0, 1)" : "could not add them (old behaviour kept)");
-    return mod ? mod : vs->mod;
+    return out;
 }
 static void prog_sync_epoch(vk_prog *pr, uint64_t epoch) {
     if (pr->xlate_epoch == epoch) return;
@@ -1015,12 +1050,22 @@ static VkDescriptorSetLayout empty_dsl(void) {
 }
 VkPipelineLayout vk_layout_of(vk_shader *vs, vk_shader *fs) {
     static nvn_hmap layouts = {.klen = 16};
+    static totk_lay_memo4 g_lay_memo4;
+    int fast = totk_vk_shader_fast_on();
+    if (fast) {
+        uint64_t hit = totk_lay_memo4_find(&g_lay_memo4, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs);
+        if (hit) return (VkPipelineLayout)(uintptr_t)hit;
+    }
     void *k[2] = {vs, fs};
     VkPipelineLayout l = (VkPipelineLayout)nvn_hm_get(&layouts, k);
-    if (l) return l;
+    if (l) {
+        if (fast) totk_lay_memo4_put(&g_lay_memo4, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs, (uint64_t)(uintptr_t)l);
+        return l;
+    }
     VkDescriptorSetLayout sets[2] = {vs ? vs->dsl : empty_dsl(), fs ? fs->dsl : empty_dsl()};
     VkPipelineLayoutCreateInfo ci = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = fs ? 2 : 1, .pSetLayouts = sets};
     VKCHECK(vkCreatePipelineLayout(V.dev, &ci, NULL, &l));
     nvn_hm_put(&layouts, k, (void *)l);
+    if (fast) totk_lay_memo4_put(&g_lay_memo4, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs, (uint64_t)(uintptr_t)l);
     return l;
 }

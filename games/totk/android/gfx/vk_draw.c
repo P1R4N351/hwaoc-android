@@ -24,6 +24,7 @@
 #include "nvn_scan_budget.h"
 #include "../../runtime/frame_timeline.h"
 #include "vk_ktgl_memo.h"
+#include "vk_dsc_fast.h"
 static int ktglmemo_draw_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "../../runtime/present_clock.h"
 #include "../../runtime/present_predict.h"
@@ -4611,18 +4612,28 @@ static void zero_buffer(VkDescriptorBufferInfo *out, size_t size) {
    The transient bytes are immutable until slot retirement; the seal serial expires this pointer before slot reuse. */
 static void block_desc(int key, const void *data, size_t n, VkDescriptorBufferInfo *out) {
     static struct { uint64_t sub; size_t n; uint8_t *bytes; VkDescriptorBufferInfo d; } last[32];
+    static totk_blk_memo4 g_blk_memo4;
     uint64_t sub = vk_submit_serial();
     static int off = -1; if (off < 0) off = vk_off("block");
     if (!off && key >= 0 && key < 32 && last[key].sub == sub && last[key].n == n && !memcmp(last[key].bytes, data, n)) { *out = last[key].d; return; }
+    uint64_t h[2] = {0, 0}, rb = 0, ro = 0, rr = 0; uint8_t *rp = NULL;
+    int can = !off && totk_vk_dsc_fast_on() && key >= 0 && key < 32;
+    if (can && totk_blk_memo4_find(&g_blk_memo4, sub, key, data, n, &rb, &ro, &rr, &rp, h)) {
+        *out = (VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)rb, ro, rr};
+        last[key].bytes = rp; last[key].n = n; last[key].sub = sub; last[key].d = *out;
+        return;
+    }
     VkBuffer tb; VkDeviceSize to; uint8_t *p = vk_transient(n, V.props.limits.minUniformBufferOffsetAlignment, &tb, &to); memcpy(p, data, n);
     *out = (VkDescriptorBufferInfo){tb, to, n};
     if (key >= 0 && key < 32) { last[key].bytes = p; last[key].n = n; last[key].sub = sub; last[key].d = *out; }
+    if (can) totk_blk_memo4_put(&g_blk_memo4, sub, key, n, h, (uint64_t)(uintptr_t)tb, to, n, p);
 }
 /* Most draws use the same generated blocks. Check their semantic inputs before filling / comparing 1.4--2.5 KiB:
    bind hooks cover every bank input, while support dimensions and compute grid are checked here. On a changed input
    block_desc still compares the bytes, preserving reuse when several state changes cancel before the next draw. */
 static void generated_desc(int kind, int stage, const uint32_t grid[3], VkDescriptorBufferInfo *out) {
     static struct { uint64_t sub, revision; uint32_t w, h, grid[3]; VkDescriptorBufferInfo d; } last[13];
+    static totk_gen_memo4 g_gen_memo4;
     int support = kind == RB_SUPPORT, bank = kind == RB_DRV2, key = support ? 0 : 1 + bank * 6 + stage;
     uint64_t sub = vk_submit_serial(), revision = support ? 0 : g_driver_revision[bank][stage];
     int compute = !support && !bank && stage == 5;
@@ -4630,10 +4641,19 @@ static void generated_desc(int kind, int stage, const uint32_t grid[3], VkDescri
     static int off = -1; if (off < 0) off = vk_off("block");
     if (!off && last[key].sub == sub && last[key].revision == revision &&
         (!support || (last[key].w == R.w && last[key].h == R.h)) && (!compute || !memcmp(last[key].grid, g, sizeof g))) { *out = last[key].d; return; }
+    int can = !off && totk_vk_dsc_fast_on();
+    uint64_t rb = 0, ro = 0, rr = 0; uint32_t rw = support ? R.w : 0, rh = support ? R.h : 0;
+    if (can && totk_gen_memo4_find(&g_gen_memo4, sub, revision, (uint32_t)key, rw, rh, g, &rb, &ro, &rr)) {
+        *out = (VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)rb, ro, rr};
+        last[key].sub = sub; last[key].revision = revision; last[key].w = R.w; last[key].h = R.h;
+        memcpy(last[key].grid, g, sizeof g); last[key].d = *out;
+        return;
+    }
     uint8_t blk[0xA00]; size_t n = support ? 1392 : sizeof blk;
     if (support) support_fill(blk, R.w, R.h); else driver_bank_fill(blk, bank ? 2 : 0, stage, grid);
     block_desc(key, blk, n, out);
     last[key].sub = sub; last[key].revision = revision; last[key].w = R.w; last[key].h = R.h; memcpy(last[key].grid, g, sizeof g); last[key].d = *out;
+    if (can) totk_gen_memo4_put(&g_gen_memo4, sub, revision, (uint32_t)key, rw, rh, g, (uint64_t)(uintptr_t)out->buffer, out->offset, out->range);
 }
 /* References are immutable in the submission's arena. Reuse up to 64 distinct
  * reference words, including non-consecutive draws and hash collisions. */
@@ -4666,6 +4686,7 @@ void vk_draw_secondary_reset(void) {
     descriptor_unbind(); g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1;
 }
 static uint64_t g_stat_sets_new, g_stat_sets_reused;
+static totk_dsc_vic g_dsc_vic;
 /* Hash both identities in one word-wise pass over the zero-filled infos. The second uses add/multiply/rotate rather
    than the first's xor/multiply/shift, not just another seed of the same hash. */
 static void hash_words(const void *p, size_t n, uint64_t h[2]) {
@@ -5000,6 +5021,33 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
     } else if (!cacheable) vk_record_memo_miss(0, 1u << VK_REC_M_DISABLED);
     return R.open;
 }
+static VkDescriptorSet dsc_resolve(vk_shader *sh, dinfo *info, size_t total, uint64_t sub, int dsoff) {
+    uint64_t h[2] = {0xcbf29ce484222325ull, 0x6a09e667f3bcc909ull};
+    hash_words(&sh->dsl, sizeof sh->dsl, h); hash_words(info, total * sizeof *info, h);
+    unsigned slot = (unsigned)(h[0] % DS_CACHE);
+    if (!dsoff && g_dsc[slot].sub == sub && g_dsc[slot].hash[0] == h[0] && g_dsc[slot].hash[1] == h[1] && g_dsc[slot].dsl == sh->dsl && g_dsc[slot].n == total) {
+        g_stat_sets_reused++; return g_dsc[slot].set;
+    }
+    int vfast = !dsoff && totk_vk_dsc_fast_on();
+    if (vfast) {
+        uint64_t vhit = totk_dsc_vic_find(&g_dsc_vic, sub, (uint64_t)(uintptr_t)sh->dsl, total, h);
+        if (vhit) { g_stat_sets_reused++; return (VkDescriptorSet)(uintptr_t)vhit; }
+    }
+    if (vfast && g_dsc[slot].sub == sub && g_dsc[slot].set)
+        totk_dsc_vic_put(&g_dsc_vic, sub, (uint64_t)(uintptr_t)g_dsc[slot].dsl, g_dsc[slot].n, g_dsc[slot].hash, (uint64_t)(uintptr_t)g_dsc[slot].set);
+    VkDescriptorSet set = vk_alloc_set(sh->dsl);
+    static VkWriteDescriptorSet *w; static size_t capw;
+    if ((size_t)sh->nb > capw) { capw = (size_t)sh->nb + 16; w = realloc(w, capw * sizeof *w); }
+    for (int i = 0, kk = 0; i < sh->nb; i++) {
+        const vk_bind *b = &sh->b[i]; dinfo *in = &info[kk]; kk += b->count;
+        w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = b->binding, .descriptorCount = b->count, .descriptorType = (VkDescriptorType)b->dtype,
+            .pBufferInfo = &in->b, .pImageInfo = &in->i, .pTexelBufferView = &in->t};
+    }
+    vkUpdateDescriptorSets(V.dev, (uint32_t)sh->nb, w, 0, NULL);
+    g_dsc[slot].sub = sub; g_dsc[slot].hash[0] = h[0]; g_dsc[slot].hash[1] = h[1]; g_dsc[slot].dsl = sh->dsl; g_dsc[slot].n = total; g_dsc[slot].set = set;
+    g_stat_sets_new++;
+    return set;
+}
 /* Fill and bind one stage's descriptor set; stage: NVN stage. Returns 0 when a binding cannot be satisfied. */
 static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, uint32_t set_index, vk_shader *sh, int stage, const uint32_t grid[3], int stats) {
     if (!sh->nb) return 1;
@@ -5099,27 +5147,9 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
         for (int i = 0, kk = 0; i < sh->nb; kk += sh->b[i].count, i++)
             if (sh->b[i].dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && g_pd_nubo < 32) g_pd_ubo[g_pd_nubo++] = (__typeof__(g_pd_ubo[0])){sh->b[i].binding, sh->b[i].kind, sh->b[i].reg, info[kk].b};
     }
-    uint64_t sub = vk_submit_serial(), h[2] = {0xcbf29ce484222325ull, 0x6a09e667f3bcc909ull};
-    hash_words(&sh->dsl, sizeof sh->dsl, h); hash_words(info, total * sizeof *info, h);
-    unsigned slot = (unsigned)(h[0] % DS_CACHE);
-    VkDescriptorSet set;
+    uint64_t sub = vk_submit_serial();
     static int dsoff = -1; if (dsoff < 0) dsoff = vk_off("ds");
-    if (!dsoff && g_dsc[slot].sub == sub && g_dsc[slot].hash[0] == h[0] && g_dsc[slot].hash[1] == h[1] && g_dsc[slot].dsl == sh->dsl && g_dsc[slot].n == total) {
-        set = g_dsc[slot].set; g_stat_sets_reused++;
-    } else {
-        set = vk_alloc_set(sh->dsl);
-        /* Writes are only consumed on a cache miss; hits need only the resolved infos (also used by pass dumps). */
-        static VkWriteDescriptorSet *w; static size_t capw;
-        if ((size_t)sh->nb > capw) { capw = (size_t)sh->nb + 16; w = realloc(w, capw * sizeof *w); }
-        for (int i = 0, kk = 0; i < sh->nb; i++) {
-            const vk_bind *b = &sh->b[i]; dinfo *in = &info[kk]; kk += b->count;
-            w[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = b->binding, .descriptorCount = b->count, .descriptorType = (VkDescriptorType)b->dtype,
-                .pBufferInfo = &in->b, .pImageInfo = &in->i, .pTexelBufferView = &in->t};
-        }
-        vkUpdateDescriptorSets(V.dev, (uint32_t)sh->nb, w, 0, NULL);
-        g_dsc[slot].sub = sub; g_dsc[slot].hash[0] = h[0]; g_dsc[slot].hash[1] = h[1]; g_dsc[slot].dsl = sh->dsl; g_dsc[slot].n = total; g_dsc[slot].set = set;
-        g_stat_sets_new++;
-    }
+    VkDescriptorSet set = dsc_resolve(sh, info, total, sub, dsoff);
     if (vk_fg_extract_active && FGX.record && set_index < 2) {
         VkDescriptorSet replay_set = set;
         if (replay_source) {
