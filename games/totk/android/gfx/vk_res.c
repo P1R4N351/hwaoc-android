@@ -35,6 +35,8 @@
 #include "vk_view_fast.h"
 #include "vk_reg_wb_fast.h"
 #include "vk_serial_fast.h"
+#include "vk_img_fast.h"
+static int img_fast_res_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static __thread totk_view_memo4 *T_view_memo;
 static __thread totk_view_id_memo4 *T_view_id_memo;
 static __thread totk_view_cut_memo4 *T_view_cut_memo;
@@ -262,6 +264,7 @@ struct vk_tex {
     vk_edge_state edge;
     _Atomic uint64_t memo_sub;            /* TOTK_VK_TEX_MEMO: last submission whose tex_get_inner work for it is done */
     int cpu_pool;                         /* tex_mirrored at creation: GPU writes re-arm settled/opt-in invalidate write-back */
+    uint8_t wb_track;                     /* cpu_pool || wb_tile_match(t), immutable per vk_tex */
     int canvas_window;                   /* registration cached at object creation, not on every draw */
     VkBufferView tbv;                     /* TARGET_BUFFER textures */
     VkBuffer tb_buffer; VkDeviceSize tb_offset, tb_range;
@@ -797,7 +800,7 @@ static vk_tex *tex_create_locked(const tex_t *t, uint64_t sub) {
     if (vk_canvas_on) x->canvas_window = nvn_hm_get(&g_window_serials, &t->serial) != NULL;
     nvn_hm_put(&g_by_serial, &t->serial, x);
     if (t->d.target == 10) return x;
-    x->mirrored = x->cpu_pool = tex_mirrored(t);
+    x->mirrored = x->cpu_pool = tex_mirrored(t); x->wb_track = (uint8_t)(x->cpu_pool || wb_tile_match(t));
     stor_key k;
     if (x->mirrored && mirshare_on() && stor_key_of(t, &k)) {
         vk_img *g = nvn_hm_get(&g_by_storage, &k);
@@ -1792,8 +1795,9 @@ int vk_write_range_hit(uint64_t a, uint64_t n) {   /* TOTK_VK_WRITE_RANGE overla
 }
 static void gpu_write_range_note(const vk_tex *x) {
     static unsigned n;
+    if (__atomic_load_n(&x->im->gpu_written, __ATOMIC_RELAXED)) return;
     uint64_t m = (uint64_t)(uintptr_t)x->t.mem;
-    if (!vk_write_range_hit(m, x->t.L.size) || x->im->gpu_written || n >= 4000) return;
+    if (!vk_write_range_hit(m, x->t.L.size) || n >= 4000) return;
     n++;
     LOGV("[gpuwrite] fp=%llu ser=%llu mem=%#llx size=%#llx %ux%ux%u fmt=%#x lv=%u tgt=%d mirrored=%d cpu_pool=%d shared=%d%s",
          (unsigned long long)(&g_frame_pub ? g_frame_pub : 0), (unsigned long long)x->t.serial, (unsigned long long)m, (unsigned long long)x->t.L.size,
@@ -1801,10 +1805,12 @@ static void gpu_write_range_note(const vk_tex *x) {
 }
 static void tex_mark_gpu_written_inner(vk_tex *x) {
     if (!x || !x->im) return;
+    if (img_fast_res_on() && totk_tex_steady_gpu_written(__atomic_load_n(&x->im->gpu_written, __ATOMIC_ACQUIRE),
+            __atomic_load_n(&x->mirrored, __ATOMIC_RELAXED), x->wb_track)) return;
     gpu_write_range_note(x);
-    if (x->im->gpu_written && !x->mirrored && !x->cpu_pool && !wb_tile_match(&x->t)) return;
+    if (__atomic_load_n(&x->im->gpu_written, __ATOMIC_ACQUIRE) && !__atomic_load_n(&x->mirrored, __ATOMIC_RELAXED) && !x->wb_track) return;
     pthread_mutex_lock(&g_tex_mu);
-    x->im->gpu_written = 1;
+    __atomic_store_n(&x->im->gpu_written, 1, __ATOMIC_RELEASE);
     stor_key k;
     if (x->mirrored && !x->im->shared && mirshare_on() && stor_key_of(&x->t, &k) && !nvn_hm_get(&g_by_storage, &k)) {
         x->im->shared = 1; x->im->k = k; x->im->refs = 1; nvn_hm_put(&g_by_storage, &k, x->im); __atomic_store_n(&x->mirrored, 0, __ATOMIC_RELAXED); g_stat_published++;
@@ -2403,6 +2409,7 @@ typedef struct {
 enum { TIDC_N = 4096 };
 static __thread tidc_t *T_tidc;
 static __thread totk_tidc_vic *T_tvic;
+static __thread totk_tidc4 *T_tidc4;
 static __thread totk_fmemo *T_fmemo;
 static __thread totk_scache4 *T_sc4;
 #ifdef TOTK_VK_TESTS
@@ -2457,11 +2464,57 @@ static int tidc_try_victim(unsigned hash, int tid, int want, int in_pool, uint32
     if (x_out) *x_out = (vk_tex *)ve->x;
     return 1;
 }
+static int tidc4_stamp_ok(const totk_tidc4_ent *e) {
+    return tex_stamp_current((tex_stamp){(tex_generation *)e->tex_cell, e->tex_val}) &&
+           tex_stamp_current((tex_stamp){(tex_generation *)e->img_cell, e->img_val});
+}
+static int tidc4_oracle_ok(totk_tidc4_ent *e, int tid, int want, uint32_t gen, int in_pool, VkImageView *ov, vk_tex **ox) {
+    vk_tex *oracle; VkImageView view = tex_by_id_slow(tid, want, &oracle, NULL);
+    int cur_pn = atomic_load_explicit(&g_tpool_n, memory_order_acquire);
+    int stable = gen == atomic_load_explicit(&g_treg_gen[tid], memory_order_acquire) &&
+        in_pool == (!cur_pn || tid < cur_pn) && (!e->x || tidc4_stamp_ok(e));
+    if (stable && (view != (VkImageView)(uintptr_t)e->view_u || oracle != (vk_tex *)e->x)) {
+        LOGV("texture generation mismatch: tid=%d target=%d", tid, want); abort();
+    }
+    *ov = view; *ox = oracle;
+    return stable;
+}
+static VkImageView tex_by_id_cached_fast4(int tid, int want, vk_tex **x_out) {
+    totk_tidc4 *tc = T_tidc4 ? T_tidc4 : (T_tidc4 = calloc(1, sizeof *T_tidc4));
+    if (!tc) { TEX_LOOKUP_COUNT(1); vk_tex *x; VkImageView v = tex_by_id_slow(tid, want, &x, NULL); if (x_out) *x_out = x; return v; }
+    uint32_t gen = atomic_load_explicit(&g_treg_gen[tid], memory_order_acquire);
+    int precise = texgen_on(), pool_n = atomic_load_explicit(&g_tpool_n, memory_order_acquire), in_pool = !pool_n || tid < pool_n;
+    uint64_t sub = vk_submit_serial(), epoch = precise ? 0 : atomic_load_explicit(&g_tex_epoch, memory_order_acquire);
+    totk_tidc4_ent *e = totk_tidc4_probe(tc, tid, want, gen);
+    int valid = 0;
+    if (e) {
+        valid = precise ? (e->in_pool == in_pool && (e->x ? tidc4_stamp_ok(e) : e->sub == sub)) : (e->epoch == epoch && e->sub == sub);
+        if (valid && precise && e->x && e->sub != sub) {
+            vk_tex *vx = (vk_tex *)e->x;
+            int mir = __atomic_load_n(&vx->mirrored, __ATOMIC_RELAXED), gw = vx->im ? __atomic_load_n(&vx->im->gpu_written, __ATOMIC_ACQUIRE) : 0;
+            if (totk_tidc4_needs_sub_check(e, sub, mir, gw)) { TEX_LOOKUP_COUNT(2); (void)vk_tex_get(&vx->t); valid = tidc4_stamp_ok(e); }
+            if (valid) e->sub = sub;
+        }
+        if (valid) {
+            if (precise && texgen_check()) { vk_tex *ox; VkImageView ov; if (!tidc4_oracle_ok(e, tid, want, gen, in_pool, &ov, &ox)) { e->valid = 0u; if (x_out) *x_out = ox; return ov; } }
+            if (x_out) *x_out = (vk_tex *)e->x;
+            return (VkImageView)(uintptr_t)e->view_u;
+        }
+        e->valid = 0u;
+    }
+    TEX_LOOKUP_COUNT(1);
+    tidc_t sc = {0}; vk_tex *nx = NULL; VkImageView nv = tex_by_id_slow(tid, want, &nx, precise ? &sc : NULL);
+    totk_tidc4_ent ent = {sc.texture.cell, sc.image.cell, sc.texture.value, sc.image.value, sub, epoch, (uint64_t)(uintptr_t)nv, nx, tid, want, gen, (uint8_t)in_pool, 1u, 0u, 0u};
+    totk_tidc4_put(tc, &ent);
+    if (x_out) *x_out = nx;
+    return nv;
+}
 static VkImageView tex_by_id_cached(int tid, int want, vk_tex **x_out) {
     if (!texcache_on() || tid <= 0 || tid >= TID_GEN_N) {
         TEX_LOOKUP_COUNT(1);
         vk_tex *x; VkImageView v = tex_by_id_slow(tid, want, &x, NULL); if (x_out) *x_out = x; return v;
     }
+    if (img_fast_res_on()) return tex_by_id_cached_fast4(tid, want, x_out);
     if (!T_tidc) T_tidc = calloc(TIDC_N, sizeof *T_tidc);
     uint32_t gen = atomic_load_explicit(&g_treg_gen[tid], memory_order_acquire);
     uint64_t sub = vk_submit_serial(), epoch = 0;

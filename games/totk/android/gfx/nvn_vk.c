@@ -21,6 +21,8 @@
 #include "vk_gw_fast.h"
 #include "vk_ub_fast.h"
 #include "vk_ktgl_memo.h"
+#include "vk_img_fast.h"
+static int img_fast_nvn_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "vk_record.h"
 #include "vk_framegen.h"
@@ -2846,7 +2848,7 @@ void vk_slot_stats(uint64_t frame) {
 #ifdef TOTK_VK_TESTS
 int vk_record_test_async_submit(void) { return submit_async_on(); }
 void vk_record_test_submit_status(uint64_t *reserved, uint64_t *queued) {
-    pthread_mutex_lock(&g_mu); *reserved = g_reserved_fence; *queued = g_fence; pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_mu); *reserved = __atomic_load_n(&g_reserved_fence, __ATOMIC_ACQUIRE); *queued = g_fence; pthread_mutex_unlock(&g_mu);
 }
 void vk_record_test_hold_submit(uint64_t ticket) {
     pthread_mutex_lock(&g_mu); g_test_submit_hold = ticket; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
@@ -2953,7 +2955,7 @@ static uint64_t slot_submit_inner(int with_posts, vk_pass_end_kind reason) {
     int untracked_wait = !asynchronous && lag_wait_on() ? lag_guard_submit(slot, value) : 0;
     int join_required = with_posts || !g_in_sub || reason == VK_PASS_END_CPU_WAIT;
     s->publication = publish; s->join_on_walk = join_required;
-    pthread_mutex_lock(&g_mu); s->value = ++g_reserved_fence; s->submit_busy = asynchronous; pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_mu); uint64_t next_rf = __atomic_load_n(&g_reserved_fence, __ATOMIC_RELAXED) + 1; __atomic_store_n(&g_reserved_fence, next_rf, __ATOMIC_RELEASE); s->value = next_rf; s->submit_busy = asynchronous; pthread_mutex_unlock(&g_mu);
     if (vk_fg_lsfg_probe_requested())
         vk_fg_lsfg_sealed(s->nprimary>1 ? s->primary : &s->cb,s->nprimary>1 ? s->nprimary : 1,s->value);
     s->ft_frame = 0; s->ft_gpu_done = 0;
@@ -3079,7 +3081,7 @@ static void wait_value_inner(uint64_t v) {
 }
 static void wait_value(uint64_t v) { VK_REC_DO(VK_REC_O_GPU_WAIT, wait_value_inner(v)); }
 void vk_wait_fence(uint64_t ticket) { wait_value(ticket); } /* exact ticket, never a latest-submission/global idle */
-void vk_gpu_idle(void) { uint64_t v, t0 = g_hitch_on ? host_now_ns() : 0; pthread_mutex_lock(&g_mu); v = g_reserved_fence; pthread_mutex_unlock(&g_mu); wait_value(v); HK_ADD(idles, 1); HK_ADD(idle_ns, host_now_ns() - t0); }
+void vk_gpu_idle(void) { uint64_t v, t0 = g_hitch_on ? host_now_ns() : 0; if (img_fast_nvn_on()) v = __atomic_load_n(&g_reserved_fence, __ATOMIC_ACQUIRE); else { pthread_mutex_lock(&g_mu); v = g_reserved_fence; pthread_mutex_unlock(&g_mu); } wait_value(v); HK_ADD(idles, 1); HK_ADD(idle_ns, host_now_ns() - t0); }
 static void cpu_step_inner(void) { HK_ADD(cpu_steps, 1); g_stat_cpu_step++; g_cum[3]++; totk_ft_count(FT_COUNT_CPU_STEPS, 1); if (vk_rec_profile_on && T_rec.active) g_rec.cpu_steps++; ub_flush(); if (g_cur) wait_value(slot_submit(0, VK_PASS_END_CPU_WAIT)); else vk_gpu_idle(); }
 void vk_cpu_step(void) { VK_REC_DO(VK_REC_S, cpu_step_inner()); }
 
@@ -3239,7 +3241,7 @@ uint64_t vk_rec_service_call(vk_rec_service_fn function, void *arg) {
    reserved tickets before handing their immutable spans to those workers. */
 static int pool_gpu_quiet(void) {
     pthread_mutex_lock(&g_mu);
-    int quiet = atomic_load(&g_done) >= g_reserved_fence;
+    int quiet = atomic_load(&g_done) >= __atomic_load_n(&g_reserved_fence, __ATOMIC_ACQUIRE);
     pthread_mutex_unlock(&g_mu);
     return quiet;
 }
@@ -6255,7 +6257,7 @@ void vk_mem_report(void) {
 uint64_t vk_submit_now(void) { return g_cur ? slot_submit(0, VK_PASS_END_SUBMISSION) : mtl_last_fence(); }
 uint64_t vk_submit_readback(void) { return g_cur ? slot_submit(0, VK_PASS_END_CPU_WAIT) : mtl_last_fence(); }
 void vk_flush_wait(void) { HK_ADD(idle_flush, 1); if (ub_private_on()) ub_flush(); if (g_cur) { uint64_t v = slot_submit(0, VK_PASS_END_CPU_WAIT); wait_value(v); } else vk_gpu_idle(); }
-uint64_t mtl_last_fence(void) { pthread_mutex_lock(&g_mu); uint64_t f = g_reserved_fence; pthread_mutex_unlock(&g_mu); return f; }
+uint64_t mtl_last_fence(void) { if (img_fast_nvn_on()) return __atomic_load_n(&g_reserved_fence, __ATOMIC_ACQUIRE); pthread_mutex_lock(&g_mu); uint64_t f = __atomic_load_n(&g_reserved_fence, __ATOMIC_ACQUIRE); pthread_mutex_unlock(&g_mu); return f; }
 int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     if (atomic_load(&g_done) >= fence) return 1;
     if (!timeout_ns) return 0;

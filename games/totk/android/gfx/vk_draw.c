@@ -29,6 +29,9 @@
 #include "vk_stage_fast.h"
 #include "vk_state_fast.h"
 #include "vk_cs_fast.h"
+#include "vk_img_fast.h"
+static int img_fast_draw_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
+static __thread totk_clear_read_memo4 *T_clear_read_memo;
 static totk_cs_pipe_state g_cs_pipe;
 static int ktglmemo_draw_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "../../runtime/present_clock.h"
@@ -155,7 +158,7 @@ static void state_init(void) { static int done; if (!done) { done = 1; pso_life_
 /* ---------- render passes ---------- */
 static struct {
     int open, secondary;                        /* primary rendering contents: inline or worker secondaries */
-    int clear_c[8]; VkClearValue cc[8]; int clear_d, clear_s; float cd; uint32_t cs;
+    int clear_c[8]; VkClearValue cc[8]; int clear_d, clear_s; float cd; uint32_t cs; uint32_t clear_mask;
     uint32_t w, h;                              /* extent of the open pass */
     uint32_t host_w, host_h; int native, canvas; /* logical support-buffer size remains w/h */
     uint32_t native_w, native_h;                /* active coordinate basis, distinct from padded window allocation */
@@ -1112,7 +1115,8 @@ static int pass_merge_barrier(uint32_t bits) {
 }
 static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
     if (!R.open && S.has_rt) {   /* clears still waiting for a draw become a pass of their own (load op CLEAR) */
-        int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
+        int pend = 0; if (img_fast_draw_on()) pend = R.clear_mask != 0u;
+        else { pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i]; }
         if (pend) begin_rendering(0);
     }
     if (!R.open) return;
@@ -1165,25 +1169,36 @@ void vk_end_rendering(void) { vk_end_rendering_at(VK_PASS_END_OTHER, 0); }
  * Resolve via the same attachment path (views, integer formats, native canvas,
  * MSAA and depth/stencil), rather than clearing an imprecise whole VkImage.
  * Walking-owner only; the guard excludes diagnostic reads during pass setup. */
-void vk_draw_texture_read(int tid, const tex_t *texture) {
-    static int resolving;
-    if (R.open || resolving || !S.has_rt) return;
-    int pending=R.clear_d || R.clear_s;
-    for (unsigned i=0;i<8;i++) pending|=R.clear_c[i];
-    if (!pending || !totk_live_cached(&g_clear_read_live,"TOTK_VK_CLEAR_ON_READ",g_clear_read_launch)) return;
-    vk_treg registration;
-    if (!texture) {
-        if (!vk_treg_get(tid,&registration)) return;
-        texture=&registration.t;
+static uint64_t draw_rt_clear_sig(void) {
+    uint64_t h = (uint64_t)(uint32_t)S.rt.n * UINT64_C(0x9e3779b97f4a7c15);
+    if (S.rt.depth) h ^= ((uint64_t)(uintptr_t)S.rt.depth->mem * UINT64_C(0xbf58476d1ce4e5b9)) ^ S.rt.depth->L.size;
+    for (int i = 0; i < S.rt.n && i < 8; i++) if (S.rt.color[i]) {
+        uint64_t m = ((uint64_t)(uintptr_t)S.rt.color[i]->mem ^ S.rt.color[i]->L.size) + (uint64_t)i * 17u;
+        h ^= m * UINT64_C(0x94d049bb133111eb);
     }
-    int overlaps=(R.clear_d || R.clear_s) && S.rt.depth && feedback_overlap(texture,S.rt.depth);
-    for (unsigned i=0;i<8 && !overlaps;i++)
-        overlaps=R.clear_c[i] && S.rt.color[i] && feedback_overlap(texture,S.rt.color[i]);
-    if (!overlaps) return;
-    resolving=1;
-    vk_end_rendering_at(VK_PASS_END_TEXTURE_BARRIER,NVN_BARRIER_INVALIDATE_TEXTURE_BIT);
-    resolving=0;
-    g_clear_read_forced++;
+    return h;
+}
+void vk_draw_texture_read(int tid, const tex_t *texture) {
+    static int resolving; int fast = img_fast_draw_on();
+    if (R.open || resolving || !S.has_rt || (fast && !R.clear_mask)) return;
+    int pending = fast ? (R.clear_mask != 0u) : (R.clear_d || R.clear_s);
+    if (!fast) for (unsigned i = 0; i < 8; i++) pending |= R.clear_c[i];
+    if (!pending || !totk_live_cached(&g_clear_read_live, "TOTK_VK_CLEAR_ON_READ", g_clear_read_launch)) return;
+    int can_memo = fast && !texture && tid > 0;
+    uint64_t treg_rev = 0, rt_sig = 0; totk_clear_read_memo4 *crm = NULL;
+    if (can_memo) {
+        crm = T_clear_read_memo ? T_clear_read_memo : (T_clear_read_memo = calloc(1, sizeof *T_clear_read_memo));
+        treg_rev = vk_treg_revision(); rt_sig = draw_rt_clear_sig();
+        if (crm && totk_clear_read_memo4_hit(crm, (uint32_t)tid, treg_rev, rt_sig, (uint16_t)R.clear_mask)) return;
+    }
+    vk_treg registration;
+    if (!texture) { if (!vk_treg_get(tid, &registration)) return; texture = &registration.t; }
+    int overlaps = (R.clear_d || R.clear_s) && S.rt.depth && feedback_overlap(texture, S.rt.depth);
+    for (unsigned i = 0; i < 8 && !overlaps; i++) overlaps = R.clear_c[i] && S.rt.color[i] && feedback_overlap(texture, S.rt.color[i]);
+    if (!overlaps) { if (can_memo && crm) totk_clear_read_memo4_put(crm, (uint32_t)tid, treg_rev, rt_sig, (uint16_t)R.clear_mask); return; }
+    resolving = 1;
+    vk_end_rendering_at(VK_PASS_END_TEXTURE_BARRIER, NVN_BARRIER_INVALIDATE_TEXTURE_BIT);
+    resolving = 0; g_clear_read_forced++;
 }
 #ifdef TOTK_VK_TESTS
 void vk_draw_test_correctness_counts(uint64_t out[2]) {
@@ -1586,7 +1601,7 @@ static int begin_rendering_inner(int draw_tail) {
         R.caddr[i] = t->mem; if (R.clear_c[i]) R.cleared |= 1u << i;
         if (t->d.samples > 1) R.samples = (VkSampleCountFlagBits)t->d.samples;
         if (i == 0) R.c0_cleared = R.clear_c[0] ? 1 : 0;
-        if (R.clear_c[i]) { ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[i].clearValue = R.cc[i]; R.clear_c[i] = 0; }
+        if (R.clear_c[i]) { ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR; ca[i].clearValue = R.cc[i]; R.clear_c[i] = 0; R.clear_mask &= ~(1u << i); }
     }
     if (S.has_rt && S.rt.depth) {
         const tex_t *t = S.rt.depth; vk_tex *x = vk_tex_get(t);
@@ -1603,7 +1618,7 @@ static int begin_rendering_inner(int draw_tail) {
             if (as & VK_IMAGE_ASPECT_DEPTH_BIT) { da.imageView = v; da.imageLayout = VK_IMAGE_LAYOUT_GENERAL; da.loadOp = R.clear_d ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE; R.dfmt = vk_tex_format(x); da.clearValue.depthStencil.depth = R.dfmt == VK_FORMAT_D16_UNORM ? d16_clear(R.cd) : R.cd; }
             if (as & VK_IMAGE_ASPECT_STENCIL_BIT) { sa.imageView = v; sa.imageLayout = VK_IMAGE_LAYOUT_GENERAL; sa.loadOp = R.clear_s ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; sa.storeOp = VK_ATTACHMENT_STORE_OP_STORE; sa.clearValue.depthStencil.stencil = R.cs; R.sfmt = vk_tex_format(x); }
             if (t->d.samples > 1) R.samples = (VkSampleCountFlagBits)t->d.samples;
-            R.clear_d = R.clear_s = 0;
+            R.clear_d = R.clear_s = 0; R.clear_mask &= ~(3u << 8);
         }
     }
     if (!have) {   /* no target: a pass of rasterisation only, sized by viewport 0 (or the scissor) */
@@ -3446,7 +3461,7 @@ static void clear_color(const p_clear_color *c) {
     VkClearValue v = color_value(vk_fmt_class(f), c->rgba);
     int full = clear_full();
     if (R.open && (c->mask & 0xf) == 0xf && full && clear_load_on()) { vk_end_rendering_at(VK_PASS_END_CLEAR, 1u << c->index); g_clear_load_c++; }
-    if (!R.open && (c->mask & 0xf) == 0xf && full) { R.clear_c[c->index] = 1; R.cc[c->index] = v; return; }
+    if (!R.open && (c->mask & 0xf) == 0xf && full) { R.clear_c[c->index] = 1; R.clear_mask |= (1u << c->index); R.cc[c->index] = v; return; }
     if ((c->mask & 0xf) != 0xf) RED(4, "colour clear with channel mask %#x: cleared whole (masked clears not done yet)", c->mask);
     g_pops.clears_inpass++;
     begin_rendering(0);
@@ -3473,8 +3488,8 @@ static void clear_ds(const p_clear_ds *c) {
     int full = clear_full();
     if (R.open && (!sm || sm == 255) && full && clear_load_on()) { vk_end_rendering_at(VK_PASS_END_CLEAR, (uint32_t)as); g_clear_load_ds++; }
     if (!R.open && (!sm || sm == 255) && full) {
-        if (as & VK_IMAGE_ASPECT_DEPTH_BIT) { R.clear_d = 1; R.cd = c->depth; }
-        if (as & VK_IMAGE_ASPECT_STENCIL_BIT) { R.clear_s = 1; R.cs = (uint32_t)c->stencil; }
+        if (as & VK_IMAGE_ASPECT_DEPTH_BIT) { R.clear_d = 1; R.clear_mask |= (1u << 8); R.cd = c->depth; }
+        if (as & VK_IMAGE_ASPECT_STENCIL_BIT) { R.clear_s = 1; R.clear_mask |= (1u << 9); R.cs = (uint32_t)c->stencil; }
         return;
     }
     if (sm && sm != 255) RED(4, "stencil clear with mask %#x: cleared whole", sm);
@@ -6932,10 +6947,10 @@ void vk_draw_exec(uint32_t op, const void *a) {
         case OP_SET_RT: {
             const p_set_rt *r = a; g_pops.setrt++;
             vk_stage_sig_invalidate(1u << 1);   /* also covers the same-target branch's state copy */
-            int pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i];
+            int pend = 0; if (img_fast_draw_on()) pend = R.clear_mask != 0u; else { pend = R.clear_d || R.clear_s; for (int i = 0; i < 8; i++) pend |= R.clear_c[i]; }
             if (R.open && !pend && S.has_rt && rt_same(&S.rt, r)) { S.rt = *r; break; }   /* the same targets again: keep the pass */
             vk_end_rendering_at(VK_PASS_END_ATTACHMENTS, 0);
-            memset(R.clear_c, 0, sizeof R.clear_c); R.clear_d = R.clear_s = 0;
+            memset(R.clear_c, 0, sizeof R.clear_c); R.clear_d = R.clear_s = 0; R.clear_mask = 0u;
             S.rt = *r; S.has_rt = 1;
             break;
         }
