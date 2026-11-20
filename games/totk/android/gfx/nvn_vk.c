@@ -17,6 +17,7 @@
    The driver is the system one, or the file named by TOTK_VK_DRIVER (a Turnip build, android/gfx/vk_load.h). */
 #include <malloc.h>
 #include "vk_int.h"
+#include "totk_nvn_sub_fast.h"
 #include "vk_ktgl_memo.h"
 static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "vk_record.h"
@@ -4342,13 +4343,14 @@ static unsigned lag_test_rng_sort(unsigned *checks) {
     return errors;
 }
 #endif
-static void collect_ubos(rng_t **r, int *n, int *cap, const uint8_t *p, int depth, rng_t seen[UBO_SEEN]) {
+static void collect_ubos(rng_t **r, int *n, int *cap, const uint8_t *p, int depth, rng_t seen[UBO_SEEN], totk_sub_seen4 *call_seen) {
+    if (call_seen && !totk_sub_seen4_first(call_seen, (uint64_t)(uintptr_t)p)) return;
     for (int guard = 0; guard < 1000000; guard++) {
         op_hdr h; memcpy(&h, p, sizeof h);
         if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) return;
         if (h.op == OP_END) return;
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
-        if (h.op == OP_CALL) { const uint8_t *t; memcpy(&t, p + 8, 8); if (depth < 16) collect_ubos(r, n, cap, t, depth + 1, seen); }
+        if (h.op == OP_CALL) { const uint8_t *t; memcpy(&t, p + 8, 8); if (depth < 16) collect_ubos(r, n, cap, t, depth + 1, seen, call_seen); }
         else if (h.op == OP_BIND_UBO) {
             const p_bind_buf *b = (const p_bind_buf *)(p + 8);
             if (b->addr && b->size && b->size <= 65536) {
@@ -4381,7 +4383,7 @@ static int lag_test_collect_bench(void) {
         int n = 0; uint64_t start = host_now_ns();
         for (unsigned repeat = 0; repeat < REPEATS; repeat++) {
             n = 0; memset(seen, 0, (mode ? UBO_SEEN : 64) * sizeof *seen);
-            if (mode) collect_ubos(&r, &n, &capacity, (const uint8_t *)stream, 0, seen);
+            if (mode) collect_ubos(&r, &n, &capacity, (const uint8_t *)stream, 0, seen, NULL);
             else for (int i = 0; i < BINDS; i++) {
                 uint64_t a = ub_address(stream[i].b.addr, stream[i].b.size);
                 unsigned slot = (unsigned)((a >> 8) ^ (a >> 20) ^ stream[i].b.size) & 63;
@@ -4415,7 +4417,10 @@ static ucap_t *ucap_build(const uint64_t *h, int n, int copy_bytes) {
     ucap_t *c = VK_CALLOC(1, sizeof *c);
     c->done = atomic_load(&g_done);   /* before the bytes: a write completing meanwhile only makes this conservative */
     rng_t *r = NULL, seen[UBO_SEEN] = {0}; int nr = 0, cap = 0;
-    for (int i = 0; i < n; i++) collect_ubos(&r, &nr, &cap, (const uint8_t *)(uintptr_t)h[i], 0, seen);
+    static __thread totk_sub_seen4 t_call_seen;
+    totk_sub_seen4 *csp = (totk_nvn_sub_fast_on() && !(vk_rec_profile_on && T_rec.active)) ? &t_call_seen : NULL;
+    if (csp) totk_sub_seen4_reset(csp);
+    for (int i = 0; i < n; i++) collect_ubos(&r, &nr, &cap, (const uint8_t *)(uintptr_t)h[i], 0, seen, csp);
     if (nr) {
         rng_sort(r, nr);
         int k = -1;   /* merge overlapping / touching ranges inside one pool; drop ranges outside every pool */
