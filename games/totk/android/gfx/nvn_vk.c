@@ -18,6 +18,7 @@
 #include <malloc.h>
 #include "vk_int.h"
 #include "totk_nvn_sub_fast.h"
+#include "vk_gw_fast.h"
 #include "vk_ktgl_memo.h"
 static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "vk_record.h"
@@ -3968,6 +3969,7 @@ static int snap_on(void) { return (ub_rename_on() && !vk_off("snap")) || ub_priv
    ~0.8 ms/frame on the Thor walker. Sealing only assigns fences and pruning is a stable filter: both keep the order. */
 typedef struct { uint64_t lo, hi, fence; } gw_t;
 static gw_t *g_gw; static uint64_t *g_gw_maxhi; static int g_ngw, g_capgw; static pthread_mutex_t g_gw_mu = PTHREAD_MUTEX_INITIALIZER;
+static totk_gw_summary g_gw_sum;
 static uint64_t g_stat_snap_skipped;
 static void gw_reindex_from(int i) {   /* caller holds g_gw_mu */
     uint64_t m = i ? g_gw_maxhi[i - 1] : 0;
@@ -3979,6 +3981,7 @@ static int gw_lower(uint64_t lo) {   /* first entry with lo >= the argument; cal
     return a;
 }
 static int gw_pending(uint64_t lo, uint64_t hi, uint64_t done) {   /* caller holds g_gw_mu */
+    if (!g_ngw || (totk_gw_fast_on() && !totk_gw_hit_locked(&g_gw_sum, lo, hi))) return 0;
     for (int i = gw_lower(hi) - 1; i >= 0 && g_gw_maxhi[i] > lo; i--)
         if (lo < g_gw[i].hi && (!g_gw[i].fence || g_gw[i].fence > done)) return 1;
     return 0;
@@ -3995,14 +3998,21 @@ static void gw_add(uint64_t lo, uint64_t hi) {
     }
     memmove(g_gw + at + 1, g_gw + at, (size_t)(g_ngw - at) * sizeof *g_gw);
     g_gw[at] = (gw_t){lo, hi, 0}; g_ngw++;
+    totk_gw_sum_add(&g_gw_sum, lo, hi);
     gw_reindex_from(at);
 }
 static void gw_seal(uint64_t fence) { pthread_mutex_lock(&g_gw_mu); for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence) g_gw[i].fence = fence; pthread_mutex_unlock(&g_gw_mu); }
 static void gw_prune(void) {
-    uint64_t done = atomic_load(&g_done); int j = 0;
+    uint64_t done = atomic_load(&g_done), mlo = 0, mhi = 0, blm = 0; int j = 0;
     pthread_mutex_lock(&g_gw_mu);
-    for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence || g_gw[i].fence > done) g_gw[j++] = g_gw[i];
+    for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence || g_gw[i].fence > done) {
+        gw_t w = g_gw[i];
+        if (!j || w.lo < mlo) mlo = w.lo;
+        if (!j || w.hi > mhi) mhi = w.hi;
+        blm |= totk_gw_bloom_mask(w.lo, w.hi); g_gw[j++] = w;
+    }
     g_ngw = j; gw_reindex_from(0);
+    totk_gw_sum_publish(&g_gw_sum, (uint32_t)j, mlo, mhi, blm);
     pthread_mutex_unlock(&g_gw_mu);
 }
 static void snap_drop(uint64_t a, uint64_t n);
@@ -4024,23 +4034,36 @@ static int ub_original_pending(uint64_t a, uint64_t n) {
 static int lag_original_pending(uint64_t address, uint64_t size) {
     enum { NP = 1024 };
     static struct { uint64_t address, size, revision, ticket, spans, lifetime, done; int pending; } memo[NP];
-    __typeof__(memo[0]) *m = &memo[lag_hash(address, size, 0) % NP];
+    static totk_orig_pend_memo4 memo4;
+    int fast = totk_gw_fast_on() && size > 0;
     uint64_t ticket = g_reserved_fence + 1, spans = atomic_load_explicit(&g_span_gen, memory_order_acquire);
-    uint64_t lifetime = nvn_dirty_lag_epoch();
-    if (m->address == address && m->size == size && m->spans == spans && m->lifetime == lifetime &&
-        (!m->pending || m->done == atomic_load(&g_done)) && lag_producer_unchanged(m->revision, address, size)) {
-        LAG_TEST_INC(VK_LAG_TEST_PRODUCER_HITS);
-        if (!m->pending && m->ticket != ticket) LAG_TEST_INC(VK_LAG_TEST_PRODUCER_CROSS_TICKET);
-        m->revision = g_lag_producer_revision; m->ticket = ticket;
-        return m->pending;
+    uint64_t lifetime = nvn_dirty_lag_epoch(), cur_done = atomic_load(&g_done);
+    if (fast) {
+        totk_orig_pend_ent *e = totk_orig_pend_find(&memo4, address, size, spans, lifetime, cur_done);
+        if (e && lag_producer_unchanged(e->revision, address, size)) {
+            LAG_TEST_INC(VK_LAG_TEST_PRODUCER_HITS);
+            if (!e->pending && e->ticket != ticket) LAG_TEST_INC(VK_LAG_TEST_PRODUCER_CROSS_TICKET);
+            e->revision = g_lag_producer_revision; e->ticket = ticket; return e->pending;
+        }
+    } else {
+        __typeof__(memo[0]) *m = &memo[lag_hash(address, size, 0) % NP];
+        if (m->address == address && m->size == size && m->spans == spans && m->lifetime == lifetime &&
+            (!m->pending || m->done == cur_done) && lag_producer_unchanged(m->revision, address, size)) {
+            LAG_TEST_INC(VK_LAG_TEST_PRODUCER_HITS);
+            if (!m->pending && m->ticket != ticket) LAG_TEST_INC(VK_LAG_TEST_PRODUCER_CROSS_TICKET);
+            m->revision = g_lag_producer_revision; m->ticket = ticket; return m->pending;
+        }
     }
     LAG_TEST_INC(VK_LAG_TEST_PRODUCER_SCANS);
-    uint64_t done = atomic_load(&g_done);
-    pthread_mutex_lock(&g_gw_mu);
-    int pending = gw_pending(address, address + size, done);
-    pthread_mutex_unlock(&g_gw_mu);
+    uint64_t done = atomic_load(&g_done); int pending = 0;
+    if (!totk_gw_fast_on() || totk_gw_may_overlap(&g_gw_sum, address, address + size)) {
+        pthread_mutex_lock(&g_gw_mu);
+        pending = gw_pending(address, address + size, done);
+        pthread_mutex_unlock(&g_gw_mu);
+    }
     if (!pending) pending = ub_original_pending(address, size);
-    *m = (__typeof__(*m)){address, size, g_lag_producer_revision, ticket, spans, lifetime, done, pending};
+    if (fast) totk_orig_pend_insert(&memo4, address, size, g_lag_producer_revision, ticket, spans, lifetime, done, pending);
+    else memo[lag_hash(address, size, 0) % NP] = (__typeof__(memo[0])){address, size, g_lag_producer_revision, ticket, spans, lifetime, done, pending};
     return pending;
 }
 #ifdef TOTK_VK_TESTS
@@ -4103,7 +4126,7 @@ static unsigned lag_test_gw_index(unsigned *checks) {
     #undef GW_RAND
     /* Per-query cost at the route's size: ~100 pending writes, 1,308 capture ranges per submission. */
     for (int count = 32; count <= 512; count *= 4) {
-        pthread_mutex_lock(&g_gw_mu); g_ngw = 0;
+        pthread_mutex_lock(&g_gw_mu); g_ngw = 0; totk_gw_sum_clear(&g_gw_sum);
         for (int i = 0; i < count; i++) gw_add(UINT64_C(0x360000000) + (uint64_t)i * 65536 * 3, UINT64_C(0x360000000) + (uint64_t)i * 65536 * 3 + 4096);
         pthread_mutex_unlock(&g_gw_mu);
         uint64_t ns[2]; unsigned hits[2] = {0};
@@ -4120,7 +4143,7 @@ static unsigned lag_test_gw_index(unsigned *checks) {
         printf("lag-query GPU writes %d pending: linear %.2f indexed %.2f ns/query; 6540 capture ranges/frame %.3f -> %.3f ms\n",
                count, ns[0] / 2e5, ns[1] / 2e5, ns[0] / 2e5 * 6540 / 1e6, ns[1] / 2e5 * 6540 / 1e6);
     }
-    pthread_mutex_lock(&g_gw_mu); g_ngw = 0; pthread_mutex_unlock(&g_gw_mu);
+    pthread_mutex_lock(&g_gw_mu); g_ngw = 0; totk_gw_sum_clear(&g_gw_sum); pthread_mutex_unlock(&g_gw_mu);
     atomic_store(&g_done, 0);
     free(shadow);
     return errors;
@@ -4246,19 +4269,33 @@ static void gpu_write_inner(uint64_t a, uint64_t n, int guard) {
        with the new graph. New aliases must also revoke guarded=true even when the donor is unchanged. */
     uint64_t spans = atomic_load_explicit(&g_span_gen, memory_order_acquire);
     { enum { NG = 256 }; static struct { uint64_t a, n, sub, physical, spans; int guarded; } seen[NG];
-      uint64_t sub = vk_submit_serial(); unsigned h = (unsigned)((a >> 6) ^ (a >> 20) ^ n) % NG;
-      if (seen[h].a == a && seen[h].n == n && seen[h].sub == sub &&
-          seen[h].physical == physical && seen[h].spans == spans) {
-          if (guard && !seen[h].guarded) {
+      static totk_gw_seen4 seen4; uint64_t sub = vk_submit_serial();
+      if (totk_gw_fast_on()) {
+          int ng = 0;
+          if (totk_gw_seen4_probe(&seen4, a, n, sub, physical, spans, guard, &ng)) {
+              if (ng) {
 #ifdef TOTK_VK_TESTS
-              g_test_gpu_write_guards++;
+                  g_test_gpu_write_guards++;
 #endif
-              lag_guard_mark(a, n, NVN_DIRTY_LAG_WRITABLE | NVN_DIRTY_LAG_GPU); seen[h].guarded = 1;
+                  lag_guard_mark(a, n, NVN_DIRTY_LAG_WRITABLE | NVN_DIRTY_LAG_GPU);
+              }
+              return;
           }
-          return;
-      }
-      seen[h].a = a; seen[h].n = n; seen[h].sub = sub; seen[h].physical = physical;
-      seen[h].spans = spans; seen[h].guarded = guard; }
+      } else {
+          unsigned h = (unsigned)((a >> 6) ^ (a >> 20) ^ n) % NG;
+          if (seen[h].a == a && seen[h].n == n && seen[h].sub == sub &&
+              seen[h].physical == physical && seen[h].spans == spans) {
+              if (guard && !seen[h].guarded) {
+#ifdef TOTK_VK_TESTS
+                  g_test_gpu_write_guards++;
+#endif
+                  lag_guard_mark(a, n, NVN_DIRTY_LAG_WRITABLE | NVN_DIRTY_LAG_GPU); seen[h].guarded = 1;
+              }
+              return;
+          }
+          seen[h].a = a; seen[h].n = n; seen[h].sub = sub; seen[h].physical = physical;
+          seen[h].spans = spans; seen[h].guarded = guard;
+      } }
     /* Count guard forwarding rather than eventual registrations: fresh frozen alias projection is
        required here; the existing late submit path still owns ticket arming and its failures. */
 #ifdef TOTK_VK_TESTS
@@ -4276,9 +4313,12 @@ int vk_gpu_write_pending(uint64_t addr, uint64_t n) {
     if (!n) return 0;
     uint64_t a = ub_address(addr, n);
     if (!a || a + n < a) return 1;
-    pthread_mutex_lock(&g_gw_mu);
-    int gpu = gw_pending(a, a + n, atomic_load_explicit(&g_done, memory_order_acquire));
-    pthread_mutex_unlock(&g_gw_mu);
+    int gpu = 0;
+    if (!totk_gw_fast_on() || totk_gw_may_overlap(&g_gw_sum, a, a + n)) {
+        pthread_mutex_lock(&g_gw_mu);
+        gpu = gw_pending(a, a + n, atomic_load_explicit(&g_done, memory_order_acquire));
+        pthread_mutex_unlock(&g_gw_mu);
+    }
     if (!gpu && ub_private_on()) gpu = ub_original_pending(a, n);
     return gpu;
 }
@@ -4432,16 +4472,24 @@ static ucap_t *ucap_build(const uint64_t *h, int n, int copy_bytes) {
             r[++k] = r[i];
         }
         /* ranges a GPU write still in flight overlaps are left to memory (the GPU timeline) */
-        pthread_mutex_lock(&g_gw_mu);
-        int m = 0; for (int i = 0; i <= k; i++) {
-            if ((g_ngw && gw_pending(r[i].lo, r[i].hi, c->done)) ||
-                (ub_private_on() && ub_original_pending(r[i].lo, r[i].hi - r[i].lo))) {
-                g_stat_snap_skipped++; continue;
+        if (k >= 0 && (!totk_gw_fast_on() || totk_gw_may_overlap(&g_gw_sum, r[0].lo, r[k].hi))) {
+            pthread_mutex_lock(&g_gw_mu);
+            int m = 0; for (int i = 0; i <= k; i++) {
+                if ((g_ngw && gw_pending(r[i].lo, r[i].hi, c->done)) ||
+                    (ub_private_on() && ub_original_pending(r[i].lo, r[i].hi - r[i].lo))) {
+                    g_stat_snap_skipped++; continue;
+                }
+                r[m++] = r[i];
             }
-            r[m++] = r[i];
+            pthread_mutex_unlock(&g_gw_mu);
+            k = m - 1;
+        } else if (k >= 0 && ub_private_on()) {
+            int m = 0; for (int i = 0; i <= k; i++) {
+                if (ub_original_pending(r[i].lo, r[i].hi - r[i].lo)) { g_stat_snap_skipped++; continue; }
+                r[m++] = r[i];
+            }
+            k = m - 1;
         }
-        pthread_mutex_unlock(&g_gw_mu);
-        k = m - 1;
         c->n = k + 1;
         c->lo = VK_MALLOC(sizeof *c->lo * (size_t)(c->n + 1)); c->hi = VK_MALLOC(sizeof *c->hi * (size_t)(c->n + 1));
         if (copy_bytes) c->off = VK_MALLOC(sizeof *c->off * (size_t)(c->n + 1));
@@ -5751,9 +5799,12 @@ int vk_ub_replay_read(uint64_t addr, uint64_t size, VkDeviceSize align, VkDescri
     if (!addr || !size || addr+size<addr) return 0;
     addr=ub_address(addr,size);
     if (!addr || addr+size<addr) return 0;
-    pthread_mutex_lock(&g_gw_mu);
-    int pending=gw_pending(addr,addr+size,atomic_load_explicit(&g_done,memory_order_acquire));
-    pthread_mutex_unlock(&g_gw_mu);
+    int pending = 0;
+    if (!totk_gw_fast_on() || totk_gw_may_overlap(&g_gw_sum, addr, addr + size)) {
+        pthread_mutex_lock(&g_gw_mu);
+        pending = gw_pending(addr, addr + size, atomic_load_explicit(&g_done, memory_order_acquire));
+        pthread_mutex_unlock(&g_gw_mu);
+    }
     if (pending) return 0;
     return lag_uniform_select(addr,size,align,out,1);
 }
@@ -5886,9 +5937,12 @@ static void update_ub(uint64_t dst, const uint8_t *data, uint64_t n) {
     if (ub_rename_on()) { ub_log(dst, data, n, 0); return; }
     if (ub_private_on()) {
         uint64_t a = ub_address(dst, n);
-        pthread_mutex_lock(&g_gw_mu);
-        int gpu = gw_pending(a, a + n, atomic_load(&g_done));
-        pthread_mutex_unlock(&g_gw_mu);
+        int gpu = 0;
+        if (!totk_gw_fast_on() || totk_gw_may_overlap(&g_gw_sum, a, a + n)) {
+            pthread_mutex_lock(&g_gw_mu);
+            gpu = gw_pending(a, a + n, atomic_load(&g_done));
+            pthread_mutex_unlock(&g_gw_mu);
+        }
         if (!gpu && !ub_original_pending(a, n)) { ub_log(dst, data, n, 0); return; }
         vk_gpu_write(dst, n);   /* a true original-memory producer cannot be replaced by a stale CPU base */
     }
