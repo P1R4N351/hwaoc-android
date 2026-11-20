@@ -25,6 +25,7 @@
 #include "vk_load_proof.h"
 #include "vk_ktgl_memo.h"
 #include "vk_shader_fast.h"
+#include "vk_cs_fast.h"
 #include "vk_subgroup.h"
 #include "vk_position.h"
 #include "vk_int_fold.h"
@@ -901,13 +902,24 @@ int vk_prog_resolve(const prog_t *p, vk_shader *out[6]) {
     for (int st = 0; st < 6; st++) if (prog_resolve_stage(pr, st, &out[st])) missing = 1;
     return missing ? -1 : 0;
 }
+static totk_cs_prog_memo4 g_cs_prog_memo;
 int vk_prog_resolve_compute(const prog_t *p, vk_shader *out[6]) {
     memset(out, 0, 6 * sizeof *out);
-    if (!vk_shaders_ready()) return -1;
+    if (!vk_shaders_ready() || !p || !p->serial) return -1;
+    int fast = totk_vk_cs_fast_on();
+    uint64_t epoch = vk_shader_xlate_epoch(), sig5 = fast ? stage_sig(5) : 0, hit = 0;
+    if (fast && totk_cs_prog_memo4_find(&g_cs_prog_memo, (uint64_t)(uintptr_t)p, p->serial, epoch, sig5, &hit)) {
+        out[5] = (vk_shader *)(uintptr_t)hit;
+        return 0;
+    }
     vk_prog *pr = prog_of(p);
     if (!pr || !pr->has[5]) return -1;
-    prog_sync_epoch(pr, vk_shader_xlate_epoch());
-    return prog_resolve_stage(pr, 5, &out[5]);
+    prog_sync_epoch(pr, epoch);
+    int rc = prog_resolve_stage(pr, 5, &out[5]);
+    if (fast && rc == 0 && out[5]) {
+        totk_cs_prog_memo4_put(&g_cs_prog_memo, (uint64_t)(uintptr_t)p, p->serial, epoch, sig5, (uint64_t)(uintptr_t)out[5]);
+    }
+    return rc;
 }
 int vk_prog_resolve_gfx(const prog_t *const progs[6], vk_shader *out[6]) {
     memset(out, 0, 6 * sizeof *out);

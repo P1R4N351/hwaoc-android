@@ -28,6 +28,8 @@
 #include "vk_vb_fast.h"
 #include "vk_stage_fast.h"
 #include "vk_state_fast.h"
+#include "vk_cs_fast.h"
+static totk_cs_pipe_state g_cs_pipe;
 static int ktglmemo_draw_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "../../runtime/present_clock.h"
 #include "../../runtime/present_predict.h"
@@ -2739,6 +2741,7 @@ static void fg_extract_authority_span_end(VkCommandBuffer cb) {
     unsigned level=FGX.authority_span.level,layer=FGX.authority_span.layer;
     FGX.authority_span.open=0;
     if (FGX.invalid) vk_fg_skip();
+    totk_cs_pipe_invalidate(&g_cs_pipe);
     if (!vk_fg_authority_span_end(cb,depth,level,layer))
         fg_extract_reject(VK_FG_DEPTH_LOST,"ordered depth authority after-copy unavailable");
 }
@@ -2749,6 +2752,7 @@ static void fg_extract_writer_end(VkCommandBuffer cb) {
         vk_fg_writer_poison("extractor rejected with pending writer span");
         return;
     }
+    totk_cs_pipe_invalidate(&g_cs_pipe);
     (void)vk_fg_writer_end(cb,FGX.writer.depth,FGX.writer.level,FGX.writer.layer,
         g_stat_draws-FGX.writer.draw0);
 }
@@ -2800,6 +2804,7 @@ static int fg_extract_depth_spans_before_draw(vk_shader *const sh[6]) {
     vk_end_rendering_at(diagnostic ? VK_PASS_END_DIAGNOSTIC : VK_PASS_END_COPY,0);
     if (target && !FGX.invalid) {
         if (unknown) {
+            totk_cs_pipe_invalidate(&g_cs_pipe);
             if (!vk_fg_authority_span_begin(vk_cb(),depth,level,layer,x,y,width,height,experimental))
                 fg_extract_reject(VK_FG_DEPTH_LOST,"ordered depth authority before-copy unavailable");
             else {
@@ -2811,6 +2816,7 @@ static int fg_extract_depth_spans_before_draw(vk_shader *const sh[6]) {
                 FGX.authority_span.experimental=experimental; FGX.authority_span.open=1;
             }
         }
+        if (diagnostic && !FGX.invalid) totk_cs_pipe_invalidate(&g_cs_pipe);
         if (diagnostic && !FGX.invalid &&
             vk_fg_writer_begin(vk_cb(),depth,level,layer,vs,fs,check,classification)) {
             FGX.writer.depth=depth; FGX.writer.level=level; FGX.writer.layer=layer;
@@ -4704,7 +4710,7 @@ static struct { uint64_t sub, hash[2]; VkDescriptorSetLayout dsl; size_t n; VkDe
 static struct { uint64_t sub; VkPipelineLayout layout; VkDescriptorSet set; } g_bound_set[2][6];   /* [graphics, compute][set index] */
 static totk_vb_state g_vb_state;
 static totk_vbuf_memo4 g_vbuf_memo4;
-static void descriptor_unbind(void) { memset(g_bound_set, 0, sizeof g_bound_set); totk_vb_invalidate(&g_vb_state); }
+static void descriptor_unbind(void) { memset(g_bound_set, 0, sizeof g_bound_set); totk_vb_invalidate(&g_vb_state); totk_cs_pipe_invalidate(&g_cs_pipe); }
 /* A fresh walker secondary inherits no pipeline, dynamic or descriptor state.
  * Descriptor contents remain cached; only binding-elision state is invalid. */
 void vk_draw_secondary_reset(void) {
@@ -5381,7 +5387,7 @@ static int quad_indirect_convert_batch(const uint64_t *inds, int n) {
         vk_qi_cache_put(&g_qi_cache, valid[k], (uint64_t)(uintptr_t)sb, (uint64_t)(d + 32));
     }
     qi_phase_barrier(cb, 2);
-    g_bound_pipe = VK_NULL_HANDLE;
+    g_bound_pipe = VK_NULL_HANDLE; totk_cs_pipe_invalidate(&g_cs_pipe);
     memset(g_bound_set[1], 0, sizeof g_bound_set[1]);
     g_qi_batches++; g_qi_batched_items += (uint64_t)nv;
     return nv;
@@ -5420,7 +5426,7 @@ static int quad_indirect_convert(VkBuffer ind_buf, VkDeviceSize ind_off, VkBuffe
     vkCmdPushConstants(cb, g_qi_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof max_quads, &max_quads);
     vkCmdDispatch(cb, 1, 1, 1);
     qi_phase_barrier(cb, 2);
-    g_bound_pipe = VK_NULL_HANDLE;
+    g_bound_pipe = VK_NULL_HANDLE; totk_cs_pipe_invalidate(&g_cs_pipe);
     memset(g_bound_set[1], 0, sizeof g_bound_set[1]);
     *out_buf = sb; *out_off = so + 32;
     return 1;
@@ -6447,7 +6453,7 @@ static void dispatch(const p_dispatch *dp) {
     if (vk_native_ui_enabled()) native_reads(sh,5,6);
     VkCommandBuffer cb = vk_cb();
     vk_barrier_all(cb);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
+    if (totk_cs_pipe_bind_needed(&g_cs_pipe, totk_vk_cs_fast_on(), (uint64_t)(uintptr_t)cb, vk_submit_serial(), (uint64_t)(uintptr_t)p)) vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p);
     uint32_t grid[3] = {(uint32_t)dp->x, (uint32_t)dp->y, (uint32_t)dp->z};
     if (__builtin_expect(vk_xlate_stats_enabled, 0)) {
         xlate_begin();
@@ -6464,7 +6470,7 @@ static void dispatch(const p_dispatch *dp) {
     vkCmdDispatch(cb, grid[0], grid[1], grid[2]);
     if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(cb);
     shader_xlate_first_command(sh[5], "dispatch");
-    if (vk_fg_extract_active && grid[0] && grid[1] && grid[2]) fg_extract_compute(sh);
+    if (vk_fg_extract_active && grid[0] && grid[1] && grid[2]) { fg_extract_compute(sh); totk_cs_pipe_invalidate(&g_cs_pipe); }
     vk_barrier_all(cb);
     pp_end(cb, pi);
     if (vk_gpuprof_on) vk_gpuprof_end(cb, VK_PASS_END_COMPUTE, 0);
@@ -9476,7 +9482,7 @@ static int pres_ahb_draw(int i, const tex_t *t, vk_tex *x, int srgb, uint32_t ow
     /* Ownership becomes foreign only after this command stream is submitted;
      * private prepare/cancel must retain the slot's actual prior GPU state. */
     if (!prepared_cb) vk_native_gpu_end(cb,scope);
-    g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; memset(g_bound_set[0], 0, sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state);
+    g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; memset(g_bound_set[0], 0, sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state); totk_cs_pipe_invalidate(&g_cs_pipe);
     return 1;
 fail:
     LOGV("window present: source cannot be sampled for AHB blit; using copy"); atomic_store(&g_ahb_off, 1); return 0;
@@ -10303,7 +10309,7 @@ generated_enqueue:
     /* The real image was submitted before any generated commands. Classify
        this whole ticket range before the real-frame endpoint is sealed. */
     vk_fg_synthetic_range(real->fence+1,b->fence);
-    g_bound_pipe=VK_NULL_HANDLE; g_dyn_dirty=1; memset(g_bound_set[0],0,sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state);
+    g_bound_pipe=VK_NULL_HANDLE; g_dyn_dirty=1; memset(g_bound_set[0],0,sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state); totk_cs_pipe_invalidate(&g_cs_pipe);
     pthread_mutex_lock(&g_win_mu);
     if (g_pres_trace || g_pres_slot_diag || g_pres_timeline) b->enqueue_ns=host_now_ns();
     pres_queue_locked(i); pthread_cond_signal(&g_pres_cv);
@@ -10424,7 +10430,7 @@ void vk_fg_slot_boundary(void) {
         g_slot_prepared_count--;
         atomic_store_explicit(&vk_fg_slot_boundary_active,g_slot_prepared_count!=0,memory_order_relaxed);
         pthread_mutex_unlock(&g_win_mu);
-        g_bound_pipe=VK_NULL_HANDLE; g_dyn_dirty=1; memset(g_bound_set[0],0,sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state);
+        g_bound_pipe=VK_NULL_HANDLE; g_dyn_dirty=1; memset(g_bound_set[0],0,sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state); totk_cs_pipe_invalidate(&g_cs_pipe);
     }
     uint64_t elapsed=host_now_ns()-g_slot_dispatch_stats.first_ns;
     if (elapsed>=UINT64_C(1000000000)) {
@@ -10633,7 +10639,7 @@ static void present_window(const tex_t *t, double period, const int crop[4]) {
         if (vk_post_run(post_cb,(unsigned)i,source,post_result ? post.w : vk_tex_width(x,0),post_result ? post.h : vk_tex_height(x,0),cx,cy,w,h,
                         (uint32_t)dw,(uint32_t)dh,srgb,&post)) {
             post_result = &post; cx = cy = 0; w = post.w; h = post.h;
-            g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; memset(g_bound_set[0],0,sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state);
+            g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; memset(g_bound_set[0],0,sizeof g_bound_set[0]); totk_vb_invalidate(&g_vb_state); totk_cs_pipe_invalidate(&g_cs_pipe);
         }
         vk_native_gpu_end(post_cb,scope);
     }
