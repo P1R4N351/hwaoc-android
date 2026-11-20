@@ -19,6 +19,7 @@
 #include "vk_int.h"
 #include "totk_nvn_sub_fast.h"
 #include "vk_gw_fast.h"
+#include "vk_ub_fast.h"
 #include "vk_ktgl_memo.h"
 static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "vk_record.h"
@@ -2601,7 +2602,7 @@ VkCommandBuffer vk_pre_cb(void) {
 static void *arena_alloc(arena_t *a, size_t size, size_t align, VkBuffer *buf, VkDeviceSize *off) {
     if (!align) align = 16;
     chunk_t *c = a->nchunk ? &a->chunks[a->nchunk - 1] : NULL;
-    VkDeviceSize at = c ? (c->used + align - 1) / align * align : 0;
+    VkDeviceSize at = c ? (totk_ub_fast_on() ? (VkDeviceSize)totk_align_up_sz(c->used, align) : (c->used + align - 1) / align * align) : 0;
     if (!c || at + size > c->size) {
         /* a free chunk (all are reset when the arena is) is used before a new one is made */
         int found = -1;
@@ -3922,15 +3923,29 @@ static int ub_pending_physical(uint64_t addr, uint64_t n) {
 #endif
     if (!vk_record_enabled()) { int idx[1]; return ub_overlaps(addr, addr + n, 1, idx, 1) != 0; }
     enum { NC = 256 }; static struct { uint64_t address, size, revision; } negative[NC];
-    __typeof__(negative[0]) *m = &negative[(unsigned)((addr >> 4) ^ (addr >> 18) ^ n) % NC];
-    if (m->address == addr && m->size == n && m->revision &&
-        (m->revision == g_ub_gen || vk_record_uniform_unchanged(m->revision, addr, n))) {
-        m->revision = g_ub_gen;
-        if (vk_rec_profile_on && T_rec.active) g_rec.touch_negative_hits++;
-        return 0;
+    static totk_ub_neg_memo4 neg4;
+    int fast = totk_ub_fast_on();
+    if (fast) {
+        totk_ub_neg_ent *e = totk_ub_neg_find(&neg4, addr, n);
+        if (e && e->revision && (e->revision == g_ub_gen || vk_record_uniform_unchanged(e->revision, addr, n))) {
+            e->revision = g_ub_gen;
+            if (vk_rec_profile_on && T_rec.active) g_rec.touch_negative_hits++;
+            return 0;
+        }
+    } else {
+        __typeof__(negative[0]) *m = &negative[(unsigned)((addr >> 4) ^ (addr >> 18) ^ n) % NC];
+        if (m->address == addr && m->size == n && m->revision &&
+            (m->revision == g_ub_gen || vk_record_uniform_unchanged(m->revision, addr, n))) {
+            m->revision = g_ub_gen;
+            if (vk_rec_profile_on && T_rec.active) g_rec.touch_negative_hits++;
+            return 0;
+        }
     }
     int idx[1], pending = ub_overlaps(addr, addr + n, 1, idx, 1) != 0;
-    if (!pending) *m = (__typeof__(*m)){addr, n, g_ub_gen};
+    if (!pending) {
+        if (fast) totk_ub_neg_put(&neg4, addr, n, g_ub_gen);
+        else negative[(unsigned)((addr >> 4) ^ (addr >> 18) ^ n) % NC] = (__typeof__(negative[0])){addr, n, g_ub_gen};
+    }
     return pending;
 }
 void vk_record_touch_buffer(uint64_t address, uint64_t size) {
@@ -3954,7 +3969,7 @@ void vk_record_touch_buffer(uint64_t address, uint64_t size) {
    updates go through renaming on top of them. A GPU copy into a range drops its snapshot (later bindings read memory on
    the GPU timeline). Ordinary snapshots require opt-in renaming; protected rename-OFF UBO captures are mandatory. */
 typedef struct { uint64_t done; int n; uint64_t *lo, *hi; size_t *off; uint8_t *bytes; } ucap_t;
-typedef struct { uint64_t lo, hi; VkBuffer buf; VkDeviceSize off; uint8_t *cpu; int dead, updated; } snap_t;
+typedef struct { uint64_t lo, hi; VkBuffer buf; VkDeviceSize off; uint8_t *cpu; int dead, updated; uint64_t upd_lo, upd_hi, upd_bloom; } snap_t;
 static snap_t *g_snap; static int g_nsnap, g_capsnap;
 static uint64_t g_snap_seq, g_snap_generation;   /* overlay watermark and immutable game-submission base identity */
 static void snap_reset(void) { g_nsnap = 0; g_snap_seq = g_ub_seq; g_snap_generation++; g_prune_floor = UINT64_MAX; ub_changed(0, UINT64_MAX); }
@@ -4509,14 +4524,33 @@ static void ucap_free(ucap_t *c) { if (c) { free(c->lo); free(c->hi); free(c->of
 void *mtl_sub_capture_ubos(const uint64_t *h, int n) { return snap_on() ? ucap_build(h, n, 1) : NULL; } /* async: eagerly own the bytes */
 static int snap_first(uint64_t a) { int lo = 0, hi = g_nsnap; while (lo < hi) { int m = (lo + hi) >> 1; if (g_snap[m].hi <= a) lo = m + 1; else hi = m; } return lo; }
 static const snap_t *snap_find(uint64_t a, uint64_t n) {   /* the live copy holding all of [a, a+n) */
+    static _Thread_local totk_snap_memo4 sm4;
+    if (!n) return NULL;
+    int fast = totk_ub_fast_on() && g_snap_generation != 0;
+    int32_t cached_i = -1;
+    if (fast && totk_snap_memo4_get(&sm4, a, n, g_snap_generation, &cached_i)) {
+        if (cached_i < 0) return NULL;
+        if (cached_i < g_nsnap && !g_snap[cached_i].dead && g_snap[cached_i].lo <= a && a + n <= g_snap[cached_i].hi)
+            return &g_snap[cached_i];
+        return NULL;
+    }
     int i = snap_first(a);
-    return i < g_nsnap && !g_snap[i].dead && g_snap[i].lo <= a && a + n <= g_snap[i].hi ? &g_snap[i] : NULL;
+    int hit = i < g_nsnap && g_snap[i].lo <= a && a + n <= g_snap[i].hi;
+    if (fast) totk_snap_memo4_put(&sm4, a, n, g_snap_generation, hit ? (int32_t)i : -1);
+    return hit && !g_snap[i].dead ? &g_snap[i] : NULL;
 }
 /* A snapshot already contains all updates logged at its creation. Only a later overlapping update can make a binding
    need an overlay: mark once at the update instead of searching the whole log at every binding of untouched snapshots.
    The flag stays conservative after chunk submissions seal / prune those updates. */
 static void snap_note_update(uint64_t lo, uint64_t n) {
-    for (int i = snap_first(lo); i < g_nsnap && g_snap[i].lo < lo + n; i++) g_snap[i].updated = 1;
+    if (!n) return;
+    uint64_t hi = lo + n, blm = totk_ub_page_bloom(lo, hi);
+    for (int i = snap_first(lo); i < g_nsnap && g_snap[i].lo < hi; i++) {
+        snap_t *s = &g_snap[i];
+        if (!s->updated || lo < s->upd_lo) s->upd_lo = lo;
+        if (!s->updated || hi > s->upd_hi) s->upd_hi = hi;
+        s->upd_bloom |= blm; s->updated = 1;
+    }
 }
 /* updated is only a cheap rejection hint. A merged snapshot can contain thousands of untouched bindings after
    one tiny update. The retained ordered log proves the requested subrange, including partial overlays; the
@@ -4524,6 +4558,7 @@ static void snap_note_update(uint64_t lo, uint64_t n) {
 static int snap_range_updated(const snap_t *sn, uint64_t address, uint64_t size) {
     uint64_t end = address + size;
     if (!sn->updated || !g_nub || end <= g_ub_lo || address >= g_ub_hi) return 0;
+    if (totk_ub_fast_on() && (end <= sn->upd_lo || address >= sn->upd_hi || !(sn->upd_bloom & totk_ub_page_bloom(address, end)))) return 0;
     int a = 0, b = g_nub;
     while (a < b) { int m = (a + b) >> 1; if (g_ub[m].lo < end) a = m + 1; else b = m; }
     uint64_t floor = address > g_ub_maxlen ? address - g_ub_maxlen : 0;
@@ -4692,7 +4727,7 @@ static void snapshot_ubos_inner(const uint64_t *h, int n, void *capv) {   /* the
             uint64_t a = e->lo > lo ? e->lo : lo, z = e->hi < hi ? e->hi : hi;
             memcpy(p + (a - lo), e->data + (a - e->lo), (size_t)(z - a));
         }
-        g_snap[g_nsnap++] = (snap_t){lo, hi, b, o, p, 0, 0};
+        g_snap[g_nsnap++] = (snap_t){lo, hi, b, o, p, 0, 0, 0, 0, 0};
         g_stat_snap_bytes += sz;
     }
     g_stat_snap_ranges += (uint64_t)g_nsnap;
@@ -4708,10 +4743,22 @@ int vk_ub_rename(uint64_t addr, uint64_t size, VkDescriptorBufferInfo *out) {
        same as last time. */
     enum { NM = 1024 };
     static struct { uint64_t addr, size, gen, sub; const void *sn; int ret; VkDescriptorBufferInfo d; } memo[NM];
-    uint64_t msub = vk_submit_serial(); unsigned mh = (unsigned)((addr >> 4) ^ (addr >> 14) ^ (size * 2654435761u)) % NM;
-    if (memo[mh].addr == addr && memo[mh].size == size && memo[mh].gen == g_ub_gen && memo[mh].sub == msub && memo[mh].sn == (const void *)sn) { if (memo[mh].ret) *out = memo[mh].d; return memo[mh].ret; }
+    static totk_ub_rename_memo4 ren4;
+    uint64_t msub = vk_submit_serial(), sn_tag = (uint64_t)(uintptr_t)sn;
+    int fast = totk_ub_fast_on();
+    if (fast) {
+        int ret = 0; uint64_t bu = 0, of = 0, rn = 0;
+        if (totk_ub_ren_get(&ren4, addr, size, g_ub_gen, msub, sn_tag, &ret, &bu, &of, &rn)) {
+            if (ret) *out = (VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)bu, (VkDeviceSize)of, (VkDeviceSize)rn};
+            return ret;
+        }
+    } else {
+        unsigned mh = (unsigned)((addr >> 4) ^ (addr >> 14) ^ (size * 2654435761u)) % NM;
+        if (memo[mh].addr == addr && memo[mh].size == size && memo[mh].gen == g_ub_gen && memo[mh].sub == msub && memo[mh].sn == (const void *)sn) { if (memo[mh].ret) *out = memo[mh].d; return memo[mh].ret; }
+    }
     int ret = ub_rename_slow(addr, size, sn, out);
-    memo[mh].addr = addr; memo[mh].size = size; memo[mh].gen = g_ub_gen; memo[mh].sub = msub; memo[mh].sn = sn; memo[mh].ret = ret; if (ret) memo[mh].d = *out;
+    if (fast) totk_ub_ren_put(&ren4, addr, size, g_ub_gen, msub, sn_tag, ret, ret ? (uint64_t)(uintptr_t)out->buffer : 0u, ret ? (uint64_t)out->offset : 0u, ret ? (uint64_t)out->range : 0u);
+    else { unsigned mh = (unsigned)((addr >> 4) ^ (addr >> 14) ^ (size * 2654435761u)) % NM; memo[mh].addr = addr; memo[mh].size = size; memo[mh].gen = g_ub_gen; memo[mh].sub = msub; memo[mh].sn = sn; memo[mh].ret = ret; if (ret) memo[mh].d = *out; }
     return ret;
 }
 static int ub_rename_slow(uint64_t addr, uint64_t size, const snap_t *sn, VkDescriptorBufferInfo *out) {
@@ -4737,9 +4784,18 @@ static int ub_rename_slow(uint64_t addr, uint64_t size, const snap_t *sn, VkDesc
     /* the same range with the same newest update in this submission: the copy made for it is still right */
     enum { NC = 256 };
     static struct { uint64_t addr, size, seq, sub; const void *base; VkDescriptorBufferInfo d; } cache[NC];
-    uint64_t newest = n ? g_ub[idx[n - 1]].seq : 0, sub = vk_submit_serial();
-    unsigned h = (unsigned)((addr >> 4) ^ (addr >> 16) ^ size) % NC;
-    if (cache[h].addr == addr && cache[h].size == size && cache[h].seq == newest && cache[h].sub == sub && cache[h].base == (const void *)sn) { *out = cache[h].d; return 1; }
+    static totk_ub_copy_memo4 cpy4;
+    uint64_t newest = n ? g_ub[idx[n - 1]].seq : 0, sub = vk_submit_serial(), sn_tag = (uint64_t)(uintptr_t)sn;
+    int fast = totk_ub_fast_on();
+    if (fast) {
+        uint64_t bu = 0, of = 0, rn = 0;
+        if (totk_ub_cpy_get(&cpy4, addr, size, newest, sub, sn_tag, &bu, &of, &rn)) {
+            *out = (VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)bu, (VkDeviceSize)of, (VkDeviceSize)rn}; return 1;
+        }
+    } else {
+        unsigned h = (unsigned)((addr >> 4) ^ (addr >> 16) ^ size) % NC;
+        if (cache[h].addr == addr && cache[h].size == size && cache[h].seq == newest && cache[h].sub == sub && cache[h].base == (const void *)sn) { *out = cache[h].d; return 1; }
+    }
     VkBuffer tb; VkDeviceSize to;
     uint8_t *p = vk_transient(size, align, &tb, &to);
     ft_snapshot_allocation(size);
@@ -4750,7 +4806,8 @@ static int ub_rename_slow(uint64_t addr, uint64_t size, const snap_t *sn, VkDesc
         memcpy(p + (lo - addr), e->data + (lo - e->lo), (size_t)(hi - lo));
     }
     *out = (VkDescriptorBufferInfo){tb, to, size};
-    cache[h].addr = addr; cache[h].size = size; cache[h].seq = newest; cache[h].sub = sub; cache[h].base = sn; cache[h].d = *out;
+    if (fast) totk_ub_cpy_put(&cpy4, addr, size, newest, sub, sn_tag, (uint64_t)(uintptr_t)tb, (uint64_t)to, size);
+    else { unsigned h = (unsigned)((addr >> 4) ^ (addr >> 16) ^ size) % NC; cache[h].addr = addr; cache[h].size = size; cache[h].seq = newest; cache[h].sub = sub; cache[h].base = sn; cache[h].d = *out; }
     g_stat_ub_renamed++;
     return 1;
 }
@@ -5857,17 +5914,32 @@ void vk_ub_read(uint64_t addr, void *dst, size_t size) {
     const snap_t *sn = g_nsnap ? snap_find(addr, size) : NULL;
     enum { NC = 128, BYTES = 32 };
     static struct { uint64_t address, size, revision, submission; const snap_t *snapshot; uint8_t bytes[BYTES]; } memo[NC];
+    static totk_ub_ptr_memo4 ptr4;
     if (!vk_record_enabled() || !sn || !sn->updated || size > BYTES) { ub_read_from(addr, dst, size, sn); return; }
-    __typeof__(memo[0]) *m = &memo[(unsigned)((addr >> 3) ^ (addr >> 16) ^ size) % NC];
-    uint64_t submission = vk_submit_serial();
-    if (m->address == addr && m->size == size && m->snapshot == sn && m->submission == submission &&
-        (m->revision == g_ub_gen || vk_record_uniform_unchanged(m->revision, addr, size))) {
-        memcpy(dst, m->bytes, size); m->revision = g_ub_gen;
-        if (vk_rec_profile_on && T_rec.active) g_rec.pointer_hits++;
-        return;
+    uint64_t submission = vk_submit_serial(), sn_tag = (uint64_t)(uintptr_t)sn;
+    int fast = totk_ub_fast_on();
+    if (fast) {
+        totk_ub_ptr_ent *e = totk_ub_ptr_find(&ptr4, addr, size, submission, sn_tag);
+        if (e && (e->revision == g_ub_gen || vk_record_uniform_unchanged(e->revision, addr, size))) {
+            memcpy(dst, e->bytes, size); e->revision = g_ub_gen;
+            if (vk_rec_profile_on && T_rec.active) g_rec.pointer_hits++;
+            return;
+        }
+    } else {
+        __typeof__(memo[0]) *m = &memo[(unsigned)((addr >> 3) ^ (addr >> 16) ^ size) % NC];
+        if (m->address == addr && m->size == size && m->snapshot == sn && m->submission == submission &&
+            (m->revision == g_ub_gen || vk_record_uniform_unchanged(m->revision, addr, size))) {
+            memcpy(dst, m->bytes, size); m->revision = g_ub_gen;
+            if (vk_rec_profile_on && T_rec.active) g_rec.pointer_hits++;
+            return;
+        }
     }
     ub_read_from(addr, dst, size, sn);
-    m->address = addr; m->size = size; m->snapshot = sn; m->submission = submission; m->revision = g_ub_gen; memcpy(m->bytes, dst, size);
+    if (fast) totk_ub_ptr_put(&ptr4, addr, size, g_ub_gen, submission, sn_tag, dst);
+    else {
+        __typeof__(memo[0]) *m = &memo[(unsigned)((addr >> 3) ^ (addr >> 16) ^ size) % NC];
+        m->address = addr; m->size = size; m->snapshot = sn; m->submission = submission; m->revision = g_ub_gen; memcpy(m->bytes, dst, size);
+    }
     if (vk_rec_profile_on && T_rec.active) g_rec.pointer_misses++;
 }
 /* Return the authority that supplies every byte without a mutable native gap: explicit immutable snapshot (1),
