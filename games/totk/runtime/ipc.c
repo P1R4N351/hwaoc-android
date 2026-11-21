@@ -4,6 +4,7 @@
    commands stop the runtime with their name and id instead of returning a fake success. */
 #include "runtime.h"
 #include "ipc.h"
+#include "totk_time_fast.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -72,9 +73,11 @@ static uint64_t buffer_addr(const uint32_t *d) { return d[1] | ((uint64_t)((d[2]
 static uint64_t buffer_size(const uint32_t *d) { return d[0] | ((uint64_t)((d[2] >> 24) & 0xf) << 32); }
 
 static void parse(const uint32_t *m, IpcRequest *rq, const uint32_t **data_words, unsigned *ndata) {
-    memset(rq, 0, sizeof *rq);
-    rq->type = m[0] & 0xffff;
-    rq->nx = (m[0] >> 16) & 0xf; rq->na = (m[0] >> 20) & 0xf; rq->nb = (m[0] >> 24) & 0xf; rq->nw = (m[0] >> 28) & 0xf;
+    if (totk_time_fast_active()) totk_ipc_req_reset_fast(rq, m[0]);
+    else {
+        memset(rq, 0, sizeof *rq); rq->type = m[0] & 0xffff;
+        rq->nx = (m[0] >> 16) & 0xf; rq->na = (m[0] >> 20) & 0xf; rq->nb = (m[0] >> 24) & 0xf; rq->nw = (m[0] >> 28) & 0xf;
+    }
     *ndata = m[1] & 0x3ff;
     unsigned recv_mode = (m[1] >> 10) & 0xf, special = m[1] >> 31;
     if (rq->nx > IPC_MAX_BUF || rq->na > IPC_MAX_BUF || rq->nb > IPC_MAX_BUF || rq->nw > IPC_MAX_BUF) runtime_fail("IPC too many buffers");
@@ -88,8 +91,10 @@ static void parse(const uint32_t *m, IpcRequest *rq, const uint32_t **data_words
         for (unsigned i = 0; i < rq->nmove; i++) rq->move[i] = *p++;
     }
     for (unsigned i = 0; i < rq->nx; i++, p += 2) rq->x[i] = (IpcBuffer){static_addr(p), p[0] >> 16, p[0] & 0x3f};
-    IpcBuffer *lists[3] = {rq->a, rq->b, rq->w}; unsigned counts[3] = {rq->na, rq->nb, rq->nw};
-    for (unsigned k = 0; k < 3; k++) for (unsigned i = 0; i < counts[k]; i++, p += 3) lists[k][i] = (IpcBuffer){buffer_addr(p), buffer_size(p), i};
+    if (!totk_time_fast_active() || (rq->na | rq->nb | rq->nw)) {
+        IpcBuffer *lists[3] = {rq->a, rq->b, rq->w}; unsigned counts[3] = {rq->na, rq->nb, rq->nw};
+        for (unsigned k = 0; k < 3; k++) for (unsigned i = 0; i < counts[k]; i++, p += 3) lists[k][i] = (IpcBuffer){buffer_addr(p), buffer_size(p), i};
+    }
     *data_words = p;
     const uint32_t *recv = p + *ndata;
     rq->nc = recv_mode == 2 ? 1 : recv_mode > 2 ? recv_mode - 2 : 0;
@@ -99,32 +104,29 @@ static void parse(const uint32_t *m, IpcRequest *rq, const uint32_t **data_words
 }
 
 static void respond(uint32_t *m, int tipc, const IpcResponse *rs) {
-    uint32_t out[MSG_BYTES / 4]; memset(out, 0, sizeof out);
-    unsigned special = rs->ncopy || rs->nmove;
+    uint32_t out[MSG_BYTES / 4];
+    unsigned special = rs->ncopy || rs->nmove, fast = totk_time_fast_active();
+    size_t widx = 2u + (special ? 1u + rs->ncopy + rs->nmove : 0u) + (size_t)rs->nxout * 2u;
+    size_t woff = widx * 4u, pay_off = tipc ? woff : ((woff + 15u) & ~(size_t)15u);
+    unsigned header = tipc ? 4u : 16u;
+    unsigned used = (unsigned)(pay_off - woff) + header + rs->data_size;
+    unsigned nwords = tipc ? (used + 3u) / 4u : (used + 16u + 3u) / 4u;
+    if (woff + (size_t)nwords * 4u > MSG_BYTES) runtime_fail("IPC response exceeds message buffer");
+    size_t total = fast ? totk_ipc_respond_bytes(woff, nwords, MSG_BYTES) : MSG_BYTES;
+    memset(out, 0, total);
     uint32_t *p = out + 2;
-    if (special) {
-        *p++ = (rs->ncopy << 1) | (rs->nmove << 5);
-        for (unsigned i = 0; i < rs->ncopy; i++) *p++ = rs->copy[i];
-        for (unsigned i = 0; i < rs->nmove; i++) *p++ = rs->move[i];
-    }
+    if (special) { *p++ = (rs->ncopy << 1) | (rs->nmove << 5); for (unsigned i = 0; i < rs->ncopy; i++) *p++ = rs->copy[i]; for (unsigned i = 0; i < rs->nmove; i++) *p++ = rs->move[i]; }
     for (unsigned i = 0; i < rs->nxout; i++, p += 2) {
         uint64_t a = rs->xout[i].addr;
         p[0] = (rs->xout[i].index & 0x3f) | (uint32_t)(((a >> 36) & 0x3f) << 6) | (uint32_t)(((a >> 32) & 0xf) << 12) | (uint32_t)(rs->xout[i].size << 16);
         p[1] = (uint32_t)a;
     }
-    uint8_t *words = (uint8_t *)p, *payload;
-    unsigned header = tipc ? 4 : 16;
-    if (tipc) payload = words;
-    else payload = (uint8_t *)out + (((words - (uint8_t *)out) + 15) & ~15);
-    unsigned used = (unsigned)(payload - words) + header + rs->data_size;
-    unsigned nwords = tipc ? (used + 3) / 4 : (used + 16 + 3) / 4;   /* CMIF keeps alignment slack like libnx */
-    if ((size_t)(words - (uint8_t *)out) + nwords * 4 > MSG_BYTES) runtime_fail("IPC response exceeds message buffer");
+    uint8_t *payload = (uint8_t *)out + pay_off;
     if (tipc) memcpy(payload, &rs->result, 4);
     else { uint32_t h[4] = {CMIF_OUT_MAGIC, 0, rs->result, 0}; memcpy(payload, h, 16); }
     memcpy(payload + header, rs->data, rs->data_size);
-    out[0] = (rs->nxout & 0xf) << 16;
-    out[1] = (nwords & 0x3ff) | (special ? 1u << 31 : 0);
-    memcpy(m, out, MSG_BYTES);
+    out[0] = (rs->nxout & 0xf) << 16; out[1] = (nwords & 0x3ff) | (special ? 1u << 31 : 0);
+    memcpy(m, out, total);
 }
 
 /* ---------- Control requests (CMIF) ---------- */
@@ -150,7 +152,7 @@ static void dispatch(IpcSession *s, uint32_t *m) {
     IpcRequest rq; const uint32_t *words; unsigned ndata;
     parse(m, &rq, &words, &ndata);
     if (ipc_dump_on() && rq.na + rq.nb) { fprintf(stderr, "[totk-ipc] raw %s:", s->name); for (unsigned i = 0; i < 20; i++) fprintf(stderr, " %08x", m[i]); fputc('\n', stderr); }
-    IpcResponse rs; memset(&rs, 0, sizeof rs);
+    IpcResponse rs; if (totk_time_fast_active()) totk_ipc_resp_reset_fast(&rs); else memset(&rs, 0, sizeof rs);
     if (rq.type == T_CLOSE || rq.type == T_TIPC_CLOSE) return;
     int tipc = rq.type >= T_TIPC_BASE;
     const uint8_t *bytes = (const uint8_t *)words, *end = bytes + ndata * 4;
