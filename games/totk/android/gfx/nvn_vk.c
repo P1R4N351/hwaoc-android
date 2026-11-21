@@ -23,6 +23,7 @@
 #include "vk_ktgl_memo.h"
 #include "vk_img_fast.h"
 #include "vk_imgmem_fast.h"
+#include "vk_post_fast.h"
 static int img_fast_nvn_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "vk_record.h"
@@ -1678,9 +1679,15 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g
  * residence, AFTER CPU posts/publication prerequisites, at g_done availability.
  * This is a CPU observation, not the GPU's hardware signal timestamp. */
 enum { PRESENT_READY_HISTORY = 1024 };
+static uint32_t g_cv_waiters;
+static totk_present_ready_ring g_present_ready_fast;
+static void nvn_cv_wait(void) { g_cv_waiters++; pthread_cond_wait(&g_cv, &g_mu); g_cv_waiters--; }
+static int nvn_cv_timedwait(const struct timespec *dl) { g_cv_waiters++; int rc = pthread_cond_timedwait(&g_cv, &g_mu, dl); g_cv_waiters--; return rc; }
+static void nvn_cv_wake(void) { if (totk_cv_should_wake(g_cv_waiters, totk_vk_post_fast_on(), 0)) pthread_cond_broadcast(&g_cv); }
 static struct { uint64_t ticket, ready_ns; } g_present_ready[PRESENT_READY_HISTORY];
 uint64_t vk_present_ready_ns(uint64_t ticket) {
     if (!ticket) return 0;
+    if (totk_vk_post_fast_on()) return totk_present_ready_read(&g_present_ready_fast, ticket, 0);
     pthread_mutex_lock(&g_mu);
     unsigned index = (unsigned)(ticket % PRESENT_READY_HISTORY);
     uint64_t ready = g_present_ready[index].ticket == ticket ? g_present_ready[index].ready_ns : 0;
@@ -2178,125 +2185,120 @@ static void *gpu_guard_thread(void *unused) {
         nvn_dirty_lag_complete(s->value);
         pthread_mutex_lock(&g_mu);
         g_gpu_head++;
-        pthread_cond_broadcast(&g_cv);
+        nvn_cv_wake();
         pthread_mutex_unlock(&g_mu);
     }
     return NULL;
 }
+static void completion_read_ts(
+        slot_t *s, uint64_t *gpu_ns_out, double *fg_ms_out, int *fg_ok_out, uint64_t *rs_out, uint64_t *re_out, int *tv_out) {
+    uint64_t t[2];
+    if (vkGetQueryPoolResults(V.dev, s->ts, 0, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT)) return;
+    if (t[1] > t[0]) {
+        uint64_t gpu_ns = (uint64_t)((double)(t[1] - t[0]) * V.props.limits.timestampPeriod);
+        *gpu_ns_out = gpu_ns;
+        atomic_fetch_add(&g_perf_gpu_ns, gpu_ns);
+        vk_pipeline_keys_pressure(host_now_ns(), gpu_ns > 25000000);
+    }
+    uint64_t pre = t[0]; int pre_valid = 1;
+    int framegen = vk_fg_enabled() && vk_fg_interpolating();
+    if (s->pre_open && (g_gpu_time_hardware || framegen))
+        pre_valid = vkGetQueryPoolResults(V.dev, s->ts, 2, 1, sizeof pre, &pre, sizeof pre, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+    if (framegen && pre_valid && V.timestamp_bits && V.props.limits.timestampPeriod > 0) {
+        uint64_t mask = V.timestamp_bits >= 64 ? UINT64_MAX : (UINT64_C(1) << V.timestamp_bits) - 1;
+        *fg_ms_out = (double)((t[1] - pre) & mask) * V.props.limits.timestampPeriod / 1e6;
+        *fg_ok_out = 1;
+    }
+    if (g_gpu_time_hardware && g_ts_clock_valid) {
+        *rs_out = guest_clock_ticks_to_ns(vk_timestamp_ticks(t[0], g_ts_gpu_sample, g_ts_host_sample, V.props.limits.timestampPeriod, V.timestamp_bits));
+        *re_out = guest_clock_ticks_to_ns(vk_timestamp_ticks(t[1], g_ts_gpu_sample, g_ts_host_sample, V.props.limits.timestampPeriod, V.timestamp_bits));
+        *tv_out = (*re_out >= *rs_out);
+        if (s->pre_open) {
+            if (pre_valid) *rs_out = guest_clock_ticks_to_ns(vk_timestamp_ticks(pre, g_ts_gpu_sample, g_ts_host_sample, V.props.limits.timestampPeriod, V.timestamp_bits));
+            else *tv_out = 0;
+        }
+        *tv_out &= (*re_out >= *rs_out);
+    }
+}
+static void completion_slot_finish(slot_t *s, uint64_t gpu_ns, double fg_ms, int fg_ok, uint64_t rs, uint64_t re, int tv) {
+    if (vk_fg_enabled() && vk_fg_interpolating()) vk_fg_gpu_sample(s->value, fg_ms, fg_ok);
+    totk_perf_gpu(s->guest_frame, gpu_ns);
+    if (s->ft_frame && totk_ft_on()) totk_ft_slot_gpu(s->ft_frame, s->value, s->ft_gpu_done, gpu_ns);
+    occl_complete(s);
+    if (vk_gpuprof_on) vk_gpuprof_slot_complete(&s->gpuprof);
+    if (!tv) gpu_time_unavailable(s->guest_frame, "slot GPU bracket unavailable");
+    vk_gpu_time_slot timing = {.guest_ns = s->guest_submit_ns, .raw_start_ns = rs, .raw_end_ns = re};
+    if (g_gpu_time_hardware && tv && !g_gpu_time_uncertain)
+        timing = vk_gpu_time_begin(&g_gpu_time_queue, s->guest_submit_ns, rs, re);
+    for (uint32_t i = 0; i < s->tsq_count; i++) {
+        unsigned q = (s->tsq_first + i) % TSQ;
+        g_tsq_time[q].origin_ticks = s->guest_origin_ticks;
+        if (g_gpu_time_hardware) {
+            g_tsq_time[q].slot = timing; g_tsq_time[q].frame = s->guest_frame;
+            g_tsq_time[q].valid = tv && !g_gpu_time_uncertain;
+            g_tsq_time[q].clock_gpu = g_ts_gpu_sample; g_tsq_time[q].clock_guest = g_ts_host_sample;
+        }
+    }
+    if (s->guest_frame && s->queue_ns >= s->guest_submit_ns) {
+        g_gpu_time_stats[GT_SLOTS]++;
+        g_gpu_time_stats[GT_SUBMIT_DELAY] += s->queue_ns - s->guest_submit_ns;
+    }
+    apply_posts(s, &timing, tv);
+}
+static void completion_publish(slot_t *s, uint64_t t1, int track_ready) {
+    pthread_mutex_lock(&g_mu);
+#ifdef TOTK_VK_TESTS
+    if (g_test_completion_hold == s->value) {
+        atomic_store_explicit(&g_test_completion_held, s->value, memory_order_release);
+        nvn_cv_wake();
+        while (g_test_completion_hold == s->value) nvn_cv_wait();
+        atomic_store_explicit(&g_test_completion_held, 0, memory_order_release);
+    }
+#endif
+    if (g_gpu_time_hardware) for (int i = 0; i < s->npost; i++) {
+        const post_op *p = &s->post[i];
+        if (p->kind == 2 && p->type == NVN_COUNTER_TYPE_TIMESTAMP)
+            vk_gpu_time_sample_publish(&g_gpu_time_samples, p->addr, p->report_ticks, p->report_origin);
+    }
+    memcpy(g_gpu_time_published, g_gpu_time_stats, sizeof g_gpu_time_published);
+    if (s->ft_frame && totk_ft_on()) totk_ff_ticket_publish(s->value, totk_ft_now(), (unsigned)s->npost);
+    s->npost = 0; s->busy = 0; g_qhead++;
+    if (!s->submit_busy && !replay_until((unsigned)(s - g_ring))) vk_record_slot_retire((unsigned)(s - g_ring));
+    atomic_store(&g_done, s->value);
+    replay_retire(s->value);
+    if (track_ready) {
+        uint64_t rns = host_now_ns();
+        unsigned index = (unsigned)(s->value % PRESENT_READY_HISTORY);
+        g_present_ready[index].ticket = s->value;
+        g_present_ready[index].ready_ns = rns;
+        totk_present_ready_note(&g_present_ready_fast, s->value, rns);
+    }
+    if (g_hitch_on) { g_done_at = host_now_ns(); HK_ADD(comp_ns, g_done_at - t1); }
+    nvn_cv_wake();
+    pthread_mutex_unlock(&g_mu);
+}
 static void *completion_thread(void *arg) {
-    (void)arg;
-    totk_thread_start("totk-post", NULL);
-    nvn_dirty_lag_thread_role("completion-post");
+    (void)arg; totk_thread_start("totk-post", NULL); nvn_dirty_lag_thread_role("completion-post");
     for (;;) {
         pthread_mutex_lock(&g_mu);
-        /* The GPU-only cursor's existence is immutable, even after capture is disabled at runtime.
-           It must pass a slot before posts release that slot for reuse. */
-        if (g_lag_wait == 1) { while (g_qhead == g_qtail || g_gpu_head == g_qhead) pthread_cond_wait(&g_cv, &g_mu); }
+        if (g_lag_wait == 1) { while (g_qhead == g_qtail || g_gpu_head == g_qhead) nvn_cv_wait(); }
         else while (g_qhead == g_qtail) pthread_cond_wait(&g_cv_work, &g_mu);
         slot_t *s = g_queue_[g_qhead % RING];
-        while (g_ub_publication == s->value) pthread_cond_wait(&g_cv, &g_mu);
+        while (g_ub_publication == s->value) nvn_cv_wait();
         pthread_mutex_unlock(&g_mu);
         totk_live_slack_tick();
         if (g_lag_wait != 1) {
             gpu_wait_slot(s);
             if (s->ft_frame && totk_ft_on()) s->ft_gpu_done = totk_ft_now();
         }
-        uint64_t t1 = g_hitch_on ? host_now_ns() : 0;   /* observed GPU completion handoff, not the driver's actual signal time */
-        uint64_t gpu_ns = 0;
-        int framegen=vk_fg_enabled() && vk_fg_interpolating(), framegen_valid=0;
-        double framegen_ms=0;
+        uint64_t t1 = g_hitch_on ? host_now_ns() : 0, gpu_ns = 0, rs = 0, re = 0;
+        double fg_ms = 0; int fg_ok = 0, tv = 0;
         if (g_ts_on > 0 || g_gpu_time_hardware) ts_calibrate();
-        uint64_t raw_start_ns = 0, raw_end_ns = 0; int timing_valid = 0;
-        if (s->ts_on) {
-            uint64_t t[2];
-            if (!vkGetQueryPoolResults(V.dev, s->ts, 0, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT)) {
-                if (t[1] > t[0]) {
-                    gpu_ns = (uint64_t)((double)(t[1] - t[0]) * V.props.limits.timestampPeriod);
-                    atomic_fetch_add(&g_perf_gpu_ns, gpu_ns);
-                    vk_pipeline_keys_pressure(host_now_ns(), gpu_ns > 25000000);
-                }
-                /* Reuse this slot's existing bracket. Pre uploads execute before
-                   all main primaries; include them in headroom, not host waits. */
-                uint64_t pre=t[0];
-                int pre_valid=1;
-                if (s->pre_open && (g_gpu_time_hardware || framegen))
-                    pre_valid=vkGetQueryPoolResults(V.dev,s->ts,2,1,sizeof pre,&pre,sizeof pre,VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
-                if (framegen && pre_valid && V.timestamp_bits && V.props.limits.timestampPeriod > 0) {
-                    uint64_t mask=V.timestamp_bits >= 64 ? UINT64_MAX : (UINT64_C(1) << V.timestamp_bits)-1;
-                    framegen_ms=(double)((t[1]-pre) & mask)*V.props.limits.timestampPeriod/1e6;
-                    framegen_valid=1;
-                }
-                if (g_gpu_time_hardware && g_ts_clock_valid) {
-                    raw_start_ns = guest_clock_ticks_to_ns(vk_timestamp_ticks(t[0], g_ts_gpu_sample, g_ts_host_sample, V.props.limits.timestampPeriod, V.timestamp_bits));
-                    raw_end_ns = guest_clock_ticks_to_ns(vk_timestamp_ticks(t[1], g_ts_gpu_sample, g_ts_host_sample, V.props.limits.timestampPeriod, V.timestamp_bits));
-                    timing_valid = raw_end_ns >= raw_start_ns;
-                    if (g_gpu_time_hardware && s->pre_open) {
-                        if (pre_valid)
-                            raw_start_ns = guest_clock_ticks_to_ns(vk_timestamp_ticks(pre, g_ts_gpu_sample, g_ts_host_sample, V.props.limits.timestampPeriod, V.timestamp_bits));
-                        else timing_valid = 0;
-                    }
-                    timing_valid &= raw_end_ns >= raw_start_ns;
-                }
-            }
-        }
-        if (framegen) vk_fg_gpu_sample(s->value,framegen_ms,framegen_valid);
-        totk_perf_gpu(s->guest_frame, gpu_ns);   /* TOTK_ADPF_GPU: per guest frame, in completion order */
-        /* The guard cursor publishes its fence observation under g_mu before we can reach this slot.
-           Report before CPU post ops: their completion is not GPU finish. gpu_ns covers main buffers, not pre. */
-        if (s->ft_frame && totk_ft_on()) totk_ft_slot_gpu(s->ft_frame, s->value, s->ft_gpu_done, gpu_ns);
-        occl_complete(s);
-        if (vk_gpuprof_on) vk_gpuprof_slot_complete(&s->gpuprof);
-        if (!timing_valid) gpu_time_unavailable(s->guest_frame, "slot GPU bracket unavailable");
-        vk_gpu_time_slot timing = {.guest_ns = s->guest_submit_ns, .raw_start_ns = raw_start_ns, .raw_end_ns = raw_end_ns};
-        if (g_gpu_time_hardware && timing_valid && !g_gpu_time_uncertain)
-            timing = vk_gpu_time_begin(&g_gpu_time_queue, s->guest_submit_ns, raw_start_ns, raw_end_ns);
-        for (uint32_t i = 0; i < s->tsq_count; i++) {
-            unsigned q = (s->tsq_first + i) % TSQ;
-            g_tsq_time[q].origin_ticks = s->guest_origin_ticks;
-            if (g_gpu_time_hardware) {
-                g_tsq_time[q].slot = timing; g_tsq_time[q].frame = s->guest_frame;
-                g_tsq_time[q].valid = timing_valid && !g_gpu_time_uncertain;
-                g_tsq_time[q].clock_gpu = g_ts_gpu_sample; g_tsq_time[q].clock_guest = g_ts_host_sample;
-            }
-        }
-        if (s->guest_frame && s->queue_ns >= s->guest_submit_ns) {
-            g_gpu_time_stats[GT_SLOTS]++;
-            g_gpu_time_stats[GT_SUBMIT_DELAY] += s->queue_ns - s->guest_submit_ns;
-        }
-        apply_posts(s, &timing, timing_valid);
+        if (s->ts_on) completion_read_ts(s, &gpu_ns, &fg_ms, &fg_ok, &rs, &re, &tv);
+        completion_slot_finish(s, gpu_ns, fg_ms, fg_ok, rs, re, tv);
         int track_ready = runtime_android_predict_active() || runtime_android_fps_auto_active() ||
-                          vk_fg_enabled() || totk_ft_on(); /* never enter frontend under g_mu */
-        pthread_mutex_lock(&g_mu);
-#ifdef TOTK_VK_TESTS
-        if (g_test_completion_hold==s->value) {
-            atomic_store_explicit(&g_test_completion_held,s->value,memory_order_release);
-            pthread_cond_broadcast(&g_cv);
-            while (g_test_completion_hold==s->value) pthread_cond_wait(&g_cv,&g_mu);
-            atomic_store_explicit(&g_test_completion_held,0,memory_order_release);
-        }
-#endif
-        if (g_gpu_time_hardware) for (int i = 0; i < s->npost; i++) {
-            const post_op *p = &s->post[i];
-            if (p->kind == 2 && p->type == NVN_COUNTER_TYPE_TIMESTAMP)
-                vk_gpu_time_sample_publish(&g_gpu_time_samples, p->addr, p->report_ticks, p->report_origin);
-        }
-        memcpy(g_gpu_time_published, g_gpu_time_stats, sizeof g_gpu_time_published);
-        /* Posts and the UBO-publication gate have passed. Keep slot ownership
-           under g_mu until this pre-done-store anchor and g_done are published;
-           neither timestamp is a manual NVN signal or a hardware signal time. */
-        if (s->ft_frame && totk_ft_on()) totk_ff_ticket_publish(s->value, totk_ft_now(), (unsigned)s->npost);
-        s->npost = 0; s->busy = 0; g_qhead++;
-        if (!s->submit_busy && !replay_until((unsigned)(s-g_ring))) vk_record_slot_retire((unsigned)(s-g_ring));
-        atomic_store(&g_done, s->value);
-        replay_retire(s->value);
-        if (track_ready) {
-            unsigned index = (unsigned)(s->value % PRESENT_READY_HISTORY);
-            g_present_ready[index].ticket = s->value;
-            g_present_ready[index].ready_ns = host_now_ns();
-        }
-        if (g_hitch_on) { g_done_at = host_now_ns(); HK_ADD(comp_ns, g_done_at - t1); }
-        pthread_cond_broadcast(&g_cv);
-        pthread_mutex_unlock(&g_mu);
+                          vk_fg_enabled() || totk_ft_on();
+        completion_publish(s, t1, track_ready);
     }
     return NULL;
 }
@@ -2388,7 +2390,7 @@ void vk_submit_optional_cancel(void) {
     g_cur->busy=g_optional_next->busy=0;
     g_cur=g_optional_next=NULL;
     g_optional_immutable=0;
-    pthread_cond_broadcast(&g_cv);
+    nvn_cv_wake();
     pthread_mutex_unlock(&g_mu);
 }
 void vk_submit_adopt_primary(VkCommandBuffer closed) {
@@ -2413,7 +2415,7 @@ void vk_submit_optional_end(void) {
     pthread_mutex_lock(&g_mu);
     g_optional_next->busy=0; g_optional_next=NULL;
     g_optional_immutable=0;
-    pthread_cond_broadcast(&g_cv);
+    nvn_cv_wake();
     pthread_mutex_unlock(&g_mu);
 }
 static void slot_begin_inner(void) {
@@ -2438,7 +2440,7 @@ static void slot_begin_inner(void) {
             s=&g_ring[next]; g_ring_next=(next+1)%RING;
         }
         blocked=s->busy || s->submit_busy;
-        while (s->busy || s->submit_busy) pthread_cond_wait(&g_cv,&g_mu);
+        while (s->busy || s->submit_busy) nvn_cv_wait();
         s->busy=1; pthread_mutex_unlock(&g_mu));
     { uint64_t d = host_now_ns() - w0; g_perf_wait_ns += d; g_cum[1] += d;
       if (blocked && T_ft_walk_frame && totk_ft_on()) totk_ft_walk_wait(T_ft_walk_frame, d); }
@@ -2762,7 +2764,7 @@ static void slot_queue(slot_t *s, int background) {
     if (s->publication) g_ub_publication = s->value;
     g_queue_[g_qtail++ % RING] = s; g_fence = s->value;
     if (!background) g_submit_done_value = s->value;
-    pthread_cond_signal(&g_cv_work); pthread_cond_broadcast(&g_cv);
+    pthread_cond_signal(&g_cv_work); nvn_cv_wake();
     pthread_mutex_unlock(&g_mu);
     /* GPU completion may clear busy immediately; the async owner's submit_busy pin still prevents reuse. */
 }
@@ -2796,8 +2798,8 @@ static void *submit_worker(void *unused) {
         pthread_mutex_lock(&g_mu);
         if (g_test_submit_hold == value) {
             atomic_store_explicit(&g_test_submit_held, value, memory_order_release);
-            pthread_cond_broadcast(&g_cv);
-            while (g_test_submit_hold == value) pthread_cond_wait(&g_cv, &g_mu);
+            nvn_cv_wake();
+            while (g_test_submit_hold == value) nvn_cv_wait();
             atomic_store_explicit(&g_test_submit_held, 0, memory_order_release);
         }
         pthread_mutex_unlock(&g_mu);
@@ -2806,7 +2808,7 @@ static void *submit_worker(void *unused) {
         s->submit_busy = 0; g_submit_done_value = value; g_sealed_head++;
         if (!s->busy && !replay_until(slot)) vk_record_slot_retire(slot);
         replay_retire(atomic_load(&g_done));
-        pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+        nvn_cv_wake(); pthread_mutex_unlock(&g_mu);
     }
     return NULL;
 }
@@ -2818,7 +2820,7 @@ static void submit_worker_start(void) {
 static void slot_handoff(slot_t *s) {
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, submit_worker_start);
     pthread_mutex_lock(&g_mu);
-    while (g_sealed_tail - g_sealed_head == RING) pthread_cond_wait(&g_cv, &g_mu);
+    while (g_sealed_tail - g_sealed_head == RING) nvn_cv_wait();
     g_sealed[g_sealed_tail++ % RING] = s; pthread_cond_signal(&g_sealed_cv);
     pthread_mutex_unlock(&g_mu); g_handoff_count++;
 }
@@ -2827,7 +2829,7 @@ static void submit_join(uint64_t value) {
     VK_REC_DO(VK_REC_O_WORKER_WAIT,
         pthread_mutex_lock(&g_mu);
         blocked = g_submit_done_value < value;
-        while (g_submit_done_value < value) pthread_cond_wait(&g_cv, &g_mu);
+        while (g_submit_done_value < value) nvn_cv_wait();
         pthread_mutex_unlock(&g_mu));
     uint64_t ns = host_now_ns() - start; g_submit_join_ns += ns; vk_record_walk_wait(ns);
     /* host_now_ns is CLOCK_MONOTONIC too; reuse this disjoint wait scope, not an enclosing CPU-step wait. */
@@ -2858,12 +2860,12 @@ void vk_record_test_submit_status(uint64_t *reserved, uint64_t *queued) {
     pthread_mutex_lock(&g_mu); *reserved = __atomic_load_n(&g_reserved_fence, __ATOMIC_ACQUIRE); *queued = g_fence; pthread_mutex_unlock(&g_mu);
 }
 void vk_record_test_hold_submit(uint64_t ticket) {
-    pthread_mutex_lock(&g_mu); g_test_submit_hold = ticket; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    pthread_mutex_lock(&g_mu); g_test_submit_hold = ticket; nvn_cv_wake(); pthread_mutex_unlock(&g_mu);
 }
 uint64_t vk_record_test_submit_held(void) { return atomic_load_explicit(&g_test_submit_held, memory_order_acquire); }
 void vk_record_test_hold_completion(uint64_t ticket) {
     pthread_mutex_lock(&g_mu); g_test_completion_hold=ticket;
-    pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);
+    nvn_cv_wake(); pthread_mutex_unlock(&g_mu);
 }
 uint64_t vk_record_test_completion_held(void) {
     return atomic_load_explicit(&g_test_completion_held,memory_order_acquire);
@@ -2903,46 +2905,20 @@ int vk_record_test_ticket_context(uint64_t ticket,uint64_t v[5]) {
     return found;
 }
 #endif
-static uint64_t slot_submit_inner(int with_posts, vk_pass_end_kind reason) {
-    const char *previous_role = nvn_dirty_lag_thread_role_get();
-    nvn_dirty_lag_thread_role("submit");
-    if (!g_cur) slot_begin();
-    int publish = with_posts && ub_private_on();
-    if (!ub_private_on()) ub_flush();
-    vk_end_rendering_at(reason, 0);
-    vk_wb_record();   /* settled copies share this ordinary slot, after the last pass and before sealing */
-    if (vk_one_primary_on) {
-        barrier_host(g_cur->cb);
-        if (g_cur->ts_on) vkCmdWriteTimestamp2(g_cur->cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_cur->ts, 1);
-        if (vk_gpuprof_on) vk_gpuprof_slot_end(g_cur->gpuprof, g_cur->cb);
-        vk_sections_seal();
-    }
-    vk_record_slot_seal((unsigned)(g_cur - g_ring));
-    totk_ft_count(FT_COUNT_CHUNKS, 1); /* one logical sealed slot, not each primary/secondary buffer */
-    int asynchronous = submit_async_on();
-    if (!asynchronous && g_submit_started) submit_join(g_reserved_fence);
-    if (!asynchronous) vk_record_assemble((unsigned)(g_cur - g_ring), 0);
-    VK_REC_DO(VK_REC_S_UNIFORM,
-        ub_seal(g_reserved_fence + 1);
-        gw_seal(g_reserved_fence + 1));
-    slot_t *s = g_cur; g_cur = NULL;
-    if (vk_gpuprof_on) vk_gpuprof_slot_seal(s->gpuprof);
-    /* Bind a preceding external split to this actual resource consumer before
-     * queue publication can complete either ticket. Its own GPU/CPU completion
-     * remains independent; only physical resource retirement is extended. */
-    if (atomic_load_explicit(&g_external_enabled,memory_order_acquire) && g_replay_pending && g_replay_pending!=s) {
+static void slot_submit_pins(slot_t *s, int with_posts) {
+    if (atomic_load_explicit(&g_external_enabled, memory_order_acquire) && g_replay_pending && g_replay_pending != s) {
         pthread_mutex_lock(&g_mu);
-        g_external[g_replay_pending-g_ring].until=g_reserved_fence+1;
-        g_replay_pending=NULL;
+        g_external[g_replay_pending - g_ring].until = g_reserved_fence + 1;
+        g_replay_pending = NULL;
         pthread_mutex_unlock(&g_mu);
-        if (!g_optional_immutable) snapshot_replay_pin(g_reserved_fence+1);
+        if (!g_optional_immutable) snapshot_replay_pin(g_reserved_fence + 1);
     }
     if (g_replay_releases) {
         pthread_mutex_lock(&g_mu);
-        for (unsigned i=0;i<RING;i++) if (g_replay_owner[i].pending) {
-            g_replay_owner[i].until=g_reserved_fence+1; g_replay_owner[i].pending=0;
+        for (unsigned i = 0; i < RING; i++) if (g_replay_owner[i].pending) {
+            g_replay_owner[i].until = g_reserved_fence + 1; g_replay_owner[i].pending = 0;
         }
-        g_replay_releases=0;
+        g_replay_releases = 0;
         pthread_mutex_unlock(&g_mu);
     }
     if (!vk_one_primary_on) {
@@ -2956,24 +2932,9 @@ static uint64_t slot_submit_inner(int with_posts, vk_pass_end_kind reason) {
         if (s->cap < g_ncarry) { s->cap = g_ncarry; s->post = VK_REALLOC(s->post, (size_t)s->cap * sizeof *s->post); }
         memcpy(s->post, g_carry, (size_t)g_ncarry * sizeof *g_carry); s->npost = g_ncarry; g_ncarry = 0;
     }
-    unsigned slot = (unsigned)(s - g_ring); uint64_t value = g_reserved_fence + 1;
-    s->native_lag = lag_wait_on() && vk_record_lag_native();
-    if (s->native_lag) lag_guard_seal(slot, value);
-    int untracked_wait = !asynchronous && lag_wait_on() ? lag_guard_submit(slot, value) : 0;
-    int join_required = with_posts || !g_in_sub || reason == VK_PASS_END_CPU_WAIT;
-    s->publication = publish; s->join_on_walk = join_required;
-    pthread_mutex_lock(&g_mu); uint64_t next_rf = __atomic_load_n(&g_reserved_fence, __ATOMIC_RELAXED) + 1; __atomic_store_n(&g_reserved_fence, next_rf, __ATOMIC_RELEASE); s->value = next_rf; s->submit_busy = asynchronous; pthread_mutex_unlock(&g_mu);
-    if (vk_fg_lsfg_probe_requested())
-        vk_fg_lsfg_sealed(s->nprimary>1 ? s->primary : &s->cb,s->nprimary>1 ? s->nprimary : 1,s->value);
-    s->ft_frame = 0; s->ft_gpu_done = 0;
-    /* Backend-only work contributes GPU duration, never a late host-time floor. */
-    s->guest_submit_ns = g_in_sub || with_posts ? g_gpu_guest_ns : 0;
-    s->guest_origin_ticks = g_in_sub || with_posts ? g_gpu_origin_ticks : 0;
-    s->guest_frame = g_in_sub || with_posts ? g_gpu_guest_frame : 0;
-    if (totk_ft_on()) {
-        s->ft_frame = totk_ft_current();
-        totk_ft_slot_seal(s->ft_frame, s->value, totk_ft_now());
-    }
+}
+static void slot_submit_dispatch(
+        slot_t *s, int asynchronous, int publish, int join_required, int untracked_wait, int with_posts, vk_pass_end_kind reason, uint64_t value) {
     g_slot_count++; g_game_slot_count += with_posts || g_in_sub;
     if (asynchronous) slot_handoff(s);
     else {
@@ -2984,16 +2945,54 @@ static uint64_t slot_submit_inner(int with_posts, vk_pass_end_kind reason) {
     atomic_fetch_add(&g_seal_serial, 1);
     if (asynchronous && join_required) submit_join(value);
     if (publish) {
-        ub_publish();   /* QueueSubmit and worker join precede every host store and genuine-alias wait */
+        ub_publish();
         pthread_mutex_lock(&g_mu);
-        g_ub_publication = 0; pthread_cond_broadcast(&g_cv);
+        g_ub_publication = 0; nvn_cv_wake();
         pthread_mutex_unlock(&g_mu);
     }
     if (!asynchronous || with_posts || !g_in_sub || reason == VK_PASS_END_CPU_WAIT) {
-        /* Final publication precedes host stores; every failed earlier slot also retains its post-op frontier. */
         pthread_mutex_lock(&g_mu); uint64_t failed = g_fallback_value; pthread_mutex_unlock(&g_mu);
         if (failed > g_fallback_consumed && failed <= value) { wait_value(failed); g_fallback_consumed = failed; }
     }
+}
+static uint64_t slot_submit_inner(int with_posts, vk_pass_end_kind reason) {
+    const char *previous_role = nvn_dirty_lag_thread_role_get();
+    nvn_dirty_lag_thread_role("submit");
+    if (!g_cur) slot_begin();
+    int publish = with_posts && ub_private_on();
+    if (!ub_private_on()) ub_flush();
+    vk_end_rendering_at(reason, 0);
+    vk_wb_record();
+    if (vk_one_primary_on) {
+        barrier_host(g_cur->cb);
+        if (g_cur->ts_on) vkCmdWriteTimestamp2(g_cur->cb, VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, g_cur->ts, 1);
+        if (vk_gpuprof_on) vk_gpuprof_slot_end(g_cur->gpuprof, g_cur->cb);
+        vk_sections_seal();
+    }
+    vk_record_slot_seal((unsigned)(g_cur - g_ring));
+    totk_ft_count(FT_COUNT_CHUNKS, 1);
+    int asynchronous = submit_async_on();
+    if (!asynchronous && g_submit_started) submit_join(g_reserved_fence);
+    if (!asynchronous) vk_record_assemble((unsigned)(g_cur - g_ring), 0);
+    VK_REC_DO(VK_REC_S_UNIFORM, ub_seal(g_reserved_fence + 1); gw_seal(g_reserved_fence + 1));
+    slot_t *s = g_cur; g_cur = NULL;
+    if (vk_gpuprof_on) vk_gpuprof_slot_seal(s->gpuprof);
+    slot_submit_pins(s, with_posts);
+    unsigned slot = (unsigned)(s - g_ring); uint64_t value = g_reserved_fence + 1;
+    s->native_lag = lag_wait_on() && vk_record_lag_native();
+    if (s->native_lag) lag_guard_seal(slot, value);
+    int untracked_wait = !asynchronous && lag_wait_on() ? lag_guard_submit(slot, value) : 0;
+    int join_required = with_posts || !g_in_sub || reason == VK_PASS_END_CPU_WAIT;
+    s->publication = publish; s->join_on_walk = join_required;
+    pthread_mutex_lock(&g_mu); uint64_t next_rf = __atomic_load_n(&g_reserved_fence, __ATOMIC_RELAXED) + 1; __atomic_store_n(&g_reserved_fence, next_rf, __ATOMIC_RELEASE); s->value = next_rf; s->submit_busy = asynchronous; pthread_mutex_unlock(&g_mu);
+    if (vk_fg_lsfg_probe_requested())
+        vk_fg_lsfg_sealed(s->nprimary > 1 ? s->primary : &s->cb, s->nprimary > 1 ? s->nprimary : 1, s->value);
+    s->ft_frame = 0; s->ft_gpu_done = 0;
+    s->guest_submit_ns = g_in_sub || with_posts ? g_gpu_guest_ns : 0;
+    s->guest_origin_ticks = g_in_sub || with_posts ? g_gpu_origin_ticks : 0;
+    s->guest_frame = g_in_sub || with_posts ? g_gpu_guest_frame : 0;
+    if (totk_ft_on()) { s->ft_frame = totk_ft_current(); totk_ft_slot_seal(s->ft_frame, s->value, totk_ft_now()); }
+    slot_submit_dispatch(s, asynchronous, publish, join_required, untracked_wait, with_posts, reason, value);
     nvn_dirty_lag_thread_role(previous_role);
     return value;
 }
@@ -3042,7 +3041,7 @@ int vk_replay_lease_end(uint64_t token,uint64_t covering_ticket) {
         g_replay_releases+=g_replay_owner[i].pending;
         g_replay_owner[i].until=g_replay_owner[i].pending ? UINT64_MAX : g_reserved_fence;
         replay_retire(atomic_load(&g_done));
-        pthread_cond_broadcast(&g_cv);
+        nvn_cv_wake();
         ended=1; break;
     }
     pthread_mutex_unlock(&g_mu);
@@ -3080,7 +3079,7 @@ static void wait_value_inner(uint64_t v) {
     if (v==UINT64_MAX) DIE("test invariant: open replay owner is not a submitted wait ticket");
     if (blocked) atomic_store_explicit(&g_test_wait_value, v, memory_order_release);
 #endif
-    while (atomic_load(&g_done) < v) pthread_cond_wait(&g_cv, &g_mu);
+    while (atomic_load(&g_done) < v) nvn_cv_wait();
     if (blocked && g_done_at) HK_ADD(wake_ns, host_now_ns() - g_done_at);
     pthread_mutex_unlock(&g_mu);
     { uint64_t d = host_now_ns() - w0; g_perf_wait_ns += d; g_cum[1] += d;
@@ -3283,7 +3282,7 @@ static uint64_t pool_wait_ticket(uint64_t ticket) {
     atomic_store_explicit(&g_test_wait_value, ticket, memory_order_release);
     if (T_pool_ticket) atomic_store_explicit(T_pool_ticket, ticket, memory_order_release);
 #endif
-    while (atomic_load(&g_done) < ticket) pthread_cond_wait(&g_cv, &g_mu);
+    while (atomic_load(&g_done) < ticket) nvn_cv_wait();
     pthread_mutex_unlock(&g_mu);
     uint64_t elapsed = g_pool_stats ? host_now_ns() - start : 0;
 #ifdef TOTK_VK_TESTS
@@ -6274,7 +6273,7 @@ int mtl_wait(uint64_t fence, uint64_t timeout_ns) {
     uint64_t w0 = host_now_ns();
     pthread_mutex_lock(&g_mu);
     int blocked = atomic_load(&g_done) < fence;
-    while (atomic_load(&g_done) < fence) if (pthread_cond_timedwait(&g_cv, &g_mu, &dl)) break;
+    while (atomic_load(&g_done) < fence) if (nvn_cv_timedwait(&dl)) break;
     int ok = atomic_load(&g_done) >= fence;
     if (blocked && ok && g_done_at) HK_ADD(wake_ns, host_now_ns() - g_done_at);
     pthread_mutex_unlock(&g_mu);

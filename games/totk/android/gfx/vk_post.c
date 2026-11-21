@@ -2,6 +2,7 @@
    Post intermediates belong to fenced present slots. Scene targets belong to
    their existing texture/source-ring owner and are filtered before any UI. */
 #include "vk_int.h"
+#include "vk_post_fast.h"
 #include "vk_ui_aspect.h"
 #include "vk_post_spv.h"
 #include "vk_post_lut.h"
@@ -14,6 +15,7 @@ enum { POST_SCALE_OFF, POST_SCALE_FSR, POST_SCALE_SGSR };
 typedef struct {
     VkImage image; VkImageView raw, display; vk_alloc memory;
     uint32_t w, h; VkFormat format;
+    uint64_t rev;
 } post_image;
 typedef struct { post_image image[POST_STAGES]; int timed; } post_slot;
 static struct {
@@ -27,6 +29,10 @@ static struct {
     unsigned nscene;
     struct { VkFormat format; VkPipeline blend; } scene_aa_pipeline[8];
     unsigned nscene_aa;
+    VkDescriptorPool pool;
+    VkDescriptorSet slot_set[POST_SLOTS][POST_STAGES];
+    totk_post_dset_state slot_dset[POST_SLOTS][POST_STAGES];
+    uint64_t next_rev;
 } P;
 #ifdef TOTK_VK_TESTS
 static uint64_t scene_aa_runs;
@@ -61,7 +67,7 @@ static void post_image_make(post_image *im, uint32_t w, uint32_t h, VkFormat for
     VKCHECK(vkCreateImageView(V.dev,&vi,NULL,&im->raw));
     im->display = im->raw;
     if (raw != format) { vi.format = format; VKCHECK(vkCreateImageView(V.dev,&vi,NULL,&im->display)); }
-    im->w=w; im->h=h; im->format=format;
+    im->w=w; im->h=h; im->format=format; im->rev=++P.next_rev;
 }
 static void post_transition(VkCommandBuffer cb, post_image *im, VkImageLayout old, VkImageLayout next,
                             VkPipelineStageFlags2 src, VkAccessFlags2 read, VkPipelineStageFlags2 dst, VkAccessFlags2 write) {
@@ -100,6 +106,56 @@ static VkResult post_pipeline_make(unsigned stage, VkFormat format, VkShaderModu
         .stageCount=2,.pStages=stages,.pVertexInputState=&vi,.pInputAssemblyState=&ia,.pViewportState=&vp,
         .pRasterizationState=&rs,.pMultisampleState=&ms,.pColorBlendState=&blend,.pDynamicState=&dy,.layout=P.layout};
     return vk_pcache_graphics(&pi,pipeline);
+}
+static void post_init_shaders(void) {
+    VkSamplerCreateInfo si = {VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, .magFilter = VK_FILTER_LINEAR, .minFilter = VK_FILTER_LINEAR,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST, .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
+    VKCHECK(vkCreateSampler(V.dev, &si, NULL, &P.sampler));
+    VkDescriptorSetLayoutBinding bindings[4];
+    for (unsigned i = 0; i < 4; i++) bindings[i] = (VkDescriptorSetLayoutBinding){.binding = i,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1,
+        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .pImmutableSamplers = &P.sampler};
+    VkDescriptorSetLayoutCreateInfo ds = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 4, .pBindings = bindings};
+    VKCHECK(vkCreateDescriptorSetLayout(V.dev, &ds, NULL, &P.dsl));
+    VkPushConstantRange range = {VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64};
+    VkPipelineLayoutCreateInfo li = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1, .pSetLayouts = &P.dsl,
+        .pushConstantRangeCount = 1, .pPushConstantRanges = &range};
+    VKCHECK(vkCreatePipelineLayout(V.dev, &li, NULL, &P.layout));
+    const uint32_t *code[] = {post_vert_spv, post_edge_spv, post_weights_spv, post_blend_spv, post_easu_spv, post_rcas_spv, post_sgsr_spv};
+    const size_t bytes[] = {sizeof post_vert_spv, sizeof post_edge_spv, sizeof post_weights_spv, sizeof post_blend_spv, sizeof post_easu_spv, sizeof post_rcas_spv, sizeof post_sgsr_spv};
+    VkShaderModule modules[POST_STAGES + 1] = {0};
+    const int enabled[POST_STAGES] = {P.aa || P.scene_aa, P.aa || P.scene_aa, P.aa, P.scale == POST_SCALE_FSR, P.scale == POST_SCALE_FSR, P.scale == POST_SCALE_SGSR};
+    for (unsigned i = 0; i < POST_STAGES + 1; i++) {
+        if (i && !enabled[i - 1]) continue;
+        VkShaderModuleCreateInfo mi = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = bytes[i], .pCode = code[i]};
+        VKCHECK(vkCreateShaderModule(V.dev, &mi, NULL, &modules[i]));
+    }
+    for (unsigned i = 0; i < POST_STAGES; i++) if (modules[i + 1])
+        VKCHECK(post_pipeline_make(i, i == POST_EDGE ? VK_FORMAT_R8G8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, modules[0], modules[i + 1], 0, &P.pipeline[i]));
+    for (unsigned i = 0; i < POST_STAGES + 1; i++) if (modules[i]) vkDestroyShaderModule(V.dev, modules[i], NULL);
+    if (P.aa || P.scene_aa) { post_image_make(&P.area, 160, 560, VK_FORMAT_R8G8_UNORM, 1); post_image_make(&P.search, 64, 16, VK_FORMAT_R8_UNORM, 1); }
+    if (V.timestamp_bits && V.props.limits.timestampPeriod > 0) {
+        VkQueryPoolCreateInfo qi = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = POST_SLOTS * 2};
+        VKCHECK(vkCreateQueryPool(V.dev, &qi, NULL, &P.queries));
+    } else LOGV("post GPU timing unavailable on this queue");
+}
+static void post_pool_init(void) {
+    uint32_t sets = 0u;
+    for (unsigned j = 0; j < POST_STAGES; j++) if (P.pipeline[j]) sets += POST_SLOTS;
+    if (!sets) return;
+    VkDescriptorPoolSize ps = {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, sets * 4u};
+    VkDescriptorPoolCreateInfo pci = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, .maxSets = sets, .poolSizeCount = 1u, .pPoolSizes = &ps};
+    VKCHECK(vkCreateDescriptorPool(V.dev, &pci, NULL, &P.pool));
+    VkDescriptorSetLayout dsls[POST_STAGES];
+    unsigned stages[POST_STAGES], nst = 0u;
+    for (unsigned j = 0; j < POST_STAGES; j++) if (P.pipeline[j]) { dsls[nst] = P.dsl; stages[nst++] = j; }
+    for (unsigned s = 0; s < POST_SLOTS; s++) {
+        VkDescriptorSet out_sets[POST_STAGES];
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, .descriptorPool = P.pool, .descriptorSetCount = nst, .pSetLayouts = dsls};
+        VKCHECK(vkAllocateDescriptorSets(V.dev, &ai, out_sets));
+        for (unsigned k = 0; k < nst; k++) P.slot_set[s][stages[k]] = out_sets[k];
+    }
 }
 void vk_post_init(void) {
     const char *aa=getenv("TOTK_POST_AA"), *scale=getenv("TOTK_POST_SCALE"), *sharp=getenv("TOTK_POST_SHARPNESS");
@@ -150,38 +206,8 @@ void vk_post_init(void) {
     P.sgsr_edge_threshold=post_sgsr_option("TOTK_POST_SGSR_EDGE_THRESHOLD",8.0f/255.0f);
     const char *direction=getenv("TOTK_POST_SGSR_EDGE_DIRECTION");
     P.sgsr_edge_direction=direction && !strcmp(direction,"1");
-    VkSamplerCreateInfo si={VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,.magFilter=VK_FILTER_LINEAR,.minFilter=VK_FILTER_LINEAR,
-        .mipmapMode=VK_SAMPLER_MIPMAP_MODE_NEAREST,.addressModeU=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-        .addressModeV=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,.addressModeW=VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE};
-    VKCHECK(vkCreateSampler(V.dev,&si,NULL,&P.sampler));
-    VkDescriptorSetLayoutBinding bindings[4];
-    for (unsigned i=0;i<4;i++) bindings[i]=(VkDescriptorSetLayoutBinding){.binding=i,
-        .descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.descriptorCount=1,
-        .stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT,.pImmutableSamplers=&P.sampler};
-    VkDescriptorSetLayoutCreateInfo ds={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,.bindingCount=4,.pBindings=bindings};
-    VKCHECK(vkCreateDescriptorSetLayout(V.dev,&ds,NULL,&P.dsl));
-    VkPushConstantRange range={VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,64};
-    VkPipelineLayoutCreateInfo li={VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,.setLayoutCount=1,.pSetLayouts=&P.dsl,
-        .pushConstantRangeCount=1,.pPushConstantRanges=&range};
-    VKCHECK(vkCreatePipelineLayout(V.dev,&li,NULL,&P.layout));
-    const uint32_t *code[]={post_vert_spv,post_edge_spv,post_weights_spv,post_blend_spv,post_easu_spv,post_rcas_spv,post_sgsr_spv};
-    const size_t bytes[]={sizeof post_vert_spv,sizeof post_edge_spv,sizeof post_weights_spv,sizeof post_blend_spv,sizeof post_easu_spv,sizeof post_rcas_spv,sizeof post_sgsr_spv};
-    VkShaderModule modules[POST_STAGES+1]={0};
-    const int enabled[POST_STAGES]={P.aa||P.scene_aa,P.aa||P.scene_aa,P.aa,P.scale==POST_SCALE_FSR,P.scale==POST_SCALE_FSR,P.scale==POST_SCALE_SGSR};
-    for (unsigned i=0;i<POST_STAGES+1;i++) {
-        if (i && !enabled[i-1]) continue;
-        VkShaderModuleCreateInfo mi={VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,.codeSize=bytes[i],.pCode=code[i]};
-        VKCHECK(vkCreateShaderModule(V.dev,&mi,NULL,&modules[i]));
-    }
-    for (unsigned i=0;i<POST_STAGES;i++) if (modules[i+1])
-        VKCHECK(post_pipeline_make(i,i==POST_EDGE?VK_FORMAT_R8G8_UNORM:VK_FORMAT_R8G8B8A8_UNORM,
-            modules[0],modules[i+1],0,&P.pipeline[i]));
-    for (unsigned i=0;i<POST_STAGES+1;i++) if (modules[i]) vkDestroyShaderModule(V.dev,modules[i],NULL);
-    if (P.aa || P.scene_aa) { post_image_make(&P.area,160,560,VK_FORMAT_R8G8_UNORM,1); post_image_make(&P.search,64,16,VK_FORMAT_R8_UNORM,1); }
-    if (V.timestamp_bits && V.props.limits.timestampPeriod>0) {
-        VkQueryPoolCreateInfo qi={VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,.queryType=VK_QUERY_TYPE_TIMESTAMP,.queryCount=POST_SLOTS*2};
-        VKCHECK(vkCreateQueryPool(V.dev,&qi,NULL,&P.queries));
-    } else LOGV("post GPU timing unavailable on this queue");
+    post_init_shaders();
+    if (totk_vk_post_fast_on() && (P.aa || P.scale)) post_pool_init();
     P.ready=1;
     const char *scale_name=P.scale==POST_SCALE_SGSR?"SGSR1":P.scale==POST_SCALE_FSR?"FSR1":"off";
     LOGV("post: AA=%s scale=%s sharpness=%.2f (display-encoded RGB)",P.aa?"SMAA1x":"off",scale_name,P.sharpness);
@@ -205,36 +231,52 @@ static void post_upload(VkCommandBuffer cb, post_image *im, const void *bytes, s
     post_transition(cb,im,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
         VK_PIPELINE_STAGE_2_COPY_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 }
-static void post_draw_pipeline(VkCommandBuffer cb, unsigned stage, post_image *dst, VkImageView source, VkImageView aux, const float push[16], VkPipeline pipeline) {
-    /* This slot is idle; discarding its previous contents needs no CPU wait. */
-    post_transition(cb,dst,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-    VkDescriptorSet set=vk_alloc_set(P.dsl);
-    int lut=(P.aa || P.scene_aa) && stage<=POST_BLEND;
-    VkDescriptorImageInfo images[4]={
-        {P.sampler,source,VK_IMAGE_LAYOUT_GENERAL},{P.sampler,aux?aux:source,VK_IMAGE_LAYOUT_GENERAL},
-        {P.sampler,lut?P.area.raw:source,lut?VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:VK_IMAGE_LAYOUT_GENERAL},
-        {P.sampler,lut?P.search.raw:source,lut?VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL:VK_IMAGE_LAYOUT_GENERAL}};
+static VkDescriptorSet post_acquire_set(unsigned stage, int slot, VkImageView source, VkImageView aux, uint64_t src_rev, uint64_t aux_rev) {
+    int fast_slot = slot >= 0 && slot < (int)POST_SLOTS && stage < POST_STAGES && totk_vk_post_fast_on() && P.slot_set[slot][stage];
+    VkDescriptorSet set = fast_slot ? P.slot_set[slot][stage] : vk_alloc_set(P.dsl);
+    int lut = (P.aa || P.scene_aa) && stage <= POST_BLEND;
+    uint64_t lut_rev = lut ? (P.area.rev ^ (P.search.rev << 32)) : 0u;
+    unsigned mask = fast_slot ? totk_post_dset_mask(&P.slot_dset[slot][stage], stage, src_rev, aux_rev, lut_rev, 0) : 0xFu;
+    if (!mask) return set;
+    VkDescriptorImageInfo images[4] = {
+        {P.sampler, source, VK_IMAGE_LAYOUT_GENERAL},
+        {P.sampler, aux ? aux : source, VK_IMAGE_LAYOUT_GENERAL},
+        {P.sampler, lut ? P.area.raw : source, lut ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL},
+        {P.sampler, lut ? P.search.raw : source, lut ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL}};
     VkWriteDescriptorSet writes[4];
-    for (unsigned i=0;i<4;i++) writes[i]=(VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .dstSet=set,.dstBinding=i,.descriptorCount=1,.descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,.pImageInfo=&images[i]};
-    vkUpdateDescriptorSets(V.dev,4,writes,0,NULL);
-    VkRenderingAttachmentInfo attachment={VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,.imageView=dst->raw,
-        .imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-        .loadOp=stage==POST_EDGE?VK_ATTACHMENT_LOAD_OP_CLEAR:VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .storeOp=VK_ATTACHMENT_STORE_OP_STORE,.clearValue.color={{0,0,0,0}}};
-    VkRenderingInfo ri={VK_STRUCTURE_TYPE_RENDERING_INFO,.renderArea={{0,0},{dst->w,dst->h}},.layerCount=1,
-        .colorAttachmentCount=1,.pColorAttachments=&attachment};
-    vkCmdBeginRendering(cb,&ri);
-    vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
-    vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,P.layout,0,1,&set,0,NULL);
-    vkCmdPushConstants(cb,P.layout,VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT,0,64,push);
-    VkViewport viewport={0,0,(float)dst->w,(float)dst->h,0,1}; VkRect2D scissor={{0,0},{dst->w,dst->h}};
-    vkCmdSetViewport(cb,0,1,&viewport); vkCmdSetScissor(cb,0,1,&scissor); vkCmdDraw(cb,3,1,0,0); vkCmdEndRendering(cb);
-    post_transition(cb,dst,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT);
+    uint32_t nw = 0u;
+    for (unsigned i = 0u; i < 4u; i++) if (mask & (1u << i)) {
+        writes[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set,
+            .dstBinding = i, .descriptorCount = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &images[i]};
+    }
+    vkUpdateDescriptorSets(V.dev, nw, writes, 0, NULL);
+    return set;
+}
+static void post_draw_slot(VkCommandBuffer cb, unsigned stage, post_image *dst, int slot,
+        VkImageView source, VkImageView aux, uint64_t src_rev, uint64_t aux_rev, const float push[16], VkPipeline pipeline) {
+    /* This slot is idle; discarding its previous contents needs no CPU wait. */
+    post_transition(cb, dst, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkDescriptorSet set = post_acquire_set(stage, slot, source, aux, src_rev, aux_rev);
+    VkRenderingAttachmentInfo attachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = dst->raw,
+        .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = stage == POST_EDGE ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE, .clearValue.color = {{0, 0, 0, 0}}};
+    VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {dst->w, dst->h}}, .layerCount = 1,
+        .colorAttachmentCount = 1, .pColorAttachments = &attachment};
+    vkCmdBeginRendering(cb, &ri);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, P.layout, 0, 1, &set, 0, NULL);
+    vkCmdPushConstants(cb, P.layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, 64, push);
+    VkViewport viewport = {0, 0, (float)dst->w, (float)dst->h, 0, 1}; VkRect2D scissor = {{0, 0}, {dst->w, dst->h}};
+    vkCmdSetViewport(cb, 0, 1, &viewport); vkCmdSetScissor(cb, 0, 1, &scissor); vkCmdDraw(cb, 3, 1, 0, 0); vkCmdEndRendering(cb);
+    post_transition(cb, dst, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_READ_BIT);
+}
+static void post_draw_pipeline(VkCommandBuffer cb, unsigned stage, post_image *dst, VkImageView source, VkImageView aux, const float push[16], VkPipeline pipeline) {
+    post_draw_slot(cb, stage, dst, -1, source, aux, 0u, 0u, push, pipeline);
 }
 static void post_draw(VkCommandBuffer cb, unsigned stage, post_image *dst, VkImageView source, VkImageView aux, const float push[16]) {
     post_draw_pipeline(cb,stage,dst,source,aux,push,P.pipeline[stage]);
@@ -381,29 +423,30 @@ int vk_post_run(VkCommandBuffer cb, unsigned slot, VkImageView source, uint32_t 
         vkCmdResetQueryPool(cb,P.queries,slot*2,2);
         vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,P.queries,slot*2); s->timed=1;
     }
-    float push[16]={(float)cx,(float)cy,(float)w,(float)h,(float)w,(float)h,(float)source_w,(float)source_h,P.sharpness};
-    post_image *result=NULL;
+    float push[16] = {(float)cx, (float)cy, (float)w, (float)h, (float)w, (float)h, (float)source_w, (float)source_h, P.sharpness};
+    post_image *result = NULL;
+    uint64_t src_rev = 0u;
     if (P.aa) {
-        post_draw(cb,POST_EDGE,&s->image[POST_EDGE],source,0,push);
-        post_draw(cb,POST_WEIGHTS,&s->image[POST_WEIGHTS],source,s->image[POST_EDGE].raw,push);
-        post_draw(cb,POST_BLEND,&s->image[POST_BLEND],source,s->image[POST_WEIGHTS].raw,push);
-        result=&s->image[POST_BLEND]; source=result->raw;
-        push[0]=push[1]=0; push[6]=w; push[7]=h;
+        post_draw_slot(cb, POST_EDGE, &s->image[POST_EDGE], (int)slot, source, 0, 0u, 0u, push, P.pipeline[POST_EDGE]);
+        post_draw_slot(cb, POST_WEIGHTS, &s->image[POST_WEIGHTS], (int)slot, source, s->image[POST_EDGE].raw, 0u, s->image[POST_EDGE].rev, push, P.pipeline[POST_WEIGHTS]);
+        post_draw_slot(cb, POST_BLEND, &s->image[POST_BLEND], (int)slot, source, s->image[POST_WEIGHTS].raw, 0u, s->image[POST_WEIGHTS].rev, push, P.pipeline[POST_BLEND]);
+        result = &s->image[POST_BLEND]; source = result->raw; src_rev = result->rev;
+        push[0] = push[1] = 0; push[6] = w; push[7] = h;
     }
-    if (P.scale==POST_SCALE_FSR) {
-        push[4]=output_w; push[5]=output_h;
-        post_draw(cb,POST_EASU,&s->image[POST_EASU],source,0,push);
-        float local[16]={0,0,(float)output_w,(float)output_h,(float)output_w,(float)output_h,(float)output_w,(float)output_h,P.sharpness};
-        post_draw(cb,POST_RCAS,&s->image[POST_RCAS],s->image[POST_EASU].raw,0,local);
-        result=&s->image[POST_RCAS];
+    if (P.scale == POST_SCALE_FSR) {
+        push[4] = output_w; push[5] = output_h;
+        post_draw_slot(cb, POST_EASU, &s->image[POST_EASU], (int)slot, source, 0, src_rev, 0u, push, P.pipeline[POST_EASU]);
+        float local[16] = {0, 0, (float)output_w, (float)output_h, (float)output_w, (float)output_h, (float)output_w, (float)output_h, P.sharpness};
+        post_draw_slot(cb, POST_RCAS, &s->image[POST_RCAS], (int)slot, s->image[POST_EASU].raw, 0, s->image[POST_EASU].rev, 0u, local, P.pipeline[POST_RCAS]);
+        result = &s->image[POST_RCAS];
     }
-    if (P.scale==POST_SCALE_SGSR) {
-        push[4]=output_w; push[5]=output_h;
-        push[8]=P.sgsr_sharpness; push[9]=P.sgsr_edge_threshold;
-        push[12]=(float)w/output_w; push[13]=(float)h/output_h;
-        push[14]=1.0f/push[6]; push[15]=1.0f/push[7];
-        post_draw(cb,POST_SGSR,&s->image[POST_SGSR],source,0,push);
-        result=&s->image[POST_SGSR];
+    if (P.scale == POST_SCALE_SGSR) {
+        push[4] = output_w; push[5] = output_h;
+        push[8] = P.sgsr_sharpness; push[9] = P.sgsr_edge_threshold;
+        push[12] = (float)w / output_w; push[13] = (float)h / output_h;
+        push[14] = 1.0f / push[6]; push[15] = 1.0f / push[7];
+        post_draw_slot(cb, POST_SGSR, &s->image[POST_SGSR], (int)slot, source, 0, src_rev, 0u, push, P.pipeline[POST_SGSR]);
+        result = &s->image[POST_SGSR];
     }
     if (P.queries) vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,P.queries,slot*2+1);
     *out=(vk_post_output){result->image,result->display,result->w,result->h,result->format};
