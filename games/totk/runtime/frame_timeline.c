@@ -1,5 +1,6 @@
 #include "frame_timeline.h"
 #include "frame_fence.h"
+#include "totk_perf_fast.h"
 #if defined(__ANDROID__) || defined(TOTK_FRAME_TIMELINE_TEST)
 #include <pthread.h>
 #include <stdio.h>
@@ -50,7 +51,9 @@ static void initialize(void) {
 int totk_ft_init(void) { pthread_once(&once, initialize); return atomic_load(&totk_ft_enabled); }
 uint64_t totk_ft_current(void) { return atomic_load_explicit(&current, memory_order_relaxed); }
 static void lock_entry(ft_entry *e) {
-    while (atomic_flag_test_and_set_explicit(&e->lock, memory_order_acquire)) {}
+    while (atomic_flag_test_and_set_explicit(&e->lock, memory_order_acquire)) {
+        if (totk_perf_fast_on()) totk_spin_pause();
+    }
 }
 static void unlock_entry(ft_entry *e) { atomic_flag_clear_explicit(&e->lock, memory_order_release); }
 static ft_entry *entry(uint64_t frame) {
@@ -69,12 +72,15 @@ static int snapshot(uint64_t frame, totk_ft_record *out) {
     unlock_entry(e); return found;
 }
 void totk_ft_work_begin(uint64_t frame) {
-    totk_ft_active_frame = frame && totk_ft_on() ? frame : 0;
+    uint64_t active = frame && totk_ft_on() ? frame : 0;
+    totk_ft_active_frame = active;
+    if (totk_perf_fast_on()) { if (active) memset(&totk_ft_active_work, 0, sizeof totk_ft_active_work); return; }
     if (frame) memset(&totk_ft_active_work, 0, sizeof totk_ft_active_work);
 }
 void totk_ft_work_end(void) {
     uint64_t frame = totk_ft_active_frame;
     totk_ft_active_frame = 0;
+    if (totk_perf_fast_on() && (!frame || !totk_ft_work_nonzero(totk_ft_active_work.value, FT_COUNT_N))) return;
     ft_entry *e = entry(frame); if (!e) return;
     for (unsigned i = 0; i < FT_COUNT_N; i++) e->data.work.value[i] += totk_ft_active_work.value[i];
     unlock_entry(e);

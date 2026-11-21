@@ -6,6 +6,7 @@
 #include "adpf_policy.h"
 #include "live_ctl.h"
 #include "guest_clock.h"
+#include "totk_perf_fast.h"
 #include <android/api-level.h>
 #include <android/native_window.h>
 #include <android/surface_control.h>
@@ -61,6 +62,7 @@ static uint32_t gpu_seen;
 static struct { unsigned frames, spans, gpus, errors, hints, hint_errors; uint64_t span_sum, span_max, gpu_sum, gpu_max; } span_stats;
 /* Bounded registry; pthread CPU clocks avoid /proc parsing/allocations. */
 static struct { int32_t tid; clockid_t clock; uint64_t cpu, used; int critical; } registry[256];
+static totk_reg_bmap reg_bm;
 static int is_one(const char *name) { const char *s = getenv(name); return s && !strcmp(s, "1"); }
 static uint64_t mono_ns(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -80,7 +82,7 @@ static void remove_thread(void *value) {
     int32_t tid = (int32_t)(intptr_t)value;
     pthread_mutex_lock(&mu);
     for (unsigned i = 0; i < 256; i++) if (registry[i].tid == tid) {
-        registry[i].tid = 0; registry_dirty = 1; break;
+        registry[i].tid = 0; totk_bmap_clear(&reg_bm, i); registry_dirty = 1; break;
     }
     pthread_mutex_unlock(&mu);
 }
@@ -198,17 +200,31 @@ void totk_perf_thread(const char *name) {
     if (pthread_getcpuclockid(pthread_self(), &clock)) return;
     pthread_mutex_lock(&mu);
     unsigned free_slot = 256;
-    for (unsigned i = 0; i < 256; i++) {
-        if (registry[i].tid == tid) {
-            if (critical && !registry[i].critical) { registry[i].critical = 1; registry_dirty = 1; }
-            pthread_mutex_unlock(&mu); return;
+    if (totk_perf_fast_on()) {
+        for (unsigned w = 0; w < 4u; w++) {
+            uint64_t m = reg_bm.occ[w];
+            for (unsigned s2 = 0; s2 < 64u && m; s2++) {
+                unsigned b = (unsigned)__builtin_ctzll(m); m &= (m - 1ull); unsigned i = (w << 6) | b;
+                if (registry[i].tid == tid) {
+                    if (critical && !registry[i].critical) { registry[i].critical = 1; totk_bmap_set(&reg_bm, i, 1); registry_dirty = 1; }
+                    pthread_mutex_unlock(&mu); return;
+                }
+            }
         }
-        if (!registry[i].tid && free_slot == 256) free_slot = i;
+        free_slot = totk_bmap_first_free(&reg_bm);
+    } else {
+        for (unsigned i = 0; i < 256; i++) {
+            if (registry[i].tid == tid) {
+                if (critical && !registry[i].critical) { registry[i].critical = 1; totk_bmap_set(&reg_bm, i, 1); registry_dirty = 1; }
+                pthread_mutex_unlock(&mu); return;
+            }
+            if (!registry[i].tid && free_slot == 256) free_slot = i;
+        }
     }
     if (free_slot < 256 && !pthread_setspecific(thread_key, (void *)(intptr_t)tid)) {
         registry[free_slot].tid = tid; registry[free_slot].clock = clock;
         registry[free_slot].cpu = cpu_time(clock); registry[free_slot].used = 0;
-        registry[free_slot].critical = critical; registry_dirty = 1;
+        registry[free_slot].critical = critical; totk_bmap_set(&reg_bm, free_slot, critical); registry_dirty = 1;
     }
     pthread_mutex_unlock(&mu);
 }
@@ -267,6 +283,7 @@ int totk_perf_span(void) {
 /* One acquire pacing wait (CLOCK_MONOTONIC); its part inside the span leaves it at the present. */
 void totk_perf_pacing(uint64_t begin, uint64_t end) {
     pthread_once(&config_once, configure);
+    if (totk_perf_fast_on() && end <= begin) return;
     if (!span_on()) return;
     pthread_mutex_lock(&mu);
     totk_adpf_pacing_add(&span_pacing, begin, end);
@@ -280,6 +297,7 @@ uint64_t totk_perf_wait_begin(void) {
 void totk_perf_wait_end(uint64_t begin) {
     if (!begin) return;
     uint64_t end = mono_ns();
+    if (totk_perf_fast_on() && end <= begin) return;
     pthread_mutex_lock(&mu);
     totk_adpf_pacing_add(&span_queue_wait, begin, end);
     pthread_mutex_unlock(&mu);
@@ -345,6 +363,63 @@ static void rate_frame(int guest_interval, int64_t target) {
     hz = totk_frame_rate_minimum(auto40 && fps60 && !framegen, hz);
     atomic_store_explicit(&content_rate, hz, memory_order_relaxed);
 }
+static size_t perf_select_tids_fast(uint64_t elapsed, int32_t *tids, size_t cap) {
+    size_t n = 0;
+    int32_t btids[256]; uint64_t bused[256];
+    for (unsigned w = 0; w < 4u; w++) {
+        uint64_t m = reg_bm.occ[w];
+        for (unsigned s2 = 0; s2 < 64u && m; s2++) {
+            unsigned b = (unsigned)__builtin_ctzll(m); m &= (m - 1ull); unsigned i = (w << 6) | b;
+            uint64_t cpu = cpu_time(registry[i].clock);
+            registry[i].used = cpu >= registry[i].cpu && registry[i].cpu ? cpu - registry[i].cpu : 0;
+            registry[i].cpu = cpu; btids[i] = registry[i].tid; bused[i] = registry[i].used;
+        }
+    }
+    for (unsigned w = 0; w < 4u; w++) {
+        uint64_t m = reg_bm.crit[w];
+        for (unsigned s2 = 0; s2 < 64u && m && n < cap; s2++) {
+            unsigned b = (unsigned)__builtin_ctzll(m); m &= (m - 1ull); tids[n++] = registry[(w << 6) | b].tid;
+        }
+    }
+    if (elapsed) totk_bmap_pick_top6(&reg_bm, btids, bused, elapsed * 15 / 100, tids, &n, cap);
+    for (unsigned w = 0; w < 4u; w++) {
+        uint64_t m = reg_bm.occ[w] & ~reg_bm.crit[w];
+        for (unsigned s2 = 0; s2 < 64u && m; s2++) {
+            unsigned b = (unsigned)__builtin_ctzll(m); m &= (m - 1ull); registry[(w << 6) | b].used = bused[(w << 6) | b];
+        }
+    }
+    return n;
+}
+static size_t perf_select_tids_slow(uint64_t elapsed, int32_t *tids, size_t cap) {
+    size_t n = 0;
+    for (unsigned i = 0; i < 256; i++) if (registry[i].tid) {
+        uint64_t cpu = cpu_time(registry[i].clock);
+        registry[i].used = cpu >= registry[i].cpu && registry[i].cpu ? cpu - registry[i].cpu : 0;
+        registry[i].cpu = cpu;
+    }
+    for (unsigned i = 0; i < 256 && n < cap; i++)
+        if (registry[i].tid && registry[i].critical) tids[n++] = registry[i].tid;
+    /* Up to six busy guest/job threads, not idle I/O or background compilers. */
+    for (unsigned k = 0; k < 6 && n < cap && elapsed; k++) {
+        int best = -1;
+        for (unsigned i = 0; i < 256; i++) if (registry[i].tid && !registry[i].critical &&
+                registry[i].used >= elapsed * 15 / 100 && (best < 0 || registry[i].used > registry[best].used)) best = (int)i;
+        if (best < 0) break;
+        tids[n++] = registry[best].tid; registry[best].used = 0;
+    }
+    return n;
+}
+static void perf_refresh_session(uint64_t now, int64_t target) {
+    uint64_t elapsed = sample_time && now > sample_time ? now - sample_time : 0;
+    int32_t tids[TOTK_ADPF_MAX_THREADS];
+    size_t n = totk_perf_fast_on() ? perf_select_tids_fast(elapsed, tids, TOTK_ADPF_MAX_THREADS)
+                                 : perf_select_tids_slow(elapsed, tids, TOTK_ADPF_MAX_THREADS);
+    for (size_t i = 1; i < n; i++) for (size_t j = i; j && tids[j] < tids[j - 1]; j--) {
+        int32_t t = tids[j]; tids[j] = tids[j - 1]; tids[j - 1] = t;
+    }
+    log_changes(totk_adpf_sync(&session, &api, tids, n, target));
+    sample_time = now; registry_dirty = 0; frames = 1;
+}
 void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_interval) {
     pthread_once(&config_once, configure);
     runtime_thermal_frame(guest_interval > 0 ? (unsigned)guest_interval : 1u);
@@ -397,28 +472,7 @@ void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_i
     uint64_t work = totk_adpf_work(previous_frame, now, pacing);
     previous_frame = now;
     if (registry_dirty || !frames || ++frames % 300 == 0) {
-        uint64_t elapsed = sample_time && now > sample_time ? now - sample_time : 0;
-        for (unsigned i = 0; i < 256; i++) if (registry[i].tid) {
-            uint64_t cpu = cpu_time(registry[i].clock);
-            registry[i].used = cpu >= registry[i].cpu && registry[i].cpu ? cpu - registry[i].cpu : 0;
-            registry[i].cpu = cpu;
-        }
-        int32_t tids[TOTK_ADPF_MAX_THREADS]; size_t n = 0;
-        for (unsigned i = 0; i < 256 && n < TOTK_ADPF_MAX_THREADS; i++)
-            if (registry[i].tid && registry[i].critical) tids[n++] = registry[i].tid;
-        /* Up to six busy guest/job threads, not idle I/O or background compilers. */
-        for (unsigned k = 0; k < 6 && n < TOTK_ADPF_MAX_THREADS && elapsed; k++) {
-            int best = -1;
-            for (unsigned i = 0; i < 256; i++) if (registry[i].tid && !registry[i].critical &&
-                    registry[i].used >= elapsed * 15 / 100 && (best < 0 || registry[i].used > registry[best].used)) best = (int)i;
-            if (best < 0) break;
-            tids[n++] = registry[best].tid; registry[best].used = 0;
-        }
-        for (size_t i = 1; i < n; i++) for (size_t j = i; j && tids[j] < tids[j - 1]; j--) {
-            int32_t t = tids[j]; tids[j] = tids[j - 1]; tids[j - 1] = t;
-        }
-        log_changes(totk_adpf_sync(&session, &api, tids, n, target));
-        sample_time = now; registry_dirty = 0; frames = 1;
+        perf_refresh_session(now, target);
     } else if (target != session.target) {
         log_changes(totk_adpf_sync(&session, &api, session.tids, session.count, target));
     }
