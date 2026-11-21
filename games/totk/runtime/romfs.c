@@ -338,6 +338,18 @@ static int folder_exists(const char *folder) {
 }
 /* The overlay slot + 1 that replaces RomFS file i, or 0. */
 static uint32_t overlay_slot(uint64_t i) {size_t lo=0,hi=noverlay;while(lo<hi){size_t m=lo+(hi-lo)/2;if(overlays[m].index<i)lo=m+1;else hi=m;}return lo<noverlay&&overlays[lo].index==i?(uint32_t)(lo+1):0;}
+#include "totk_fs_fast.h"
+static totk_fs_rom_cache g_rom_fast = {.epoch = 1};
+static uint64_t romfs_lookup_file_fast(const char *p, uint32_t *ov_out) {
+ size_t plen = strlen(p); uint64_t i = UINT64_MAX; uint32_t ov = 0; uint8_t fst = 0, dst = 0;
+ if (totk_fs_rom_get(&g_rom_fast, p, plen, &i, &ov, &fst, &dst)) {
+  if (fst == TOTK_FS_FSTATE_NOFILE) { *ov_out = 0u; return UINT64_MAX; }
+  *ov_out = ov; return i;
+ }
+ i = file_index(p); ov = i == UINT64_MAX ? 0u : overlay_slot(i);
+ totk_fs_rom_put(&g_rom_fast, p, plen, i, ov, i == UINT64_MAX ? TOTK_FS_FSTATE_NOFILE : TOTK_FS_FSTATE_FILE, TOTK_FS_DSTATE_UNK);
+ *ov_out = ov; return i;
+}
 /* DRS is a final, in-memory whole-pack overlay. The template is unmodified
    player data decoded once by scripts/prepare_drs_template.py, not a replacement
    manifest. No template is read or required unless TOTK_DRS_MIN is set. */
@@ -419,6 +431,7 @@ void runtime_fs_init(void) {
  runtime_boot_status(TOTK_UI("准备游戏资源","Preparing game data"),TOTK_UI("检查分辨率补丁并挂载只读游戏资源","Checking the resolution patch and mounting the read-only game data"));
  overlay_init(dir);
  fprintf(stderr,"[totk] native read-only RomFS ready: %llu files\n",(unsigned long long)file_count);
+ totk_fs_rom_bump(&g_rom_fast);
  __atomic_store_n(&rel_ready,1,__ATOMIC_RELEASE);
 }
 /* The companion host's reader (duo/duo_port.h romfs_read; runtime/duo_port.c): a file by its path below the root,
@@ -428,7 +441,7 @@ void runtime_fs_init(void) {
    Overlays are honoured, so the companion shows a mod's replaced art and text as the game does. */
 int64_t runtime_romfs_read_rel(const char *rel,uint64_t offset,void *out,uint64_t n) {
  if(!__atomic_load_n(&rel_ready,__ATOMIC_ACQUIRE)||!rel)return -1;if(!*rel)return 0;if(!path_ok(rel))return -1;
- uint64_t i=file_index(rel);if(i==UINT64_MAX)return -1;uint32_t ov=overlay_slot(i);
+ uint32_t ov=0;uint64_t i=romfs_lookup_file_fast(rel,&ov);if(i==UINT64_MAX)return -1;
  uint64_t base=0,size;const uint8_t *memory=NULL;int fd=image_fd,own=-1;
  if(ov){const Overlay *o=&overlays[ov-1];size=o->size;memory=o->memory;
   if(out&&!memory){own=fd=open(o->path,O_RDONLY|O_CLOEXEC);struct stat st;if(fd<0||fstat(fd,&st)!=0||(uint64_t)st.st_size!=size){if(fd>=0)close(fd);return -1;}}}
@@ -452,12 +465,12 @@ static unsigned mount_rom(const char *name,void *cache,uint64_t size) {
 }
 static unsigned cache_size(uint64_t *out) {if(!out)return INVALID;*out=0;return 0;}
 /* TOTK_FS_LOG=1: log every RomFS open with the time since start (shows how far the game gets without a picture). */
-static void fs_log(const char *what,const char *path){static int on=-1;static uint64_t t0;if(on<0){on=getenv("TOTK_FS_LOG")!=NULL;t0=runtime_now_ns();}if(on)fprintf(stderr,"[totk-fs] %8.3f %s %s\n",(runtime_now_ns()-t0)/1e9,what,path);}
+static void fs_log(const char *what,const char *path){static _Atomic int on=-1;static _Atomic uint64_t t0;int cur=atomic_load_explicit(&on,memory_order_acquire);if(cur<0){uint64_t now=runtime_now_ns();cur=getenv("TOTK_FS_LOG")!=NULL;if(cur)atomic_store_explicit(&t0,now,memory_order_release);atomic_store_explicit(&on,cur,memory_order_release);}if(cur)fprintf(stderr,"[totk-fs] %8.3f %s %s\n",(runtime_now_ns()-atomic_load_explicit(&t0,memory_order_acquire))/1e9,what,path);}
 void runtime_fs_log(const char *what,const char *path){fs_log(what,path);}
 unsigned runtime_romfs_open(uint64_t *out,const char *path,int mode) {
  fs_log("rom",path?path:"(null)");
- if(!out||mode!=1)return UNSUPPORTED;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint64_t i=file_index(p);if(i==UINT64_MAX)return NOT_FOUND;
- uint32_t ov=overlay_slot(i);int fd=-1;
+ if(!out||mode!=1)return UNSUPPORTED;const char *p=rom_path(path);if(!p)return NOT_FOUND;uint32_t ov=0;uint64_t i=romfs_lookup_file_fast(p,&ov);if(i==UINT64_MAX)return NOT_FOUND;
+ int fd=-1;
  if(ov&&!overlays[ov-1].memory){const Overlay *o=&overlays[ov-1];fd=open(o->path,O_RDONLY|O_CLOEXEC);struct stat st;
   if(fd<0||fstat(fd,&st)!=0||(uint64_t)st.st_size!=o->size||st.st_dev!=o->dev||st.st_ino!=o->ino||st.st_mtimespec.tv_sec!=o->mtime.tv_sec||st.st_mtimespec.tv_nsec!=o->mtime.tv_nsec){
    fprintf(stderr,"[totk] RomFS overlay: %s is missing or changed since the start check\n",o->path);runtime_fail("RomFS overlay file changed while the game ran (restart the game)");}}
@@ -490,8 +503,17 @@ unsigned runtime_romfs_read(uint64_t *out,uint64_t h,int64_t offset,void *buffer
 unsigned runtime_romfs_size(int64_t *out,uint64_t h) {int fd;uint64_t base,size;const uint8_t *memory;if(!out||!handle_resolve(h,&fd,&base,&size,&memory))return INVALID;*out=(int64_t)size;return 0;}
 void runtime_romfs_close(uint64_t h) {int fd=-1;pthread_mutex_lock(&lock);int ok=romfs_htable_close_locked(&htable,h,&fd);pthread_mutex_unlock(&lock);if(!ok)runtime_fail("close invalid file handle");if(fd>=0)close(fd);}
 unsigned runtime_romfs_entry_type(int *out,const char *path) {
- if(!out)return INVALID;const char *p=rom_path(path);if(!p)return NOT_FOUND;if(file_index(p)!=UINT64_MAX){*out=1;return 0;}
- char dir[4096];if(snprintf(dir,sizeof(dir),"%s/",p)>=(int)sizeof(dir))return INVALID;if(folder_exists(dir)){*out=0;return 0;}return NOT_FOUND;
+ if(!out)return INVALID;const char *p=rom_path(path);if(!p)return NOT_FOUND;
+ size_t plen=strlen(p);uint64_t ci=UINT64_MAX;uint32_t cov=0;uint8_t cf=0,cd=0;
+ if(totk_fs_rom_get(&g_rom_fast,p,plen,&ci,&cov,&cf,&cd)){
+  if(cf==TOTK_FS_FSTATE_FILE){*out=1;return 0;}
+  if(cd==TOTK_FS_DSTATE_DIR){*out=0;return 0;}
+  if(cd==TOTK_FS_DSTATE_NODIR)return NOT_FOUND;
+ }
+ uint64_t i=file_index(p);if(i!=UINT64_MAX){totk_fs_rom_put(&g_rom_fast,p,plen,i,overlay_slot(i),TOTK_FS_FSTATE_FILE,TOTK_FS_DSTATE_UNK);*out=1;return 0;}
+ char dir[4096];if(snprintf(dir,sizeof(dir),"%s/",p)>=(int)sizeof(dir))return INVALID;
+ int ex=folder_exists(dir);totk_fs_rom_put(&g_rom_fast,p,plen,UINT64_MAX,0u,TOTK_FS_FSTATE_NOFILE,ex?TOTK_FS_DSTATE_DIR:TOTK_FS_DSTATE_NODIR);
+ if(ex){*out=0;return 0;}return NOT_FOUND;
 }
 int runtime_romfs_owns(const char *path) {size_t n=strlen(mount_name);return n&&path&&!strncmp(path,mount_name,n)&&path[n]==':';}
 int runtime_romfs_handle(uint64_t h) {return romfs_h_valid_bits(h);}
