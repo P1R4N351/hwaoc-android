@@ -18,11 +18,13 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include "vk_spv_fast.h"
 
 enum { VK_VARY_FLOAT = 0, VK_VARY_SINT = 1, VK_VARY_UINT = 2 };
 /* The user Locations a module declares for one storage class (1 Input, 3 Output), scalar or vector variables only
    (built-ins, blocks and arrays are skipped), with each one's numeric kind (VK_VARY_*). 0 = ok, -1 = malformed. */
 static inline int vk_spirv_io(const uint32_t *w, size_t nw, uint32_t storage, uint32_t *mask, uint8_t kind[32]) {
+    if (totk_vk_spv_fast_on()) return totk_spirv_io_fast(w, nw, storage, mask, kind, VK_VARY_FLOAT, VK_VARY_SINT, VK_VARY_UINT);
     *mask = 0;
     if (nw < 5 || w[0] != 0x07230203 || !w[3] || w[3] > (1u << 22)) return -1;
     uint32_t bound = w[3];
