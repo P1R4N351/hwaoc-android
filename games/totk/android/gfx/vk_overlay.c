@@ -1,6 +1,7 @@
 /* 5x7 glyphs derive from d2r_gfx/gfx/nvn/fps_overlay.c (same MIT project lineage). */
 #include "vk_int.h"
 #include "vk_overlay.h"
+#include "vk_ovl_fast.h"
 #include "vk_present_policy.h"
 #include <stddef.h>
 #include "build_kind.h"
@@ -376,9 +377,16 @@ static raster_target raster_target_make(uint32_t *pixels, unsigned w, unsigned h
     default: return (raster_target){pixels,1,(ptrdiff_t)w};
     }
 }
-static void raster_cell(const vk_overlay_panel *p, unsigned row, unsigned col, unsigned ch, unsigned scale, raster_target out) {
+static void raster_cell_mode(
+    const vk_overlay_panel *p, unsigned row, unsigned col, unsigned ch,
+    unsigned scale, raster_target out, int skip_bg) {
+    (void)p;
     unsigned x = (VK_OVERLAY_PAD + col * VK_OVERLAY_CELL_W) * scale;
     unsigned y = (VK_OVERLAY_PAD + row * VK_OVERLAY_ROW_H) * scale;
+    if (totk_vk_ovl_fast_on()) {
+        totk_ovl_raster_cell_fast(out.origin, out.dx, out.dy, x, y, font[ch & 127], scale, VK_OVERLAY_CELL_W, fg, bg, skip_bg);
+        return;
+    }
     for (unsigned r = 0; r < 7; r++) for (unsigned sy = 0; sy < scale; sy++) {
         uint32_t *dst = out.origin + (y + r * scale + sy) * out.dy + x * out.dx;
         for (unsigned c = 0; c < VK_OVERLAY_CELL_W; c++) {
@@ -387,7 +395,9 @@ static void raster_cell(const vk_overlay_panel *p, unsigned row, unsigned col, u
         }
     }
 }
-static void raster_column(const vk_overlay_panel *p, unsigned source, unsigned dest, unsigned scale, raster_target out) {
+static void raster_column_mode(
+    const vk_overlay_panel *p, unsigned source, unsigned dest,
+    unsigned scale, raster_target out, int skip_bg) {
     int valid = p->graph_count == p->layout.graph_w || source < p->graph_count;
     double ms = valid ? p->graph_ms[source] : 0;
     double target = isfinite(p->target_ms) && p->target_ms > 0 ? p->target_ms : 1000.0 / 30;
@@ -396,6 +406,11 @@ static void raster_column(const vk_overlay_panel *p, unsigned source, unsigned d
     unsigned line = (unsigned)(fmin(target, 100.0) * VK_OVERLAY_GRAPH_H / 100.0 + .5);
     if (line >= VK_OVERLAY_GRAPH_H) line = VK_OVERLAY_GRAPH_H - 1;
     uint32_t color = ms <= target + .000001 ? RGBA(80,220,100) : ms <= target * 1.5 + .000001 ? RGBA(255,210,40) : RGBA(240,70,60);
+    if (totk_vk_ovl_fast_on()) {
+        totk_ovl_raster_col_fast(out.origin, out.dx, out.dy, p->layout.graph_x + dest, p->layout.graph_y,
+                                 VK_OVERLAY_GRAPH_H, scale, bar, line, color, RGBA(120,140,160), bg, skip_bg);
+        return;
+    }
     for (unsigned y = 0; y < VK_OVERLAY_GRAPH_H; y++) {
         uint32_t pixel = y == VK_OVERLAY_GRAPH_H - 1 - line ? RGBA(120,140,160) : y >= VK_OVERLAY_GRAPH_H - bar ? color : bg;
         for (unsigned sy = 0; sy < scale; sy++) {
@@ -407,14 +422,14 @@ static void raster_column(const vk_overlay_panel *p, unsigned source, unsigned d
 void vk_overlay_raster(const vk_overlay_panel *p, uint32_t scale, uint32_t *rgba) {
     if (!scale || scale > VK_OVERLAY_MAX_SCALE || !p->layout.generation) return;
     unsigned size = p->layout.width * p->layout.height * scale * scale;
-    for (unsigned i = 0; i < size; i++) rgba[i] = bg;
+    totk_ovl_fill_u32(rgba, size, bg);
     unsigned cols = (p->layout.width - 2 * VK_OVERLAY_PAD) / VK_OVERLAY_CELL_W;
     raster_target out = raster_target_make(rgba,p->layout.width*scale,p->layout.height*scale,0);
     for (unsigned r = 0; r < p->layout.rows; r++) {
         const char *s = row_text(p, r);
-        for (unsigned c = 0; c < cols && s[c]; c++) raster_cell(p, r, c, (unsigned char)s[c], scale, out);
+        for (unsigned c = 0; c < cols && s[c]; c++) raster_cell_mode(p, r, c, (unsigned char)s[c], scale, out, 1);
     }
-    for (unsigned x = 0; x < p->layout.graph_w; x++) raster_column(p, (p->graph_next + x) % p->layout.graph_w, x, scale, out);
+    for (unsigned x = 0; x < p->layout.graph_w; x++) raster_column_mode(p, (p->graph_next + x) % p->layout.graph_w, x, scale, out, 1);
 }
 
 static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -481,11 +496,18 @@ void vk_overlay_test_publications(uint64_t *resolution, unsigned stages[2]) {
 }
 void vk_overlay_test_snapshot(vk_overlay_panel *panel) { *panel = history; }
 #endif
-static int read_number(const char *root, const char *name, double *value) {
+static int read_number_slow(const char *root, const char *name, double *value) {
     char path[512]; if (snprintf(path, sizeof path, "%s/%s", root, name) >= (int)sizeof path) return 0;
     FILE *f = fopen(path, "r"); if (!f) return 0;
     char extra; int ok = fscanf(f, "%lf %c", value, &extra) == 1; fclose(f);
     return ok && isfinite(*value);
+}
+static int read_number(const char *root, const char *name, double *value) {
+    if (totk_vk_ovl_fast_on()) {
+        int st = totk_ovl_read_number_fast(root, name, value);
+        if (st >= 0) return st;
+    }
+    return read_number_slow(root, name, value);
 }
 static int meaningful_mw(double mw) {
     /* Below half a display unit would still print the misleading '0.0 W'. */
@@ -493,10 +515,13 @@ static int meaningful_mw(double mw) {
 }
 vk_overlay_power vk_overlay_read_power(const char *root) {
     vk_overlay_power unavailable = {-1, 0};
-    char path[512], status[32] = {0};
-    if (snprintf(path, sizeof path, "%s/battery/status", root) >= (int)sizeof path) return unavailable;
-    FILE *f = fopen(path, "r");
-    if (f) { if (fgets(status, sizeof status, f)) status[strcspn(status, "\r\n")] = 0; fclose(f); }
+    char status[32] = {0};
+    if (!totk_vk_ovl_fast_on() || totk_ovl_read_text_line(root, "battery/status", status, sizeof status) < 0) {
+        char path[512];
+        if (snprintf(path, sizeof path, "%s/battery/status", root) >= (int)sizeof path) return unavailable;
+        FILE *f = fopen(path, "r");
+        if (f) { if (fgets(status, sizeof status, f)) status[strcspn(status, "\r\n")] = 0; fclose(f); }
+    }
     int discharging = !strcmp(status, "Discharging");
     int plugged = !strcmp(status, "Charging") || !strcmp(status, "Full") || !strcmp(status, "Not charging");
     double current, voltage, online, power;
@@ -542,10 +567,26 @@ static unsigned memory_mib(const char *root, const char *file, const char *field
 }
 vk_overlay_system vk_overlay_read_system(const char *cpu_root, const char *proc_root, int cpu) {
     vk_overlay_system s = {0};
-    s.total = memory_mib(proc_root, "meminfo", "MemTotal");
-    s.available = memory_mib(proc_root, "meminfo", "MemAvailable");
+    int fast = totk_vk_ovl_fast_on();
+    char buf[8192]; size_t blen = 0u;
+    int m_ok = fast ? totk_ovl_read_fd_small(proc_root, "meminfo", buf, sizeof buf, &blen) : -1;
+    if (m_ok > 0) {
+        if (!totk_ovl_parse_meminfo_buf(buf, blen, &s.total, &s.available)) s.total = s.available = UINT_MAX;
+    } else if (m_ok == 0) {
+        s.total = s.available = UINT_MAX;
+    } else {
+        s.total = memory_mib(proc_root, "meminfo", "MemTotal");
+        s.available = memory_mib(proc_root, "meminfo", "MemAvailable");
+    }
     if (s.total == UINT_MAX || s.available == UINT_MAX || s.available > s.total) s.available = s.total = 0;
-    s.rss = memory_mib(proc_root, "self/status", "VmRSS");
+    int r_ok = fast ? totk_ovl_read_fd_small(proc_root, "self/status", buf, sizeof buf, &blen) : -1;
+    if (r_ok > 0) {
+        if (!totk_ovl_parse_status_rss_buf(buf, blen, &s.rss)) s.rss = UINT_MAX;
+    } else if (r_ok == 0) {
+        s.rss = UINT_MAX;
+    } else {
+        s.rss = memory_mib(proc_root, "self/status", "VmRSS");
+    }
     if (s.rss == UINT_MAX) s.rss = 0;
     if (cpu < 0 || cpu >= 1024) return s;
     char root[512];
@@ -766,7 +807,7 @@ static int update_staging(staging *s, const vk_overlay_panel *p, unsigned rotati
     if (fresh) {
         VkDeviceSize size = (VkDeviceSize)p->layout.width * p->layout.height * scale * scale * sizeof *s->pixels;
         if (!allocate(s, size)) return 0;
-        for (VkDeviceSize i = 0; i < size / sizeof *s->pixels; i++) s->pixels[i] = bg;
+        totk_ovl_fill_u32(s->pixels, (size_t)(size / sizeof *s->pixels), bg);
         memset(s->cells, ' ', sizeof s->cells);
         s->layout_generation = p->layout.generation;
         s->rotation = rotation;
@@ -780,7 +821,7 @@ static int update_staging(staging *s, const vk_overlay_panel *p, unsigned rotati
                 unsigned char ch = end ? ' ' : (unsigned char)text[c];
                 if (!ch) { end = 1; ch = ' '; }
                 if ((unsigned char)s->cells[r][c] == ch) continue;
-                raster_cell(p, r, c, ch, scale, out); s->cells[r][c] = ch;
+                raster_cell_mode(p, r, c, ch, scale, out, fresh); s->cells[r][c] = ch;
             }
         }
         s->text_generation = p->text_generation;
@@ -789,7 +830,7 @@ static int update_staging(staging *s, const vk_overlay_panel *p, unsigned rotati
     unsigned n = fresh || s->target_ms != p->target_ms || delta >= p->layout.graph_w ? p->layout.graph_w : (unsigned)delta;
     unsigned start = n == p->layout.graph_w ? 0 : (p->graph_next + p->layout.graph_w - n) % p->layout.graph_w;
     for (unsigned k = 0; k < n; k++) {
-        unsigned x = (start + k) % p->layout.graph_w; raster_column(p, x, x, scale, out);
+        unsigned x = (start + k) % p->layout.graph_w; raster_column_mode(p, x, x, scale, out, fresh);
     }
     s->graph_total = p->graph_total; s->target_ms = p->target_ms;
     return 1;
