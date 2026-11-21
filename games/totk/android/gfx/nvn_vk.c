@@ -22,6 +22,7 @@
 #include "vk_ub_fast.h"
 #include "vk_ktgl_memo.h"
 #include "vk_img_fast.h"
+#include "vk_imgmem_fast.h"
 static int img_fast_nvn_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "vk_record.h"
@@ -550,7 +551,10 @@ static PFN_vkGetPhysicalDeviceExternalBufferProperties vkGetPhysicalDeviceExtern
 static VkExtensionProperties *g_ext; static uint32_t g_next;
 static int has_ext(const char *n) { for (uint32_t i = 0; i < g_next; i++) if (!strcmp(g_ext[i].extensionName, n)) return 1; return 0; }
 
+static totk_memtype_lut g_totk_memtype_lut;
 int vk_pick_type(uint32_t bits, VkMemoryPropertyFlags want) {
+    if (totk_vk_imgmem_fast_on() && g_totk_memtype_lut.ready && g_totk_memtype_lut.count == V.mp.memoryTypeCount)
+        return totk_memtype_pick_fast(&g_totk_memtype_lut, bits, want, 0);
     for (uint32_t i = 0; i < V.mp.memoryTypeCount; i++) if ((bits >> i & 1) && (V.mp.memoryTypes[i].propertyFlags & want) == want) return (int)i;
     return -1;
 }
@@ -666,6 +670,9 @@ static void vk_init_once(void) {
     if (V.props.apiVersion < VK_API_VERSION_1_3) DIE("%s offers Vulkan %u.%u; 1.3 is needed", V.props.deviceName, VK_API_VERSION_MAJOR(V.props.apiVersion), VK_API_VERSION_MINOR(V.props.apiVersion));
     LOGV("device %s, driver %s %s (%s%s%s)", V.props.deviceName, drvp.driverName, drvp.driverInfo, kind, drv ? " " : "", drv ? drv : "");
     vkGetPhysicalDeviceMemoryProperties(V.pd, &V.mp);
+    { uint32_t fl[32] = {0}; uint32_t n = V.mp.memoryTypeCount < 32u ? V.mp.memoryTypeCount : 32u;
+      for (uint32_t i = 0u; i < n; i++) fl[i] = V.mp.memoryTypes[i].propertyFlags;
+      totk_memtype_lut_build(&g_totk_memtype_lut, n, fl); }
     vkEnumerateDeviceExtensionProperties(V.pd, NULL, &g_next, NULL);
     g_ext = VK_CALLOC(g_next, sizeof *g_ext);
     vkEnumerateDeviceExtensionProperties(V.pd, NULL, &g_next, g_ext);

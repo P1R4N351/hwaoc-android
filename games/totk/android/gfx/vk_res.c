@@ -37,6 +37,7 @@
 #include "vk_reg_wb_fast.h"
 #include "vk_serial_fast.h"
 #include "vk_img_fast.h"
+#include "vk_imgmem_fast.h"
 static int img_fast_res_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static __thread totk_view_memo4 *T_view_memo;
 static __thread totk_view_id_memo4 *T_view_id_memo;
@@ -122,18 +123,39 @@ static void wb_diag_sweep(uint64_t start, uint64_t bytes, uint64_t chunks, int y
 
 /* ---------- device memory: 64 MiB blocks per memory type, first-fit free lists; big images get their own ---------- */
 #define BLOCK_SIZE (64ull << 20)
-typedef struct { VkDeviceSize off, size; } span_t;
-typedef struct { VkDeviceMemory mem; uint32_t type; span_t *free; int nfree, capfree; VkDeviceSize used; } block_t;
-static block_t *g_blocks; static int g_nblocks;
+typedef totk_mem_span span_t;
+typedef totk_mem_block block_t;
+static block_t *g_blocks; static VkDeviceMemory *g_block_mems; static int g_nblocks;
+static uint64_t g_type_block_mask[32];
 static pthread_mutex_t g_mem_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_mem_dedicated_bytes, g_mem_block_bytes;
 
 static void block_free_insert(block_t *b, VkDeviceSize off, VkDeviceSize size) {
     int i = 0; while (i < b->nfree && b->free[i].off < off) i++;
     if (b->nfree == b->capfree) { b->capfree = b->capfree ? 2 * b->capfree : 16; b->free = realloc(b->free, (size_t)b->capfree * sizeof *b->free); }
-    memmove(b->free + i + 1, b->free + i, (size_t)(b->nfree - i) * sizeof *b->free); b->free[i] = (span_t){off, size}; b->nfree++;
-    if (i + 1 < b->nfree && b->free[i].off + b->free[i].size == b->free[i + 1].off) { b->free[i].size += b->free[i + 1].size; memmove(b->free + i + 1, b->free + i + 2, (size_t)(b->nfree - i - 2) * sizeof *b->free); b->nfree--; }
-    if (i > 0 && b->free[i - 1].off + b->free[i - 1].size == b->free[i].off) { b->free[i - 1].size += b->free[i].size; memmove(b->free + i, b->free + i + 1, (size_t)(b->nfree - i - 1) * sizeof *b->free); b->nfree--; }
+    if (b->nfree - i > 0) memmove(b->free + i + 1, b->free + i, (size_t)(b->nfree - i) * sizeof *b->free);
+    b->free[i] = (span_t){off, size}; b->nfree++;
+    if (i + 1 < b->nfree && b->free[i].off + b->free[i].size == b->free[i + 1].off) { b->free[i].size += b->free[i + 1].size; if (b->nfree - i - 2 > 0) memmove(b->free + i + 1, b->free + i + 2, (size_t)(b->nfree - i - 2) * sizeof *b->free); b->nfree--; }
+    if (i > 0 && b->free[i - 1].off + b->free[i - 1].size == b->free[i].off) { b->free[i - 1].size += b->free[i].size; if (b->nfree - i - 1 > 0) memmove(b->free + i, b->free + i + 1, (size_t)(b->nfree - i - 1) * sizeof *b->free); b->nfree--; }
+    b->max_valid = 0u;
+}
+static int mem_alloc_legacy(uint32_t type, VkDeviceSize size, VkDeviceSize align, vk_alloc *out) {
+    for (int bi = 0; bi < g_nblocks; bi++) {
+        block_t *b = &g_blocks[bi];
+        if (b->type != type) continue;
+        for (int i = 0; i < b->nfree; i++) {
+            VkDeviceSize at = (b->free[i].off + align - 1) / align * align, end = b->free[i].off + b->free[i].size;
+            if (at + size > end) continue;
+            span_t f = b->free[i];
+            if (b->nfree - i - 1 > 0) memmove(b->free + i, b->free + i + 1, (size_t)(b->nfree - i - 1) * sizeof *b->free);
+            b->nfree--; b->max_valid = 0u;
+            if (at > f.off) block_free_insert(b, f.off, at - f.off);
+            if (at + size < end) block_free_insert(b, at + size, end - at - size);
+            b->used += size; out->mem = g_block_mems[bi]; out->off = at; out->size = size; out->block = bi;
+            return 1;
+        }
+    }
+    return 0;
 }
 int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk_alloc *out) {
     int type = vk_pick_type(req->memoryTypeBits, want);
@@ -150,31 +172,23 @@ int vk_mem_alloc(const VkMemoryRequirements *req, VkMemoryPropertyFlags want, vk
         return 1;
     }
     pthread_mutex_lock(&g_mem_mu);
+    int fast = totk_vk_imgmem_fast_on();
     for (int pass = 0; pass < 2; pass++) {
-        for (int bi = 0; bi < g_nblocks; bi++) {
-            block_t *b = &g_blocks[bi];
-            if (b->type != (uint32_t)type) continue;
-            for (int i = 0; i < b->nfree; i++) {
-                VkDeviceSize at = (b->free[i].off + align - 1) / align * align, end = b->free[i].off + b->free[i].size;
-                if (at + req->size > end) continue;
-                span_t f = b->free[i];
-                memmove(b->free + i, b->free + i + 1, (size_t)(b->nfree - i - 1) * sizeof *b->free); b->nfree--;
-                if (at > f.off) block_free_insert(b, f.off, at - f.off);
-                if (at + req->size < end) block_free_insert(b, at + req->size, end - at - req->size);
-                b->used += req->size;
-                out->mem = b->mem; out->off = at; out->size = req->size; out->block = bi;
-                pthread_mutex_unlock(&g_mem_mu);
-                return 1;
-            }
-        }
+        int hit_bi = -1; uint64_t hit_at = 0u;
+        int hit = fast ? totk_imgmem_pool_alloc(g_blocks, g_nblocks, g_type_block_mask, (uint32_t)type, req->size, align, BLOCK_SIZE, &hit_bi, &hit_at, 0)
+                       : mem_alloc_legacy((uint32_t)type, req->size, align, out);
+        if (hit) { if (fast) { out->mem = g_block_mems[hit_bi]; out->off = hit_at; out->size = req->size; out->block = hit_bi; } pthread_mutex_unlock(&g_mem_mu); return 1; }
         if (pass) break;
         VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, .allocationSize = BLOCK_SIZE, .memoryTypeIndex = (uint32_t)type};
         VkDeviceMemory m;
         if (vk_memory_allocate(&mai, &m, VK_MEMORY_IMAGE_BLOCK)) break;
         int bi = g_nblocks++;
         g_blocks = realloc(g_blocks, (size_t)g_nblocks * sizeof *g_blocks);
-        block_t *b = &g_blocks[bi]; memset(b, 0, sizeof *b); b->mem = m; b->type = (uint32_t)type;
-        block_free_insert(b, 0, BLOCK_SIZE);
+        g_block_mems = realloc(g_block_mems, (size_t)g_nblocks * sizeof *g_block_mems);
+        g_block_mems[bi] = m;
+        block_t *b = &g_blocks[bi]; memset(b, 0, sizeof *b); b->type = (uint32_t)type;
+        if (bi < 64 && (uint32_t)type < 32u) g_type_block_mask[type] |= UINT64_C(1) << bi;
+        totk_imgmem_block_free(b, 0u, BLOCK_SIZE, 0);
         g_mem_block_bytes += BLOCK_SIZE;
     }
     pthread_mutex_unlock(&g_mem_mu);
@@ -185,7 +199,10 @@ void vk_mem_free(vk_alloc *a) {
     if (a->block < 0) { vk_memory_release(a->mem, VK_MEMORY_IMAGE_DEDICATED); pthread_mutex_lock(&g_mem_mu); g_mem_dedicated_bytes -= a->size; pthread_mutex_unlock(&g_mem_mu); }
     else {
         pthread_mutex_lock(&g_mem_mu);
-        block_t *b = &g_blocks[a->block]; block_free_insert(b, a->off, a->size); b->used -= a->size;
+        block_t *b = &g_blocks[a->block];
+        if (totk_vk_imgmem_fast_on()) totk_imgmem_block_free(b, a->off, a->size, 0);
+        else block_free_insert(b, a->off, a->size);
+        b->used -= a->size;
         pthread_mutex_unlock(&g_mem_mu);
     }
     memset(a, 0, sizeof *a);
