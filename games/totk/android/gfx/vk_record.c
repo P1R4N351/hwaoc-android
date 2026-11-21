@@ -5,6 +5,7 @@
 #include "vk_shader_fast.h"
 #include "vk_dsc_fast.h"
 #include "vk_stage_fast.h"
+#include "vk_rec_fast.h"
 #include "../../runtime/frame_timeline.h"
 #include <errno.h>
 #include <sys/mman.h>
@@ -359,6 +360,11 @@ void vk_record_slot_retire(unsigned slot) {
 /* The walk owns these size-class lists. A worker only reads blocks of a dispatched job; growth/free
    concerns the unpublished building job, and pruning requires the retired slot handoff. */
 static unsigned storage_class(size_t bytes) {
+    if (totk_vk_rec_fast_on()) {
+        unsigned idx = totk_rec_storage_class_fast(bytes, REC_STORAGE_CLASSES, totk_w35_fault());
+        if (idx >= REC_STORAGE_CLASSES) DIE("recorder storage request too large: %zu bytes", bytes);
+        return idx;
+    }
     size_t capacity = REC_STORAGE_MIN; unsigned index = 0;
     while (capacity < bytes && index + 1 < REC_STORAGE_CLASSES) { capacity *= 2; index++; }
     if (capacity < bytes) DIE("recorder storage request too large: %zu bytes", bytes);
@@ -376,8 +382,9 @@ static void *storage_get(rec_storage *storage, size_t bytes, int info, const cha
     rec_storage_block *block = storage->free[index];
     if (block) storage->free[index] = block->next;
     else {
-        rec_storage_slab *slab = storage->slabs;
-        while (slab && (slab->bytes > REC_STORAGE_SLAB || capacity > slab->bytes - slab->used)) slab = slab->next;
+        rec_storage_slab *prev = NULL, *slab = storage->slabs;
+        while (slab && (slab->bytes > REC_STORAGE_SLAB || capacity > slab->bytes - slab->used)) { prev = slab; slab = slab->next; }
+        if (slab && prev && totk_vk_rec_fast_on()) { prev->next = slab->next; slab->next = storage->slabs; storage->slabs = slab; }
         if (!slab) {
             size_t need = sizeof *slab + capacity;
             size_t mapped = (need + REC_STORAGE_SLAB - 1) & ~(size_t)(REC_STORAGE_SLAB - 1);
@@ -551,11 +558,18 @@ const VkDescriptorPoolSize vk_desc_pool_sizes[VK_DESC_POOL_TYPES] = {
     {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 8192}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 2048},
     {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, 2048}, {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1024},
     {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 32768}, {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8192}};
+_Static_assert(VK_DESCRIPTOR_TYPE_SAMPLER == 0 && VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER == 1 &&
+               VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE == 2 && VK_DESCRIPTOR_TYPE_STORAGE_IMAGE == 3 &&
+               VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER == 4 && VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER == 5 &&
+               VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER == 6 && VK_DESCRIPTOR_TYPE_STORAGE_BUFFER == 7,
+               "vk_desc_pool_sizes matches 0..7");
 int vk_desc_layout_fits(const VkDescriptorSetLayoutBinding *bindings, uint32_t count, char *why, size_t size) {
     uint64_t need[VK_DESC_POOL_TYPES] = {0};
+    int fast = totk_vk_rec_fast_on(), wf = totk_w35_fault();
     for (uint32_t i = 0; i < count; i++) {
-        unsigned t = 0;
-        while (t < VK_DESC_POOL_TYPES && vk_desc_pool_sizes[t].type != bindings[i].descriptorType) t++;
+        int mapped = fast ? totk_desc_pool_type_slot((int)bindings[i].descriptorType, wf) : -1;
+        unsigned t = (mapped >= 0) ? (unsigned)mapped : 0u;
+        if (mapped < 0) while (t < VK_DESC_POOL_TYPES && vk_desc_pool_sizes[t].type != bindings[i].descriptorType) t++;
         if (t == VK_DESC_POOL_TYPES) {
             snprintf(why, size, "binding %u has descriptor type %d, which no descriptor pool declares",
                 bindings[i].binding, (int)bindings[i].descriptorType);
@@ -623,7 +637,7 @@ typedef struct desc_layout_stock {
     VkDescriptorSet *set; uint32_t count, used, capacity;
 } desc_layout_stock;
 struct vk_desc_stock {
-    nvn_hmap layouts; desc_layout_stock *list;
+    nvn_hmap layouts; desc_layout_stock *list; totk_desc_stock_memo8 memo;
     uint64_t sets, used; uint32_t pressure;
     uint32_t max, over;   /* this generation's ceiling (0: none); checkouts past it, allocated outside the stock */
 };
@@ -671,8 +685,13 @@ void vk_desc_stock_free(vk_desc_stock **stock) {
 VkDescriptorSet vk_desc_stock_take(vk_desc_stock **stock, VkDescriptorSetLayout layout, vk_desc_stock_alloc alloc, void *owner) {
     vk_desc_stock *st = *stock;
     if (!st) { st = *stock = VK_CALLOC(1, sizeof *st); st->layouts.klen = sizeof layout; st->max = vk_desc_stock_ceiling(); }
-    desc_layout_stock *s = nvn_hm_get(&st->layouts, &layout);
-    if (!s) { s = VK_CALLOC(1, sizeof *s); s->next = st->list; st->list = s; nvn_hm_put(&st->layouts, &layout, s); }
+    int fast = totk_vk_rec_fast_on();
+    desc_layout_stock *s = fast ? totk_desc_stock_memo_get(&st->memo, (const void *)(uintptr_t)layout, totk_w35_fault()) : NULL;
+    if (!s) {
+        s = nvn_hm_get(&st->layouts, &layout);
+        if (!s) { s = VK_CALLOC(1, sizeof *s); s->next = st->list; st->list = s; nvn_hm_put(&st->layouts, &layout, s); }
+        if (fast) totk_desc_stock_memo_put(&st->memo, (const void *)(uintptr_t)layout, s);
+    }
     if (s->used == s->count) {
         uint32_t batch = s->count ? (s->count < VK_DESC_STOCK_BATCH ? s->count : VK_DESC_STOCK_BATCH) : 1; /* 1,1,2,4,...32 */
         if (st->max && st->sets + batch > st->max) {
@@ -1015,8 +1034,10 @@ static VkDescriptorSet descriptor_set(rec_context *c, rec_job *j, VkDescriptorSe
 /* The constant worker specialization contains only raw Vulkan calls. The
  * shared walking entry resolves its token once, at the first emitted command;
  * an unchanged dynamic snapshot must not create an ordered section. */
+_Static_assert(sizeof(vk_record_dynamic) == 160u, "vk_record_dynamic 160B zero-pad");
 static inline __attribute__((always_inline)) void record_dynamic_emit_inner(VkCommandBuffer cb,
         const vk_record_dynamic *state, vk_record_dynamic *previous, int all, int walking) {
+    if (totk_vk_rec_fast_on() && totk_rec_dyn_unchanged(state, previous, sizeof *state, all, totk_w35_fault())) return;
     int routed = 0;
 #define EMIT(command, ...) do { \
     if (walking && !routed) { cb = VK_SECTION_CB(cb); routed = 1; } \
@@ -1064,6 +1085,49 @@ static inline VkDescriptorSet rec_descriptor_set_fast(rec_context *c, rec_job *j
     totk_rec_slice4_put(&c->slice_memo, sseq, first, count, lu, spu, ticket, (uint64_t)(uintptr_t)set);
     return set;
 }
+typedef struct {
+    VkBuffer v[17]; VkDeviceSize o[17], s[17], st[17];
+    uint64_t addr[17], rsz[17]; const vk_record_spans *sp[17]; uint32_t valid, raw;
+} rec_vstate;
+static uint32_t record_one_vertex(rec_context *c, rec_job *j, const vk_record_draw *d, rec_vstate *vs, uint32_t v) {
+    uint32_t bit = 1u << v; VkBuffer buffer = d->vertex[v].buffer;
+    uint64_t offset = d->vertex[v].offset, available; VkDeviceSize size = d->vertex[v].size;
+    if (buffer) vs->raw &= ~bit;
+    else if ((vs->raw & bit) && vs->addr[v] == d->vertex[v].address && vs->rsz[v] == d->vertex[v].size && vs->sp[v] == d->spans) {
+        buffer = vs->v[v]; offset = vs->o[v]; size = vs->s[v];
+    } else {
+        if (!d->vertex[v].address || !vk_record_resolve(d->spans, d->vertex[v].address, 1, &buffer, &offset, &available, c->hints)) {
+            VkDescriptorBufferInfo zero = zero_buffer(c); buffer = zero.buffer; offset = zero.offset; size = 64;
+        } else if (size > available) size = available;
+        vs->addr[v] = d->vertex[v].address; vs->rsz[v] = d->vertex[v].size; vs->sp[v] = d->spans; vs->raw |= bit;
+    }
+    if (d->lag_ticket && d->vertex[v].lag_reason)
+        collect_guard(j, d->spans, buffer, offset, size, d->lag_ticket, d->vertex[v].lag_reason);
+#ifdef TOTK_VK_TESTS
+    if (d->test_vertex.address && d->vertex[v].address == d->test_vertex.address) {
+        atomic_fetch_add(&test_checks, 1);
+        if (buffer != d->test_vertex.buffer || offset != d->test_vertex.offset) atomic_fetch_add(&test_failures, 1);
+    }
+#endif
+    uint32_t ch = (!(vs->valid & bit) || vs->v[v] != buffer || vs->o[v] != offset || vs->s[v] != size || vs->st[v] != d->vertex[v].stride) ? bit : 0u;
+    vs->valid |= bit; vs->v[v] = buffer; vs->o[v] = offset; vs->s[v] = size; vs->st[v] = d->vertex[v].stride;
+    return ch;
+}
+static void record_draw_vertices(rec_context *c, rec_job *j, const vk_record_draw *d, rec_vstate *vs) {
+    uint32_t changed = 0;
+    if (totk_vk_rec_fast_on()) {
+        for (uint32_t vm = totk_rec_vmask(d->vertex_mask, totk_w35_fault()); vm; vm &= vm - 1u)
+            changed |= record_one_vertex(c, j, d, vs, (uint32_t)__builtin_ctz(vm));
+    } else {
+        for (uint32_t v = 0; v < 17; v++) if (d->vertex_mask >> v & 1) changed |= record_one_vertex(c, j, d, vs, v);
+    }
+    while (changed) {
+        uint32_t first = (uint32_t)__builtin_ctz(changed), end = first + 1;
+        while (end < 17 && (changed >> end & 1)) end++;
+        (vkCmdBindVertexBuffers2)(j->cb, first, end - first, vs->v + first, vs->o + first, vs->s + first, vs->st + first);
+        changed &= ~(((1u << (end - first)) - 1) << first);
+    }
+}
 static void record_job(rec_job *j, unsigned worker) {
     if (j->registering) {
         j->reset_time = 0;
@@ -1101,10 +1165,8 @@ static void record_job(rec_job *j, unsigned worker) {
     }
     VkPipeline pipeline = VK_NULL_HANDLE; vk_record_dynamic dynamic = {0};
     VkPipelineLayout bound_layout = VK_NULL_HANDLE; VkDescriptorSet bound_set[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
-    VkBuffer vertices[17], index_buffer = VK_NULL_HANDLE;
-    VkDeviceSize offsets[17], sizes[17], strides[17], index_offset = 0;
-    uint64_t addresses[17], raw_sizes[17]; const vk_record_spans *vertex_spans[17];
-    uint32_t vertex_valid = 0, raw_valid = 0; VkIndexType index_type = VK_INDEX_TYPE_UINT32;
+    rec_vstate vs = {0}; VkBuffer index_buffer = VK_NULL_HANDLE;
+    VkDeviceSize index_offset = 0; VkIndexType index_type = VK_INDEX_TYPE_UINT32;
     uint32_t event = 0; uint64_t draws = 0;
     uint64_t sseq = ++c->slice_seq; if (!sseq) { memset(&c->slice_memo, 0, sizeof c->slice_memo); sseq = c->slice_seq = 1; }
     for (uint32_t i = 0; i <= j->count; i++) {
@@ -1126,38 +1188,7 @@ static void record_job(rec_job *j, unsigned worker) {
                 (vkCmdBindDescriptorSets)(j->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, d->layout, s, 1, &set, 0, NULL); bound_set[s] = set;
             }
         }
-        uint32_t changed = 0;
-        for (uint32_t v = 0; v < 17; v++) if (d->vertex_mask >> v & 1) {
-            uint32_t bit = 1u << v; VkBuffer buffer = d->vertex[v].buffer;
-            uint64_t offset = d->vertex[v].offset, available; VkDeviceSize size = d->vertex[v].size;
-            if (buffer) raw_valid &= ~bit; /* selected handles, especially private overrides, are not cached raw resolutions */
-            else if ((raw_valid & bit) && addresses[v] == d->vertex[v].address &&
-                     raw_sizes[v] == d->vertex[v].size && vertex_spans[v] == d->spans) {
-                buffer = vertices[v]; offset = offsets[v]; size = sizes[v];
-            } else {
-                if (!d->vertex[v].address || !vk_record_resolve(d->spans, d->vertex[v].address, 1, &buffer, &offset, &available, c->hints)) {
-                    VkDescriptorBufferInfo zero = zero_buffer(c); buffer = zero.buffer; offset = zero.offset; size = 64;
-                } else if (size > available) size = available;
-                addresses[v] = d->vertex[v].address; raw_sizes[v] = d->vertex[v].size; vertex_spans[v] = d->spans;
-                raw_valid |= bit;
-            }
-            if (d->lag_ticket && d->vertex[v].lag_reason)
-                collect_guard(j, d->spans, buffer, offset, size, d->lag_ticket, d->vertex[v].lag_reason);
-#ifdef TOTK_VK_TESTS
-            if (d->test_vertex.address && d->vertex[v].address == d->test_vertex.address) {
-                atomic_fetch_add(&test_checks, 1);
-                if (buffer != d->test_vertex.buffer || offset != d->test_vertex.offset) atomic_fetch_add(&test_failures, 1);
-            }
-#endif
-            if (!(vertex_valid & bit) || vertices[v] != buffer || offsets[v] != offset || sizes[v] != size || strides[v] != d->vertex[v].stride) changed |= bit;
-            vertex_valid |= bit; vertices[v] = buffer; offsets[v] = offset; sizes[v] = size; strides[v] = d->vertex[v].stride;
-        }
-        while (changed) {
-            uint32_t first = (uint32_t)__builtin_ctz(changed), end = first + 1;
-            while (end < 17 && (changed >> end & 1)) end++;
-            (vkCmdBindVertexBuffers2)(j->cb, first, end - first, vertices + first, offsets + first, sizes + first, strides + first);
-            changed &= ~(((1u << (end - first)) - 1) << first);
-        }
+        record_draw_vertices(c, j, d, &vs);
         if (d->index || d->index_address) {
             VkBuffer buffer = d->index; uint64_t offset = d->index_offset;
             if (d->index_address) {
@@ -1375,10 +1406,12 @@ static rec_job *job_allocate(void) {
     j->generation = slots[current_slot].generation; j->slot = current_slot;
     j->frame = totk_ft_work_frame();
     j->done = j->parallel = j->count = 0; j->pass_next = j->queue_next = j->batch_next = NULL;
+    uint32_t had_guards = j->nguards;
     j->nguards = j->nprojected = 0; j->projected_ranges = j->prep_ns = 0;
     j->guard_ticket = vk_record_lag_ticket(); j->registering = 0;
     if (j->guard_ticket) nvn_dirty_lag_batch_reset(&j->units);
-    if (j->guard_cache) memset(j->guard_cache, 0, REC_GUARD_CACHE * sizeof *j->guard_cache);
+    if (j->guard_cache && totk_rec_need_guard_zero(had_guards, totk_vk_rec_fast_on()))
+        memset(j->guard_cache, 0, REC_GUARD_CACHE * sizeof *j->guard_cache);
     return j;
 }
 static rec_job *job_begin(void) {
