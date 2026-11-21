@@ -19,6 +19,7 @@
 #include <sys/mman.h>
 #include "mprotect_stats.h"
 #include "totk_svc_fast.h"
+#include "totk_oe_fast.h"
 
 #include <time.h>
 #include <unistd.h>
@@ -321,11 +322,10 @@ static void oe_copyright_visibility(unsigned visible) { (void)visible; }
 /* TOTK_OPERATION_MODE=handheld reports the Switch handheld mode (oe OperationMode 0, PerformanceMode Normal 0) instead of
    docked (1, Boost 1): the game then uses its own handheld settings (1280x720 output, lower internal resolution), which
    Nintendo made for half the docked GPU clock. Read once; any other value stops the start. */
-static int handheld_mode(void) {static int v=-1;if(v<0){const char *e=getenv("TOTK_OPERATION_MODE");int h;if(!e||!strcmp(e,"docked"))h=0;else if(!strcmp(e,"handheld"))h=1;else runtime_fail("TOTK_OPERATION_MODE must be docked or handheld");
- fprintf(stderr,"[totk] operation mode reported to the game: %s\n",h?"handheld (performance normal)":"docked (performance boost)");v=h;}return v;}
+static int handheld_mode(void) {static _Atomic int v=-1;int cur=atomic_load_explicit(&v,memory_order_acquire);if(cur<0){const char *e=getenv("TOTK_OPERATION_MODE");int h=0;if(!e||!strcmp(e,"docked"))h=0;else if(!strcmp(e,"handheld"))h=1;else runtime_fail("TOTK_OPERATION_MODE must be docked or handheld");int exp=-1;if(atomic_compare_exchange_strong(&v,&exp,h))fprintf(stderr,"[totk] operation mode reported to the game: %s\n",h?"handheld (performance normal)":"docked (performance boost)");cur=atomic_load_explicit(&v,memory_order_acquire);}return cur;}
 int runtime_handheld_mode(void){return handheld_mode();}   /* runtime/input.c: the pad is the handheld controller then */
-static int operation_mode(void) {return handheld_mode()?0:1;}
-static int performance_mode(void) {return handheld_mode()?0:1;}
+static int operation_mode(void) {return totk_oe_opmode_to_console(handheld_mode());}
+static int performance_mode(void) {return totk_oe_opmode_to_console(handheld_mode());}
 static int focus_policy;
 static void focus_mode(int mode) {if(mode<0||mode>3)runtime_fail("unknown focus handling mode");focus_policy=mode;runtime_startup_checkpoint((uintptr_t)__builtin_return_address(0));fprintf(stderr,"[totk] focus policy stored: %d (window lifecycle pending)\n",focus_policy);}
 static int focus_state(void) {return runtime_front_focus();}
@@ -339,11 +339,22 @@ static void performance_config(int mode,int cfg) {if(mode<0||mode>1)runtime_fail
    launcher sets to the app's first preferred language (BCP 47, e.g. "pt-BR"; it follows a per-app language), or else
    the Mac's current locale. Brazil maps to "pt-BR" only in the 1.4.3 build, whose RomFS has the official USpt text.
    Chinese follows an explicit Hant/Hans script, otherwise TW/HK/MO selects Traditional Chinese. */
+static totk_oe_lang_slot g_oe_lang_fast;
+static pthread_mutex_t g_oe_lang_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_oe_lang_ready;
 static uint64_t desired_language(void) {
- const char *explicit=getenv("TOTK_LANG");char code[8]={0};
+ const char *explicit=getenv("TOTK_LANG");
+ const char *tag_env=getenv("TOTK_LOCALE");
+ const char *lc_env=getenv("LC_ALL");
+ const char *lang_env=getenv("LANG");
+ if(atomic_load_explicit(&g_oe_lang_ready,memory_order_acquire)){
+  uint64_t cached=0;
+  if(totk_oe_lang_get(&g_oe_lang_fast,explicit,tag_env,lc_env,lang_env,&cached))return cached;
+ }
+ char code[8]={0};
  if(explicit){if(strlen(explicit)>7)runtime_fail("language code too long");memcpy(code,explicit,strlen(explicit));}
  else {
-  char language[16]={0},script[8]={0},region[4]={0};const char *tag=getenv("TOTK_LOCALE");
+  char language[16]={0},script[8]={0},region[4]={0};const char *tag=tag_env;
   if(tag&&*tag){
    size_t n=strcspn(tag,"-_");if(n<sizeof(language))memcpy(language,tag,n);
    for(const char *p=tag+n;*p;){p+=strspn(p,"-_");size_t k=strcspn(p,"-_");
@@ -361,7 +372,7 @@ static uint64_t desired_language(void) {
    if(value)CFStringGetCString(value,region,sizeof(region),kCFStringEncodingUTF8);CFRelease(locale);
 #else
    /* Linux: LC_ALL / LANG ("pt_BR.UTF-8"). Android: the launcher sets TOTK_LOCALE from the system locale. */
-   const char *l=getenv("LC_ALL");if(!l||!*l)l=getenv("LANG");if(!l)l="";
+   const char *l=lc_env;if(!l||!*l)l=lang_env;if(!l)l="";
    size_t n=strcspn(l,"_-.@");if(n<sizeof(language))memcpy(language,l,n);
    if(l[n]=='_'||l[n]=='-'){const char *r=l+n+1;if(isalpha((unsigned char)r[0])&&isalpha((unsigned char)r[1])){region[0]=(char)toupper((unsigned char)r[0]);region[1]=(char)toupper((unsigned char)r[1]);}}
    if(!strcmp(language,"C")||!strcmp(language,"POSIX"))language[0]=0;
@@ -379,8 +390,15 @@ static uint64_t desired_language(void) {
  }
  /* Once: the language a launcher setting (TOTK_LANG / TOTK_LOCALE) resolved to, for the session log. */
  static _Atomic int logged;if(!atomic_exchange(&logged,1))fprintf(stderr,"[totk] language reported to the game: %s (%s)\n",code,
-  explicit?"TOTK_LANG":getenv("TOTK_LOCALE")&&*getenv("TOTK_LOCALE")?"from TOTK_LOCALE":"system default");
- uint64_t result;memcpy(&result,code,8);return result;
+  explicit?"TOTK_LANG":tag_env&&*tag_env?"from TOTK_LOCALE":"system default");
+ uint64_t result=0;memcpy(&result,code,8);
+ if(totk_oe_fast_active()){
+  pthread_mutex_lock(&g_oe_lang_mu);
+  totk_oe_lang_put(&g_oe_lang_fast,explicit,tag_env,lc_env,lang_env,result);
+  atomic_store_explicit(&g_oe_lang_ready,1,memory_order_release);
+  pthread_mutex_unlock(&g_oe_lang_mu);
+ }
+ return result;
 }
 /* Streaming allocations arrive in bursts; keep failures visible without a write for every success.
    As with TOTK_TRACE_SVC, the environment is sampled once and published atomically to guest threads. */

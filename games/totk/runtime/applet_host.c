@@ -3,25 +3,32 @@
    calls that would talk to system services are taken here. */
 #include "runtime.h"
 #include <pthread.h>
+#include <stdatomic.h>
+#include "totk_oe_fast.h"
 #include <stdio.h>
 #include <string.h>
 
 /* ---------- nn::oe ---------- */
 static float balance[2] = {1.0f, 1.0f};
+static totk_oe_balance g_oe_bal;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t message_cv = PTHREAD_COND_INITIALIZER;
-static uint32_t messages[32]; static unsigned head, tail;
+static totk_oe_mq g_oe_mq;
 static uint64_t start_ns;
 __attribute__((constructor)) static void started(void) { start_ns = runtime_now_ns(); }
 
 void runtime_oe_push_message(uint32_t message) {
     pthread_mutex_lock(&lock);
-    if (tail - head < 32) { messages[tail++ % 32] = message; pthread_cond_broadcast(&message_cv); }
+    if (totk_oe_mq_push_locked(&g_oe_mq, message)) pthread_cond_broadcast(&message_cv);
     pthread_mutex_unlock(&lock);
 }
-static void get_balance(float *l, float *r) { pthread_mutex_lock(&lock); if (l) *l = balance[0]; if (r) *r = balance[1]; pthread_mutex_unlock(&lock); }
+static void get_balance(float *l, float *r) {
+    if (totk_oe_fast_active()) { totk_oe_bal_get(&g_oe_bal, l, r); return; }
+    pthread_mutex_lock(&lock); if (l) *l = balance[0]; if (r) *r = balance[1]; pthread_mutex_unlock(&lock);
+}
 static void set_balance(float l, float r) {
     if (l < 0 || l > 1 || r < 0 || r > 1) runtime_fail("volume balance out of range");
+    totk_oe_bal_set(&g_oe_bal, l, r);
     pthread_mutex_lock(&lock); balance[0] = l; balance[1] = r; pthread_mutex_unlock(&lock);
 }
 static int64_t total_active_time(void) { return (int64_t)(runtime_now_ns() - start_ns); }   /* TimeSpan in ns */
@@ -39,18 +46,21 @@ static unsigned char try_pop_launch_parameter(uint64_t *size,void *buffer,uint64
     (void)buffer;(void)capacity;if(size)*size=0;return 0;
 }
 static unsigned char try_pop(uint32_t *out) {
-    pthread_mutex_lock(&lock); int ok = head != tail; if (ok && out) *out = messages[head++ % 32]; pthread_mutex_unlock(&lock); return (unsigned char)ok;
+    unsigned char fast_ret = 0;
+    if (totk_oe_mq_try_empty(&g_oe_mq, out, &fast_ret)) return fast_ret;
+    pthread_mutex_lock(&lock); int ok = totk_oe_mq_pop_locked(&g_oe_mq, out); pthread_mutex_unlock(&lock); return (unsigned char)ok;
 }
 int runtime_core_away(void); void runtime_core_back(int *away);
 static uint32_t pop(void) {
     __attribute__((cleanup(runtime_core_back))) int away = runtime_core_away();   /* blocks like a Horizon wait */
-    pthread_mutex_lock(&lock); while (head == tail) pthread_cond_wait(&message_cv, &lock);
-    uint32_t m = messages[head++ % 32]; pthread_mutex_unlock(&lock); return m;
+    uint32_t m = 0;
+    pthread_mutex_lock(&lock); while (!totk_oe_mq_pop_locked(&g_oe_mq, &m)) pthread_cond_wait(&message_cv, &lock);
+    pthread_mutex_unlock(&lock); return m;
 }
 
 /* ---------- nn::prepo: play reports are not transmitted (no Nintendo servers) ---------- */
-static uint64_t reports;
-static unsigned report_save(const void *report) { (void)report; if (!(reports++ % 100)) fprintf(stderr, "[totk] play report kept local (not transmitted), count %llu\n", (unsigned long long)reports); return 0; }
+static _Atomic uint64_t reports;
+static unsigned report_save(const void *report) { (void)report; uint64_t prev = atomic_fetch_add_explicit(&reports, 1u, memory_order_relaxed); if (!(prev % 100u)) fprintf(stderr, "[totk] play report kept local (not transmitted), count %llu\n", (unsigned long long)(prev + 1u)); return 0; }
 static unsigned report_save_uid(const void *report, const void *uid) { (void)uid; return report_save(report); }
 static unsigned immediate_transmission(void) { return 0; }
 static unsigned connection_status(void *report, const char *a, const char *b, const char *c) { (void)report; (void)a; (void)b; (void)c; return 0; }
