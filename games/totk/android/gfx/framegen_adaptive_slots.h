@@ -2,6 +2,7 @@
  * Only scalar reservations live here. Cancelling/forgetting a reservation NEVER
  * completes GPU work, releases a source/output, or retracts a platform apply. */
 #pragma once
+#include "vk_pace_fast.h"
 #include <stdint.h>
 #include <stddef.h>
 
@@ -72,6 +73,8 @@ typedef struct {
     unsigned configured, have_publication, have_history, have_real;
     unsigned samples, pending_count;
     fgs_mode mode;
+    uint16_t pending_mask, occ_tracked;
+    uint64_t occ_mask;
 } fgs_state;
 
 static inline int fgs_add_ns(uint64_t a, uint64_t b, uint64_t *out) {
@@ -121,13 +124,23 @@ static inline unsigned fgs_slot_kind(const fgs_state *s, uint64_t ordinal) {
     return p->kind && p->ordinal==ordinal ? p->kind : FGS_SLOT_EMPTY;
 }
 static inline int fgs_pending_index(const fgs_state *s, uint64_t token) {
-    if (!token) return -1;
+    if (!token || (totk_pace_fast_on() && !s->pending_count)) return -1;
+    if (totk_pace_fast_on() && totk_fgs_popcnt16(s->pending_mask) == s->pending_count) {
+        uint32_t m = s->pending_mask;
+        while (m) {
+            unsigned i = totk_fgs_ctz32(m);
+            m &= m - 1u;
+            if (s->pending[i].token == token) return (int)i;
+        }
+        return -1;
+    }
     for (unsigned i=0;i<FGS_PENDING_CAP;i++)
         if (s->pending[i].token==token) return (int)i;
     return -1;
 }
 static inline void fgs_remove_pending(fgs_state *s, unsigned index) {
     s->pending[index]=(fgs_request){0};
+    s->pending_mask &= (uint16_t)~(1u << index);
     s->pending_count--;
 }
 static inline void fgs_batch_cancel(fgs_state *s, unsigned index,
@@ -135,6 +148,19 @@ static inline void fgs_batch_cancel(fgs_state *s, unsigned index,
     /* A batch can enumerate the entire fixed pending array, without truncation. */
     out->cancelled[out->cancel_count++]=(fgs_cancel){s->pending[index],reason};
     fgs_remove_pending(s,index);
+}
+static inline void fgs_cancel_all_pending(fgs_state *s, fgs_cancel_reason reason, fgs_batch *out) {
+    if (totk_pace_fast_on() && totk_fgs_popcnt16(s->pending_mask) == s->pending_count) {
+        uint32_t m = s->pending_mask;
+        while (m) {
+            unsigned i = totk_fgs_ctz32(m);
+            m &= m - 1u;
+            fgs_batch_cancel(s, i, reason, out);
+        }
+        return;
+    }
+    for (unsigned i=0;i<FGS_PENDING_CAP;i++)
+        if (s->pending[i].token) fgs_batch_cancel(s,i,reason,out);
 }
 /* Age metadata only once actual time makes earlier slots ineligible. A burst
  * of future reservations must hit capacity, never silently seal FREE holes.
@@ -160,7 +186,10 @@ static inline void fgs_record_slot(fgs_state *s, fgs_slot slot, unsigned kind,
         s->have_history=1;
     }
     /* This finite metadata is wholly unrelated to external resource ownership. */
-    s->occupied[slot.ordinal%FGS_HISTORY_CAP]=(fgs_occupied){slot.ordinal,kind};
+    unsigned slot_idx = (unsigned)(slot.ordinal & (FGS_HISTORY_CAP - 1u));
+    s->occupied[slot_idx]=(fgs_occupied){slot.ordinal,kind};
+    s->occ_mask |= UINT64_C(1) << slot_idx;
+    s->occ_tracked = 1u;
 }
 static inline void fgs_clear_predictor(fgs_state *s) {
     s->have_publication=0;
@@ -188,8 +217,7 @@ static inline fgs_status fgs_reset(fgs_state *s, uint64_t window_epoch,
         uint64_t base_ns, uint64_t period_ns, uint64_t margin_ns, fgs_batch *out) {
     if (!s || !out) return FGS_INVALID;
     *out=(fgs_batch){0};
-    for (unsigned i=0;i<FGS_PENDING_CAP;i++)
-        if (s->pending[i].token) fgs_batch_cancel(s,i,FGS_CANCEL_RESET,out);
+    fgs_cancel_all_pending(s, FGS_CANCEL_RESET, out);
     uint64_t generation=s->generation, token=s->next_token;
     *s=(fgs_state){.window_epoch=window_epoch,.generation=generation,.base_ns=base_ns,
         .period_ns=period_ns,.margin_ns=margin_ns,.next_token=token,
@@ -205,8 +233,7 @@ static inline fgs_status fgs_reset(fgs_state *s, uint64_t window_epoch,
 static inline fgs_status fgs_end(fgs_state *s, fgs_batch *out) {
     if (!s || !out) return FGS_INVALID;
     *out=(fgs_batch){.mode=FGS_MODE_CLOCK};
-    for (unsigned i=0;i<FGS_PENDING_CAP;i++)
-        if (s->pending[i].token) fgs_batch_cancel(s,i,FGS_CANCEL_END,out);
+    fgs_cancel_all_pending(s, FGS_CANCEL_END, out);
     s->configured=0;
     fgs_clear_predictor(s);
     s->mode=FGS_MODE_CLOCK;
@@ -282,6 +309,50 @@ static inline int fgs_reanchor_translate(const fgs_state *next, int64_t lag_ns,
  * one, so a later REAL can neither land on an irrevocably applied GEN's
  * display vsync nor fill a hole before it. The live old-numbering occupancy
  * entries are cleared: every translated slot is below the new sealed floor. */
+static inline int fgs_reanchor_occupied(
+        const fgs_state *s, fgs_state *next, int64_t lag_ns,
+        uint64_t *high_out, unsigned *live_out, unsigned *moved_out) {
+    uint64_t target = 0, high = 0;
+    unsigned live = 0, moved = 0;
+    if (totk_pace_fast_on() && !s->have_history) {
+        *high_out = 0; *live_out = 0; *moved_out = 0; return 1;
+    }
+    if (totk_pace_fast_on() && s->occ_tracked) {
+        uint64_t m = s->occ_mask;
+        while (m) {
+            unsigned i = totk_fgs_ctz64(m);
+            m &= m - 1u;
+            const fgs_occupied *p = &s->occupied[i];
+            if (!p->kind || p->ordinal < s->sealed_before) continue;
+            uint64_t translated;
+            if (!fgs_slot_target(s, p->ordinal, &target) ||
+                    !fgs_reanchor_translate(next, lag_ns, p->ordinal, target, &translated) ||
+                    !fgs_slot_target(next, translated, &target)) return 0;
+            if (!live || translated > high) high = translated;
+            next->occupied[i] = (fgs_occupied){0};
+            next->occ_mask &= ~(UINT64_C(1) << i);
+            live++;
+            moved += translated != p->ordinal;
+        }
+    } else {
+        for (unsigned i = 0; i < FGS_HISTORY_CAP; i++) {
+            const fgs_occupied *p = &s->occupied[i];
+            if (!p->kind || p->ordinal < s->sealed_before) continue;
+            uint64_t translated;
+            if (!fgs_slot_target(s, p->ordinal, &target) ||
+                    !fgs_reanchor_translate(next, lag_ns, p->ordinal, target, &translated) ||
+                    !fgs_slot_target(next, translated, &target)) return 0;
+            if (!live || translated > high) high = translated;
+            next->occupied[i] = (fgs_occupied){0};
+            next->occ_mask &= ~(UINT64_C(1) << i);
+            live++;
+            moved += translated != p->ordinal;
+        }
+    }
+    *high_out = high; *live_out = live; *moved_out = moved;
+    return 1;
+}
+
 static inline fgs_status fgs_reanchor(fgs_state *s, uint64_t vsync_ns,
         int64_t lag_ns, uint64_t period_ns, fgs_reanchor_result *out) {
     if (!s || !out) return FGS_INVALID;
@@ -305,21 +376,9 @@ static inline fgs_status fgs_reanchor(fgs_state *s, uint64_t vsync_ns,
     next.base_ns=anchor-anchor_ordinal*period_ns;
     next.period_ns=period_ns;
     next.generation=s->generation+1;
-    uint64_t target, high=0;
-    unsigned live=0, moved=0;
-    for (unsigned i=0;i<FGS_HISTORY_CAP;i++) {
-        const fgs_occupied *p=&s->occupied[i];
-        if (!p->kind || p->ordinal<s->sealed_before) continue;
-        uint64_t translated;
-        if (!fgs_slot_target(s,p->ordinal,&target) ||
-                !fgs_reanchor_translate(&next,lag_ns,p->ordinal,target,&translated) ||
-                !fgs_slot_target(&next,translated,&target)) return FGS_OVERFLOW;
-        if (!live || translated>high) high=translated;
-        /* Old-numbering metadata; the translated slot is below the new floor. */
-        next.occupied[i]=(fgs_occupied){0};
-        live++;
-        moved+=translated!=p->ordinal;
-    }
+    uint64_t target = 0, high = 0;
+    unsigned live = 0, moved = 0;
+    if (!fgs_reanchor_occupied(s, &next, lag_ns, &high, &live, &moved)) return FGS_OVERFLOW;
     if (s->have_real) {
         uint64_t translated;
         if (!fgs_reanchor_translate(&next,lag_ns,s->last_real.ordinal,
@@ -371,25 +430,23 @@ static inline fgs_status fgs_peek_real(const fgs_state *s,
 /* AFTER actual REAL apply only, using the exact assigned target even if apply
  * overran its cutoff. Timing misses are diagnostics and never undo publication.
  * Prediction uses only actual past publications. It does NOT supply game phase. */
-static inline fgs_status fgs_commit_real(fgs_state *s, fgs_slot assigned,
-        uint64_t actual_publication_ns, uint64_t frame, uint64_t source_epoch,
-        int eligible, fgs_batch *out) {
-    if (!s || !out) return FGS_INVALID;
-    *out=(fgs_batch){0};
-    fgs_status valid=fgs_validate_slot(s,assigned);
-    if (valid!=FGS_OK) return valid;
-    if (fgs_slot_kind(s,assigned.ordinal)) return FGS_DUPLICATE;
-    uint64_t floor=fgs_commit_floor(s,assigned,actual_publication_ns);
-    if (!fgs_storage_available(s,assigned.ordinal,floor)) return FGS_CAPACITY;
-    uint64_t cutoff=assigned.target_ns>=s->margin_ns ?
-        assigned.target_ns-s->margin_ns : 0;
-    out->deadline_missed=actual_publication_ns>cutoff;
-    out->target_missed=actual_publication_ns>=assigned.target_ns;
-    int scene=!eligible || (s->have_publication && source_epoch!=s->last_source_epoch);
-    int clock=s->have_publication && actual_publication_ns<=s->last_publication_ns;
-    int gap=s->have_publication && actual_publication_ns>s->last_publication_ns &&
-        actual_publication_ns-s->last_publication_ns>FGS_RESET_GAP_NS;
-    fgs_record_slot(s,assigned,FGS_SLOT_REAL,floor);
+static inline void fgs_commit_real_cancel(
+        fgs_state *s, fgs_slot assigned, int scene, int clock, int gap, fgs_batch *out) {
+    if (totk_pace_fast_on() && totk_fgs_popcnt16(s->pending_mask) == s->pending_count) {
+        uint32_t m = s->pending_mask;
+        while (m) {
+            unsigned i = totk_fgs_ctz32(m);
+            m &= m - 1u;
+            if (scene || clock || gap || s->pending[i].slot.ordinal < s->sealed_before ||
+                    s->pending[i].slot.ordinal >= assigned.ordinal) {
+                fgs_cancel_reason reason = scene ? FGS_CANCEL_SCENE :
+                    clock ? FGS_CANCEL_CLOCK : gap ? FGS_CANCEL_GAP :
+                    s->pending[i].slot.ordinal < s->sealed_before ? FGS_CANCEL_CLOCK : FGS_CANCEL_REAL;
+                fgs_batch_cancel(s, i, reason, out);
+            }
+        }
+        return;
+    }
     for (unsigned i=0;i<FGS_PENDING_CAP;i++) {
         if (!s->pending[i].token) continue;
         if (scene || clock || gap || s->pending[i].slot.ordinal<s->sealed_before ||
@@ -400,23 +457,82 @@ static inline fgs_status fgs_commit_real(fgs_state *s, fgs_slot assigned,
             fgs_batch_cancel(s,i,reason,out);
         }
     }
+}
+
+static inline int fgs_commit_find_slot(
+        const fgs_state *s, uint64_t ordinal, int *free_out) {
+    if (totk_pace_fast_on() && totk_fgs_popcnt16(s->pending_mask) == s->pending_count) {
+        uint32_t m = s->pending_mask;
+        while (m) {
+            unsigned i = totk_fgs_ctz32(m);
+            m &= m - 1u;
+            if (s->pending[i].slot.ordinal == ordinal) return 1;
+        }
+        *free_out = totk_fgs_first_free16(s->pending_mask);
+        return 0;
+    }
+    int owned = 0, free_index = -1;
+    for (unsigned i=0;i<FGS_PENDING_CAP;i++) {
+        if (s->pending[i].token && s->pending[i].slot.ordinal==ordinal) owned=1;
+        if (!s->pending[i].token && free_index<0) free_index=(int)i;
+    }
+    *free_out = free_index;
+    return owned;
+}
+
+static inline void fgs_commit_real_issue(
+        fgs_state *s, fgs_slot assigned, uint64_t actual_publication_ns,
+        uint64_t frame, uint64_t source_epoch, uint64_t predicted, fgs_batch *out) {
+    for (uint64_t ordinal=assigned.ordinal+1;ordinal<predicted;ordinal++) {
+        if (fgs_slot_kind(s,ordinal)) continue;
+        int free_index = -1;
+        if (fgs_commit_find_slot(s, ordinal, &free_index)) continue;
+        if (free_index<0) { out->request_status=FGS_CAPACITY; break; }
+        uint64_t target;
+        if (!fgs_slot_target(s,ordinal,&target) || s->next_token==UINT64_MAX) {
+            out->request_status=FGS_OVERFLOW; break;
+        }
+        fgs_request request={.token=++s->next_token,.frame=frame,
+            .source_epoch=source_epoch,.real_slot=assigned,
+            .slot=fgs_make_slot(s,ordinal,target),.publication_ns=actual_publication_ns,
+            .ewma_ns=s->ewma_ns,.predicted_next_ordinal=predicted,
+            .deadline_ns=target-s->margin_ns};
+        s->pending[free_index]=request;
+        s->pending_mask |= (uint16_t)(1u << (unsigned)free_index);
+        s->pending_count++;
+        out->requests[out->request_count++]=request;
+    }
+}
+
+static inline fgs_status fgs_commit_real(fgs_state *s, fgs_slot assigned,
+        uint64_t actual_publication_ns, uint64_t frame, uint64_t source_epoch,
+        int eligible, fgs_batch *out) {
+    if (!s || !out) return FGS_INVALID;
+    *out=(fgs_batch){0};
+    fgs_status valid=fgs_validate_slot(s,assigned);
+    if (valid!=FGS_OK) return valid;
+    if (fgs_slot_kind(s,assigned.ordinal)) return FGS_DUPLICATE;
+    uint64_t floor=fgs_commit_floor(s,assigned,actual_publication_ns);
+    if (!fgs_storage_available(s,assigned.ordinal,floor)) return FGS_CAPACITY;
+    uint64_t cutoff=assigned.target_ns>=s->margin_ns ? assigned.target_ns-s->margin_ns : 0;
+    out->deadline_missed=actual_publication_ns>cutoff;
+    out->target_missed=actual_publication_ns>=assigned.target_ns;
+    int scene=!eligible || (s->have_publication && source_epoch!=s->last_source_epoch);
+    int clock=s->have_publication && actual_publication_ns<=s->last_publication_ns;
+    int gap=s->have_publication && actual_publication_ns>s->last_publication_ns &&
+        actual_publication_ns-s->last_publication_ns>FGS_RESET_GAP_NS;
+    fgs_record_slot(s,assigned,FGS_SLOT_REAL,floor);
+    fgs_commit_real_cancel(s, assigned, scene, clock, gap, out);
     if (scene || clock || gap) fgs_clear_predictor(s);
     if (!scene && !clock && !gap && s->have_publication) {
         uint64_t interval=actual_publication_ns-s->last_publication_ns;
-        /* Both EMA and interval are bounded by RESET_GAP_NS; still check the
-         * arithmetic explicitly, including token/ordinal/time paths below. */
         if (!s->samples) s->ewma_ns=interval;
-        else if (s->ewma_ns>(UINT64_MAX-interval)/7) {
-            fgs_clear_predictor(s);
-            clock=1;
-        } else s->ewma_ns=(7*s->ewma_ns+interval)/8;
+        else if (s->ewma_ns>(UINT64_MAX-interval)/7) { fgs_clear_predictor(s); clock=1; }
+        else s->ewma_ns=(7*s->ewma_ns+interval)/8;
         if (!clock && s->samples<FGS_WARMUP_INTERVALS) s->samples++;
     }
-    s->last_publication_ns=actual_publication_ns;
-    s->last_source_epoch=source_epoch;
-    s->have_publication=1;
-    s->last_real=assigned;
-    s->have_real=1;
+    s->last_publication_ns=actual_publication_ns; s->last_source_epoch=source_epoch;
+    s->have_publication=1; s->last_real=assigned; s->have_real=1;
     s->mode=scene ? FGS_MODE_SCENE : clock ? FGS_MODE_CLOCK : gap ? FGS_MODE_GAP :
         s->samples<FGS_WARMUP_INTERVALS ? FGS_MODE_WARMUP :
         s->ewma_ns<=s->period_ns ? FGS_MODE_PASSTHROUGH :
@@ -425,39 +541,12 @@ static inline fgs_status fgs_commit_real(fgs_state *s, fgs_slot assigned,
     if (s->mode!=FGS_MODE_ACTIVE) return FGS_OK;
     uint64_t predicted, time;
     if (!fgs_add_ns(actual_publication_ns,s->ewma_ns,&time) ||
-            !fgs_add_ns(time,s->margin_ns,&time) ||
-            !fgs_first_ordinal(s,time,&predicted)) {
-        out->request_status=FGS_OVERFLOW;
-        return FGS_OK;
+            !fgs_add_ns(time,s->margin_ns,&time) || !fgs_first_ordinal(s,time,&predicted)) {
+        out->request_status=FGS_OVERFLOW; return FGS_OK;
     }
     if (predicted<=assigned.ordinal || predicted-assigned.ordinal<=1) return FGS_OK;
-    if (predicted-assigned.ordinal-1>FGS_MAX_REQUESTS) {
-        out->request_status=FGS_CAPACITY;
-        return FGS_OK;
-    }
-    for (uint64_t ordinal=assigned.ordinal+1;ordinal<predicted;ordinal++) {
-        if (fgs_slot_kind(s,ordinal)) continue;
-        int owned=0, free_index=-1;
-        for (unsigned i=0;i<FGS_PENDING_CAP;i++) {
-            if (s->pending[i].token && s->pending[i].slot.ordinal==ordinal) owned=1;
-            if (!s->pending[i].token && free_index<0) free_index=(int)i;
-        }
-        if (owned) continue;
-        if (free_index<0) { out->request_status=FGS_CAPACITY; break; }
-        uint64_t target;
-        if (!fgs_slot_target(s,ordinal,&target) || s->next_token==UINT64_MAX) {
-            out->request_status=FGS_OVERFLOW;
-            break;
-        }
-        fgs_request request={.token=++s->next_token,.frame=frame,
-            .source_epoch=source_epoch,.real_slot=assigned,
-            .slot=fgs_make_slot(s,ordinal,target),.publication_ns=actual_publication_ns,
-            .ewma_ns=s->ewma_ns,.predicted_next_ordinal=predicted,
-            .deadline_ns=target-s->margin_ns};
-        s->pending[free_index]=request;
-        s->pending_count++;
-        out->requests[out->request_count++]=request;
-    }
+    if (predicted-assigned.ordinal-1>FGS_MAX_REQUESTS) { out->request_status=FGS_CAPACITY; return FGS_OK; }
+    fgs_commit_real_issue(s, assigned, actual_publication_ns, frame, source_epoch, predicted, out);
     return FGS_OK;
 }
 

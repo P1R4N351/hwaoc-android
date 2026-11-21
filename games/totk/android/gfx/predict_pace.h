@@ -3,6 +3,7 @@
  * reserves S on vk_present_slots, and keeps that SAME S through presentation.
  * All supplied timestamps use one monotonic nanosecond clock. */
 #pragma once
+#include "vk_pace_fast.h"
 #include <stdint.h>
 
 enum {
@@ -91,6 +92,7 @@ static inline unsigned predict_pace_quantile_index(unsigned count, unsigned ppm)
  * Duplicate values remove one occurrence. No scans occur in choose. */
 static inline void predict_pace_order_update(int64_t *order, unsigned count,
         int replacing, int64_t old, int64_t value) {
+    if (totk_pace_fast_on()) { totk_pace_order_update_fast(order, count, replacing, old, value); return; }
     if (replacing) {
         unsigned i = 0;
         while (order[i] < old) i++;
@@ -257,12 +259,16 @@ static inline int predict_pacer_presented(predict_pacer *p, uint64_t slot, uint6
     if (p->phase_count < PREDICT_PACE_WARMUP) return -1;
     p->display_phase_ns = p->phase_order[(p->phase_count - 1) / 10];
     p->display_count = p->phase_count;
-    p->display_misses = 0;
     int64_t tolerance = (int64_t)(refresh / 2);
     int64_t threshold = p->display_phase_ns > INT64_MAX - tolerance
         ? INT64_MAX : p->display_phase_ns + tolerance;
-    for (unsigned i = p->phase_count; i && p->phase_order[i - 1] > threshold; i--)
-        p->display_misses++;
+    if (totk_pace_fast_on()) {
+        p->display_misses = totk_pace_count_gt_fast(p->phase_order, p->phase_count, threshold);
+    } else {
+        p->display_misses = 0;
+        for (unsigned i = p->phase_count; i && p->phase_order[i - 1] > threshold; i--)
+            p->display_misses++;
+    }
     uint64_t target = 0;
     if (predict_pace_over_budget(p->display_misses, p->display_count, p->miss_budget_ppm)) {
         int64_t tail = p->phase_order[predict_pace_quantile_index(p->phase_count, p->miss_budget_ppm)];

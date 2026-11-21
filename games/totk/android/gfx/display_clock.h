@@ -3,6 +3,7 @@
  * Nominal mode changes reset immediately. A measured period is frozen between
  * validations, so nanosecond noise cannot reset acquire/predict/queued slots. */
 #pragma once
+#include "vk_pace_fast.h"
 #include <stdint.h>
 
 enum {
@@ -49,6 +50,71 @@ static inline display_clock_result display_clock_snapshot(const display_period_c
  * queued target. This helper neither extrapolates phase nor edits reservations.
  * After initial calibration, revalidate once/minute. A material change requires
  * two consecutive stable windows; tiny drift never churns the effective mode. */
+static inline uint64_t display_clock_median_consensus(
+        display_period_clock *p, uint64_t reference, uint64_t *elapsed_out,
+        uint64_t *ticks_out, unsigned *good_out) {
+    uint64_t periods[DISPLAY_CLOCK_BLOCKS], raw[DISPLAY_CLOCK_BLOCKS];
+    int fast = totk_pace_fast_on();
+    for (unsigned i = 0; i < DISPLAY_CLOCK_BLOCKS; i++) {
+        uint64_t per = p->elapsed_ns[i] / p->ticks[i];
+        periods[i] = per;
+        raw[i] = per;
+    }
+    if (fast) {
+        totk_display_sort8_u64(periods);
+    } else {
+        for (unsigned i = 1; i < DISPLAY_CLOCK_BLOCKS; i++) {
+            uint64_t v = periods[i]; unsigned j = i;
+            while (j && periods[j - 1] > v) { periods[j] = periods[j - 1]; j--; }
+            periods[j] = v;
+        }
+    }
+    uint64_t median = periods[DISPLAY_CLOCK_BLOCKS / 2];
+    uint64_t tolerance = reference / 1000;
+    if (tolerance < 2000) tolerance = 2000;
+    uint64_t elapsed = 0, physical_ticks = 0;
+    unsigned good = 0;
+    for (unsigned i = 0; i < DISPLAY_CLOCK_BLOCKS; i++) {
+        uint64_t period = fast ? raw[i] : (p->elapsed_ns[i] / p->ticks[i]);
+        if (display_clock_distance(period, median) > tolerance) continue;
+        elapsed += p->elapsed_ns[i]; physical_ticks += p->ticks[i]; good++;
+    }
+    *elapsed_out = elapsed; *ticks_out = physical_ticks; *good_out = good;
+    return median;
+}
+
+static inline display_clock_result display_clock_finish_window(
+        display_period_clock *p, uint64_t frame_ns, uint64_t previous,
+        uint64_t nominal_refresh_ns, uint64_t reference, unsigned changed) {
+    uint64_t elapsed = 0, physical_ticks = 0;
+    unsigned good = 0;
+    (void)display_clock_median_consensus(p, reference, &elapsed, &physical_ticks, &good);
+    display_clock_clear_window(p);
+    p->valid_blocks = good; p->window_ns = elapsed; p->window_ticks = physical_ticks;
+    if (good < DISPLAY_CLOCK_BLOCKS - 2) { p->candidate_windows = 0; return display_clock_snapshot(p, previous, 0); }
+    uint64_t measured = elapsed / physical_ticks;
+    p->measured_ns = measured;
+    if (display_clock_distance(measured, nominal_refresh_ns) > nominal_refresh_ns / 50) {
+        p->candidate_windows = 0; return display_clock_snapshot(p, previous, 0);
+    }
+    uint64_t material = reference / 1000;
+    if (material < 5000) material = 5000;
+    if (!p->calibrated) {
+        p->calibrated = 1;
+        if (measured != reference) { p->refresh_ns = measured; changed = 1; }
+    } else if (display_clock_distance(measured, reference) >= material) {
+        if (!p->candidate_windows || display_clock_distance(measured, p->candidate_ns) > 2000) {
+            p->candidate_ns = measured; p->candidate_windows = 1;
+            return display_clock_snapshot(p, previous, 0);
+        }
+        p->refresh_ns = measured; changed = 1;
+    }
+    p->candidate_windows = 0;
+    p->next_validation_ns = frame_ns > UINT64_MAX - DISPLAY_CLOCK_VALIDATE_NS
+        ? UINT64_MAX : frame_ns + DISPLAY_CLOCK_VALIDATE_NS;
+    return display_clock_snapshot(p, previous, changed);
+}
+
 static inline display_clock_result display_clock_observe(display_period_clock *p,
         uint64_t frame_ns, uint64_t nominal_refresh_ns) {
     uint64_t previous = p->previous_frame_ns;
@@ -83,49 +149,5 @@ static inline display_clock_result display_clock_observe(display_period_clock *p
     p->block_ns = p->block_ticks = 0;
     if (p->blocks < DISPLAY_CLOCK_BLOCKS)
         return display_clock_snapshot(p, previous, 0);
-    uint64_t periods[DISPLAY_CLOCK_BLOCKS];
-    for (unsigned i = 0; i < DISPLAY_CLOCK_BLOCKS; i++) periods[i] = p->elapsed_ns[i] / p->ticks[i];
-    for (unsigned i = 1; i < DISPLAY_CLOCK_BLOCKS; i++) {
-        uint64_t v = periods[i]; unsigned j = i;
-        while (j && periods[j - 1] > v) { periods[j] = periods[j - 1]; j--; }
-        periods[j] = v;
-    }
-    uint64_t median = periods[DISPLAY_CLOCK_BLOCKS / 2];
-    uint64_t tolerance = reference / 1000;
-    if (tolerance < 2000) tolerance = 2000;
-    uint64_t elapsed = 0, physical_ticks = 0;
-    unsigned good = 0;
-    for (unsigned i = 0; i < DISPLAY_CLOCK_BLOCKS; i++) {
-        uint64_t period = p->elapsed_ns[i] / p->ticks[i];
-        if (display_clock_distance(period, median) > tolerance) continue;
-        elapsed += p->elapsed_ns[i]; physical_ticks += p->ticks[i]; good++;
-    }
-    display_clock_clear_window(p);
-    p->valid_blocks = good; p->window_ns = elapsed; p->window_ticks = physical_ticks;
-    if (good < DISPLAY_CLOCK_BLOCKS - 2) { p->candidate_windows = 0; return display_clock_snapshot(p, previous, 0); }
-    uint64_t measured = elapsed / physical_ticks;
-    p->measured_ns = measured;
-    /* Calibration corrects small nominal rounding/rate errors, not an
-     * unannounced whole refresh mode. Require its authoritative callback. */
-    if (display_clock_distance(measured, nominal_refresh_ns) > nominal_refresh_ns / 50) {
-        p->candidate_windows = 0; return display_clock_snapshot(p, previous, 0);
-    }
-    uint64_t material = reference / 1000;
-    if (material < 5000) material = 5000;
-    if (!p->calibrated) {
-        p->calibrated = 1;
-        if (measured != reference) {
-            p->refresh_ns = measured; changed = 1;
-        }
-    } else if (display_clock_distance(measured, reference) >= material) {
-        if (!p->candidate_windows || display_clock_distance(measured, p->candidate_ns) > 2000) {
-            p->candidate_ns = measured; p->candidate_windows = 1;
-            return display_clock_snapshot(p, previous, 0);
-        }
-        p->refresh_ns = measured; changed = 1;
-    }
-    p->candidate_windows = 0;
-    p->next_validation_ns = frame_ns > UINT64_MAX - DISPLAY_CLOCK_VALIDATE_NS
-        ? UINT64_MAX : frame_ns + DISPLAY_CLOCK_VALIDATE_NS;
-    return display_clock_snapshot(p, previous, changed);
+    return display_clock_finish_window(p, frame_ns, previous, nominal_refresh_ns, reference, changed);
 }

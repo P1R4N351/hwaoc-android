@@ -4,6 +4,7 @@
  * The owner resets on refresh/guest-mode changes and rejects old-epoch feedback.
  * Only apply, at acquire, may change the effective interval after reset. */
 #pragma once
+#include "vk_pace_fast.h"
 #include <stdint.h>
 
 enum {
@@ -96,6 +97,56 @@ static inline void fps_auto_clear_history(fps_auto_policy *p) {
     p->drop_first_miss_ns = p->drop_last_miss_ns = 0;
     p->drop_window_first_slow_ns = 0;
 }
+static inline void fps_auto_eval_drop_window(fps_auto_policy *p, uint64_t now_ns) {
+    uint64_t coverage_ns = p->game_last_ns - p->game_first_ns;
+    p->last_game_count = p->last_drop_count = p->game_count;
+    p->last_game_coverage_ns = p->last_drop_coverage_ns = coverage_ns;
+    p->last_drop_misses = p->game_slow_count;
+    uint64_t intervals = p->game_count - 1;
+    p->last_game_fps_milli = coverage_ns ? intervals * 1000000000000ull / coverage_ns : 0;
+    if (p->game_count >= FPS_AUTO_DROP_MIN_SAMPLES &&
+        coverage_ns >= FPS_AUTO_DROP_COVERAGE_NS &&
+        intervals * 1000000000ull < FPS_AUTO_DROP_FPS * coverage_ns) {
+        p->drop_first_miss_ns = p->drop_streak
+            ? p->drop_window_first_slow_ns : p->game_first_slow_ns;
+        p->drop_window_first_slow_ns = p->game_first_slow_ns;
+        p->drop_last_miss_ns = p->game_last_slow_ns;
+        if (p->drop_streak < FPS_AUTO_DROP_WINDOWS) p->drop_streak++;
+    } else {
+        p->drop_streak = 0;
+        p->drop_first_miss_ns = p->drop_last_miss_ns = 0;
+        p->drop_window_first_slow_ns = 0;
+    }
+    fps_auto_clear_game_window(p);
+    p->desired = 1;
+    if (p->drop_streak >= FPS_AUTO_DROP_WINDOWS &&
+        p->drop_last_miss_ns - p->drop_first_miss_ns >= FPS_AUTO_DROP_MISS_SPAN_NS &&
+        now_ns >= p->last_change_ns && now_ns - p->last_change_ns >= FPS_AUTO_DWELL_NS) {
+        p->desired = 2;
+        p->reason = FPS_AUTO_REASON_DROP;
+    }
+}
+
+static inline void fps_auto_evict_expired(fps_auto_policy *p, uint64_t now_ns) {
+    if (totk_pace_fast_on()) {
+        unsigned k = totk_fps_auto_evict_k(
+            (const uint8_t *)&p->samples[0].now_ns, sizeof p->samples[0],
+            p->head, p->count, FPS_AUTO_HISTORY_CAPACITY - 1u,
+            now_ns, FPS_AUTO_RECOVER_WINDOW_NS);
+        if (!k) return;
+        for (unsigned i = 0u; i < k && p->misses; i++)
+            p->misses -= p->samples[(p->head + i) & (FPS_AUTO_HISTORY_CAPACITY - 1u)].miss;
+        p->head = (p->head + k) & (FPS_AUTO_HISTORY_CAPACITY - 1u);
+        p->count -= k;
+        return;
+    }
+    while (p->count && now_ns - p->samples[p->head].now_ns > FPS_AUTO_RECOVER_WINDOW_NS) {
+        p->misses -= p->samples[p->head].miss;
+        p->head = (p->head + 1) % FPS_AUTO_HISTORY_CAPACITY;
+        p->count--;
+    }
+}
+
 static inline int fps_auto_refresh_valid(uint64_t refresh_ns) {
     return refresh_ns > FPS_AUTO_MARGIN_NS && refresh_ns <= UINT64_MAX / 3;
 }
@@ -190,38 +241,7 @@ static inline void fps_auto_game_present(fps_auto_policy *p, uint64_t now_ns) {
     p->last_game_present_ns = now_ns;
     p->have_game_present = 1;
     if (p->interval != 1) return; /* Paced 30-fps presents cannot prove recovery. */
-    if (p->game_count && now_ns - p->game_first_ns >= FPS_AUTO_DROP_WINDOW_NS) {
-        uint64_t coverage_ns = p->game_last_ns - p->game_first_ns;
-        p->last_game_count = p->last_drop_count = p->game_count;
-        p->last_game_coverage_ns = p->last_drop_coverage_ns = coverage_ns;
-        p->last_drop_misses = p->game_slow_count;
-        /* Window duration <5 s and count <=1024 bound both multiplications,
-         * even at UINT64_MAX timestamps. Compare the exact rate, not its
-         * rounded milli-fps diagnostic: exact 55 fps must not downshift. */
-        uint64_t intervals = p->game_count - 1;
-        p->last_game_fps_milli = coverage_ns ? intervals * 1000000000000ull / coverage_ns : 0;
-        if (p->game_count >= FPS_AUTO_DROP_MIN_SAMPLES &&
-            coverage_ns >= FPS_AUTO_DROP_COVERAGE_NS &&
-            intervals * 1000000000ull < FPS_AUTO_DROP_FPS * coverage_ns) {
-            p->drop_first_miss_ns = p->drop_streak
-                ? p->drop_window_first_slow_ns : p->game_first_slow_ns;
-            p->drop_window_first_slow_ns = p->game_first_slow_ns;
-            p->drop_last_miss_ns = p->game_last_slow_ns;
-            if (p->drop_streak < FPS_AUTO_DROP_WINDOWS) p->drop_streak++;
-        } else {
-            p->drop_streak = 0;
-            p->drop_first_miss_ns = p->drop_last_miss_ns = 0;
-            p->drop_window_first_slow_ns = 0;
-        }
-        fps_auto_clear_game_window(p);
-        p->desired = 1;
-        if (p->drop_streak >= FPS_AUTO_DROP_WINDOWS &&
-            p->drop_last_miss_ns - p->drop_first_miss_ns >= FPS_AUTO_DROP_MISS_SPAN_NS &&
-            now_ns >= p->last_change_ns && now_ns - p->last_change_ns >= FPS_AUTO_DWELL_NS) {
-            p->desired = 2;
-            p->reason = FPS_AUTO_REASON_DROP;
-        }
-    }
+    if (p->game_count && now_ns - p->game_first_ns >= FPS_AUTO_DROP_WINDOW_NS) fps_auto_eval_drop_window(p, now_ns);
     if (p->game_count == FPS_AUTO_HISTORY_CAPACITY) {
         fps_auto_discard(p, now_ns, FPS_AUTO_REASON_CAPACITY);
         p->last_game_present_ns = now_ns;
@@ -291,14 +311,7 @@ static inline fps_auto_observation fps_auto_observe(fps_auto_policy *p,
         now_ns - p->samples[p->head].now_ns >= FPS_AUTO_DROP_WINDOW_NS) {
         fps_auto_clear_samples(p);
     }
-    if (p->interval == 2) {
-        while (p->count &&
-            now_ns - p->samples[p->head].now_ns > FPS_AUTO_RECOVER_WINDOW_NS) {
-            p->misses -= p->samples[p->head].miss;
-            p->head = (p->head + 1) % FPS_AUTO_HISTORY_CAPACITY;
-            p->count--;
-        }
-    }
+    if (p->interval == 2) fps_auto_evict_expired(p, now_ns);
     if (p->count == FPS_AUTO_HISTORY_CAPACITY) {
         fps_auto_discard(p, now_ns, FPS_AUTO_REASON_CAPACITY);
         r.reset = 1;
