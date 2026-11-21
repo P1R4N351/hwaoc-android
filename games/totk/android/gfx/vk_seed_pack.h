@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "vk_seed_fast.h"
 
 /* Read-only view of the deterministic TOTKVKP1 seed pack. */
 typedef struct vk_seed_pack { void *mapping; size_t size; uint64_t count; int fd; } vk_seed_pack;
@@ -33,6 +34,7 @@ static inline int vk_seed_pack_range_compare(const void *a, const void *b) {
 }
 
 static inline int vk_seed_pack_valid_name(const unsigned char *name, size_t *length) {
+    if (totk_vk_seed_fast_on()) return totk_seed_valid_name_fast(name, length, totk_w33_fault());
     size_t n = 0;
     while (n < 84 && name[n]) {
         unsigned char c = name[n];
@@ -51,12 +53,46 @@ static inline int vk_seed_pack_valid_name(const unsigned char *name, size_t *len
     return 0;
 }
 
+static inline int vk_seed_pack_validate(const unsigned char *b, uint64_t count,
+                                        size_t file_size, uint64_t index_end64, int fast_on, int fault_mode) {
+    if (fast_on) return totk_seed_pack_scan_fast(b, count, file_size, index_end64, fault_mode);
+    if (count > SIZE_MAX / sizeof(vk_seed_pack_range)) return -2;
+    vk_seed_pack_range *ranges = count ? (vk_seed_pack_range *)malloc((size_t)count * sizeof *ranges) : NULL;
+    if (count && !ranges) return -1;
+    const unsigned char *previous = NULL;
+    size_t previous_length = 0;
+    uint64_t range_count = 0;
+    int rc = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        const unsigned char *record = b + 32 + (size_t)i * 104;
+        size_t name_length;
+        if (!vk_seed_pack_valid_name(record, &name_length)) { rc = -2; break; }
+        if (previous) {
+            size_t common = previous_length < name_length ? previous_length : name_length;
+            int order = memcmp(previous, record, common);
+            if (order > 0 || (order == 0 && previous_length >= name_length)) { rc = -2; break; }
+        }
+        previous = record; previous_length = name_length;
+        uint32_t reserved = vk_seed_pack_le32(record + 84);
+        uint64_t offset = vk_seed_pack_le64(record + 88), length = vk_seed_pack_le64(record + 96);
+        if (reserved || (offset & 7) || offset < index_end64 ||
+            offset > (uint64_t)file_size || length > UINT64_MAX - offset || offset + length > (uint64_t)file_size) {
+            rc = -2; break;
+        }
+        if (length) ranges[range_count++] = (vk_seed_pack_range){offset, offset + length};
+    }
+    if (!rc && range_count > 1) qsort(ranges, (size_t)range_count, sizeof *ranges, vk_seed_pack_range_compare);
+    for (uint64_t i = 1; !rc && i < range_count; i++)
+        if (ranges[i].begin < ranges[i - 1].end) rc = -2;
+    free(ranges);
+    return rc;
+}
+
 static inline int vk_seed_pack_open(vk_seed_pack *pack, const char *path) {
     static const unsigned char magic[8] = {'T','O','T','K','V','K','P','1'};
     struct stat st;
     int fd = -1, result = -1;
     void *mapping = MAP_FAILED;
-    vk_seed_pack_range *ranges = NULL;
     uint64_t count = 0;
     size_t file_size = 0;
 
@@ -74,52 +110,14 @@ static inline int vk_seed_pack_open(vk_seed_pack *pack, const char *path) {
     if (mapping == MAP_FAILED) goto done;
     {
         const unsigned char *b = (const unsigned char *)mapping;
-        uint32_t version = vk_seed_pack_le32(b + 8);
-        uint32_t record_size = vk_seed_pack_le32(b + 12);
+        uint32_t version = vk_seed_pack_le32(b + 8), record_size = vk_seed_pack_le32(b + 12);
         count = vk_seed_pack_le64(b + 16);
-        uint64_t total_size = vk_seed_pack_le64(b + 24);
+        uint64_t total_size = vk_seed_pack_le64(b + 24), index_end64 = 32 + count * 104;
         if (memcmp(b, magic, sizeof magic) || version != 1 || record_size != 104 ||
-            total_size != (uint64_t)file_size ||
-            count > (uint64_t)((file_size - 32) / 104)) {
-            result = -2; goto done;
-        }
-        uint64_t index_end64 = 32 + count * 104;
-        if (index_end64 > SIZE_MAX || index_end64 > file_size) { result = -2; goto done; }
-        if (count > SIZE_MAX / sizeof *ranges) { result = -2; goto done; }
-        if (count) {
-            ranges = (vk_seed_pack_range *)malloc((size_t)count * sizeof *ranges);
-            if (!ranges) goto done;
-        }
-        const unsigned char *previous = NULL;
-        size_t previous_length = 0;
-        uint64_t range_count = 0;
-        for (uint64_t i = 0; i < count; i++) {
-            const unsigned char *record = b + 32 + (size_t)i * 104;
-            size_t name_length;
-            uint64_t offset, length, end;
-            if (!vk_seed_pack_valid_name(record, &name_length)) { result = -2; goto done; }
-            if (previous) {
-                size_t common = previous_length < name_length ? previous_length : name_length;
-                int order = memcmp(previous, record, common);
-                if (order > 0 || (order == 0 && previous_length >= name_length)) { result = -2; goto done; }
-            }
-            previous = record;
-            previous_length = name_length;
-            uint32_t reserved = vk_seed_pack_le32(record + 84);
-            offset = vk_seed_pack_le64(record + 88);
-            length = vk_seed_pack_le64(record + 96);
-            if (reserved || (offset & 7) || offset < index_end64 ||
-                offset > (uint64_t)file_size || length > UINT64_MAX - offset) {
-                result = -2; goto done;
-            }
-            end = offset + length;
-            if (end > (uint64_t)file_size) { result = -2; goto done; }
-            if (length) ranges[range_count++] = (vk_seed_pack_range){offset, end};
-        }
-        if (range_count > 1)
-            qsort(ranges, (size_t)range_count, sizeof *ranges, vk_seed_pack_range_compare);
-        for (uint64_t i = 1; i < range_count; i++)
-            if (ranges[i].begin < ranges[i - 1].end) { result = -2; goto done; }
+            total_size != (uint64_t)file_size || count > (uint64_t)((file_size - 32) / 104) ||
+            index_end64 > SIZE_MAX || index_end64 > file_size) { result = -2; goto done; }
+        int rc = vk_seed_pack_validate(b, count, file_size, index_end64, totk_vk_seed_fast_on(), totk_w33_fault());
+        if (rc) { result = rc; goto done; }
     }
     pack->mapping = mapping;
     pack->size = file_size;
@@ -128,7 +126,6 @@ static inline int vk_seed_pack_open(vk_seed_pack *pack, const char *path) {
     mapping = MAP_FAILED;
     result = 0;
 done:
-    free(ranges);
     if (mapping != MAP_FAILED) munmap(mapping, file_size);
     if (fd >= 0) close(fd);
     if (result) memset(pack, 0, sizeof *pack);

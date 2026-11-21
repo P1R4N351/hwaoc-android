@@ -27,12 +27,14 @@ enum { IO_EMPTY, IO_QUEUED, IO_READING, IO_READY };
 typedef struct seed_file {
     char name[SEED_NAME];
     struct seed_file *next, *queue, *recent_prev, *recent_next;
+    totk_seed_warm_link warm;
     char *data;
     size_t size, length;
     uint64_t offset, generation;
     int packed, state, learned, warmed;
     unsigned waiters;
     size_t reserved;
+    uint8_t name_len, slab_owned;
 } seed_file;
 typedef struct seed_request {
     struct seed_request *next;
@@ -43,6 +45,10 @@ typedef struct seed_request {
 static pthread_mutex_t io_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t io_cv = PTHREAD_COND_INITIALIZER;
 static nvn_hmap inventory = {.klen = SEED_NAME};
+static totk_seed_idx fast_inv;
+static seed_file *seed_slab;
+static totk_seed_warm_link *warm_fast_head, *warm_fast_tail;
+static _Atomic int fast_ready_state;
 static seed_file *files, *files_tail, *warm_head, *warm_tail, *recent_head, *recent_tail;
 static seed_request *request_head, *request_tail;
 static char *seed_directory, *learn_path;
@@ -69,6 +75,21 @@ static int shader_name(const char *name) {
     return vk_seed_pack_valid_name(key, &length);
 }
 static seed_file *entry(const char *name, int create) { /* io_mu, except private initial inventory */
+    if (totk_vk_seed_fast_on()) {
+        size_t len = 0;
+        if (!totk_seed_valid_cstr_fast(name, &len)) return NULL;
+        uint64_t h = totk_seed_hash(name, len, totk_w33_fault());
+        seed_file *f = totk_seed_idx_get(&fast_inv, name, len, h, totk_w33_fault());
+        if (!f && create) {
+            f = calloc(1, sizeof *f);
+            if (!f) { fprintf(stderr, "[seed-io] out of memory building seed inventory\n"); abort(); }
+            memcpy(f->name, name, len); f->name_len = (uint8_t)len;
+            totk_seed_idx_put_unique(&fast_inv, f->name, len, h, f);
+            stats.entries++;
+            if (files_tail) files_tail->next = f; else files = f; files_tail = f;
+        }
+        return f;
+    }
     char key[SEED_NAME] = {0};
     if (!shader_name(name)) return NULL;
     memcpy(key, name, strlen(name));
@@ -108,7 +129,23 @@ static void inventory_build(void) {
         int result = vk_seed_pack_open(&packed, path);
         if (result) fprintf(stderr, "[seed-io] pack %s: %s; falling back to indexed loose seed\n", path,
             result == -2 ? "invalid/truncated/incompatible" : "missing or unreadable");
-        else for (uint64_t i = 0; i < packed.count; i++) {
+        else if (totk_vk_seed_fast_on() && packed.count) {
+            if (!totk_seed_idx_reserve(&fast_inv, (uint32_t)packed.count + 64u) ||
+                !(seed_slab = calloc((size_t)packed.count, sizeof *seed_slab))) abort();
+            for (uint64_t i = 0; i < packed.count; i++) {
+                const char *name; const void *data; size_t size;
+                if (!vk_seed_pack_entry(&packed, i, &name, &data, &size)) continue;
+                size_t len = strnlen(name, SEED_NAME - 1u);
+                seed_file *f = &seed_slab[i];
+                memcpy(f->name, name, len); f->name_len = (uint8_t)len; f->slab_owned = 1u;
+                f->packed = 1; f->offset = (const unsigned char *)data - (const unsigned char *)packed.mapping;
+                f->size = size;
+                totk_seed_idx_put_unique(&fast_inv, f->name, len, totk_seed_hash(f->name, len, 0), f);
+                if (files_tail) files_tail->next = f; else files = f; files_tail = f;
+                stats.entries++; stats.pack_entries++;
+                if (len > 4u && !memcmp(f->name + len - 4u, ".spv", 4u)) has_modules = 1;
+            }
+        } else for (uint64_t i = 0; i < packed.count; i++) {
             const char *name; const void *data; size_t size;
             if (!vk_seed_pack_entry(&packed, i, &name, &data, &size)) continue;
             seed_file *f = entry(name, 1); if (!f) continue;
@@ -130,17 +167,21 @@ static void inventory_build(void) {
         }
         closedir(dir);
     }
-    for (seed_file *f = files; f; f = f->next) {
-        size_t n = strlen(f->name);
-        if (n > 4 && !strcmp(f->name + n - 4, ".spv")) has_modules = 1;
+    if (!totk_vk_seed_fast_on() || !packed.count || !has_modules) {
+        for (seed_file *f = files; f; f = f->next) {
+            size_t n = f->name_len ? f->name_len : strlen(f->name);
+            if (n > 4 && !memcmp(f->name + n - 4, ".spv", 4)) { has_modules = 1; break; }
+        }
     }
 }
 static void queue(seed_file **head, seed_file **tail, seed_file *f) {
     f->queue = NULL; f->state = IO_QUEUED;
+    if (totk_vk_seed_fast_on()) { totk_seed_warm_link_push(&warm_fast_head, &warm_fast_tail, &f->warm, f); return; }
     if (*tail) (*tail)->queue = f; else *head = f;
     *tail = f;
 }
 static seed_file *pop(seed_file **head, seed_file **tail) {
+    if (totk_vk_seed_fast_on()) return (seed_file *)totk_seed_warm_link_pop(&warm_fast_head, &warm_fast_tail);
     seed_file *f = *head;
     if (f) { *head = f->queue; if (!*head) *tail = NULL; f->queue = NULL; }
     return f;
@@ -184,12 +225,16 @@ static void warm_plan(void) { /* index sizes, not payload reads; io_mu */
     }
 }
 static void cancel_warm(seed_file *f) { /* io_mu; demand never waits for queued warming */
-    seed_file **link = &warm_head, *previous = NULL;
-    while (*link && *link != f) { previous = *link; link = &(*link)->queue; }
-    if (!*link) return;
-    *link = f->queue; if (warm_tail == f) warm_tail = previous;
-    f->queue = NULL; f->state = IO_EMPTY;
-    release_reservation(f); stats.warm_bypassed++;
+    if (totk_vk_seed_fast_on()) {
+        if (f->state != IO_QUEUED) return;
+        totk_seed_warm_link_unlink(&warm_fast_head, &warm_fast_tail, &f->warm, totk_w33_fault());
+    } else {
+        seed_file **link = &warm_head, *previous = NULL;
+        while (*link && *link != f) { previous = *link; link = &(*link)->queue; }
+        if (!*link) return;
+        *link = f->queue; if (warm_tail == f) warm_tail = previous; f->queue = NULL;
+    }
+    f->state = IO_EMPTY; release_reservation(f); stats.warm_bypassed++;
 }
 static char *payload_read(seed_file *f, size_t *length, uint64_t *reads) {
     if (!f->packed) {
@@ -280,6 +325,7 @@ static void *seed_worker(void *unused) {
     uint64_t began = host_now_ns();
     pthread_mutex_lock(&io_mu);
     inventory_build(); learned_load(); warm_plan(); index_ready = 1;
+    if (totk_vk_seed_fast_on() && !stopping) atomic_store_explicit(&fast_ready_state, has_modules ? 2 : 1, memory_order_release);
     stats.index_ns = host_now_ns() - began;
     fprintf(stderr, "[seed-io] indexed %llu files (%llu packed), learned %llu keys learned_bytes=%llu cap=%zu mode=%s, index=%.3fms directory %s\n",
         (unsigned long long)stats.entries, (unsigned long long)stats.pack_entries,
@@ -318,7 +364,8 @@ static void *seed_worker(void *unused) {
                 if (!data) release_reservation(f);
                 if (data) { stats.warm_ready++; stats.warm_bytes += length + 1; } else stats.warm_failed++;
             }
-            pthread_cond_broadcast(&io_cv); continue;
+            if (!totk_vk_seed_fast_on() || f->waiters || stopping) pthread_cond_broadcast(&io_cv);
+            continue;
         }
         if (learn_dirty && (stopping || host_now_ns() >= save_after)) {
             unsigned count = recent_count;
@@ -366,10 +413,35 @@ int vk_seed_io_active(void) {
     pthread_mutex_lock(&io_mu); int active = started && !stopping; pthread_mutex_unlock(&io_mu); return active;
 }
 int vk_seed_io_ready(void) {
+    if (totk_vk_seed_fast_on()) {
+        int fs = atomic_load_explicit(&fast_ready_state, memory_order_acquire);
+        if (fs > 0) return totk_seed_ready_decode(fs, totk_w33_fault());
+    }
     pthread_mutex_lock(&io_mu);
     while (started && !stopping && !index_ready) pthread_cond_wait(&io_cv, &io_mu);
     int ready = started && !stopping && has_modules; pthread_mutex_unlock(&io_mu); return ready;
 }
+static void demand_read_locked(seed_file *f) {
+    f->state = IO_READING; f->warmed = 0;
+    seed_file source = *f; size_t n = source.size; uint64_t reads = 0;
+    pthread_mutex_unlock(&io_mu);
+#ifdef TOTK_VK_TESTS
+    if (vk_seed_io_test_before_read) vk_seed_io_test_before_read(source.name);
+#endif
+    char *bytes = payload_read(&source, &n, &reads);
+    pthread_mutex_lock(&io_mu);
+    if (stats_on) {
+        stats.demand_reads += reads; window.demand_reads += reads;
+        stats.demand_bytes += bytes ? n : 0; window.demand_bytes += bytes ? n : 0;
+    }
+    if (source.generation != f->generation) { free(bytes); f->state = IO_EMPTY; }
+    else {
+        f->data = bytes; f->length = bytes ? n : 0; f->state = IO_READY;
+        stats.cached_bytes += f->length;
+    }
+    if (!totk_vk_seed_fast_on() || f->waiters > 1 || stopping) pthread_cond_broadcast(&io_cv);
+}
+
 char *vk_seed_io_read(const char *name, size_t *size) {
     uint64_t began = stats_on ? host_now_ns() : 0;
     pthread_mutex_lock(&io_mu);
@@ -385,28 +457,8 @@ char *vk_seed_io_read(const char *name, size_t *size) {
     f->waiters++;
     while (!stopping && f->state != IO_READY) {
         if (f->state == IO_QUEUED) cancel_warm(f);
-        if (f->state == IO_EMPTY) {
-            /* Pin lifetime with readers, snapshot publication metadata, and read
-               immediately. Unrelated worker IO/fsync cannot delay cold demand. */
-            f->state = IO_READING; f->warmed = 0;
-            seed_file source = *f; size_t n = source.size; uint64_t reads = 0;
-            pthread_mutex_unlock(&io_mu);
-#ifdef TOTK_VK_TESTS
-            if (vk_seed_io_test_before_read) vk_seed_io_test_before_read(source.name);
-#endif
-            char *bytes = payload_read(&source, &n, &reads);
-            pthread_mutex_lock(&io_mu);
-            if (stats_on) {
-                stats.demand_reads += reads; window.demand_reads += reads;
-                stats.demand_bytes += bytes ? n : 0; window.demand_bytes += bytes ? n : 0;
-            }
-            if (source.generation != f->generation) { free(bytes); f->state = IO_EMPTY; }
-            else {
-                f->data = bytes; f->length = bytes ? n : 0; f->state = IO_READY;
-                stats.cached_bytes += f->length;
-            }
-            pthread_cond_broadcast(&io_cv);
-        } else pthread_cond_wait(&io_cv, &io_mu); /* join one actual in-flight read */
+        if (f->state == IO_EMPTY) demand_read_locked(f);
+        else pthread_cond_wait(&io_cv, &io_mu);
     }
     f->waiters--;
     if (stopping) goto done;
@@ -433,7 +485,7 @@ done:
         if (elapsed > stats.blocking_max_ns) stats.blocking_max_ns = elapsed;
         if (elapsed > window.blocking_max_ns) window.blocking_max_ns = elapsed;
     }
-    readers--; pthread_cond_broadcast(&io_cv);
+    readers--; if (!totk_vk_seed_fast_on() || (stopping && !readers)) pthread_cond_broadcast(&io_cv);
     pthread_mutex_unlock(&io_mu); return data;
 }
 int vk_seed_io_request(const char *directory, const char *variant, char *json, size_t size) {
@@ -458,6 +510,7 @@ void vk_seed_io_published(const char *variant) {
         if (!seed_path(path, name) || stat(path, &st) || !S_ISREG(st.st_mode) || st.st_size < 0 || (uint64_t)st.st_size > SIZE_MAX - 1) continue;
         seed_file *f = entry(name, 1); if (!f) continue;
         f->generation++; f->packed = 0; f->size = (size_t)st.st_size; f->warmed = 0;
+        if (i == 0 && !has_modules) { has_modules = 1; if (totk_vk_seed_fast_on() && index_ready && !stopping) atomic_store_explicit(&fast_ready_state, 2, memory_order_release); }
         if (f->state == IO_READY) {
             stats.cached_bytes -= f->length; free(f->data); f->data = NULL;
             f->length = 0; f->state = IO_EMPTY; release_reservation(f);
@@ -488,15 +541,17 @@ void vk_seed_io_report(void) {
 void vk_seed_io_stop(void) {
     pthread_mutex_lock(&io_mu);
     if (!started || stopping) { pthread_mutex_unlock(&io_mu); return; }
-    stopping = 1; pthread_cond_broadcast(&io_cv); pthread_mutex_unlock(&io_mu);
+    stopping = 1; atomic_store_explicit(&fast_ready_state, 0, memory_order_release);
+    pthread_cond_broadcast(&io_cv); pthread_mutex_unlock(&io_mu);
     pthread_join(io_thread, NULL);
     pthread_mutex_lock(&io_mu);
     while (readers) pthread_cond_wait(&io_cv, &io_mu);
     /* Readers either own detached copies or observe stopping under the same mutex. */
-    while (files) { seed_file *next = files->next; free(files->data); free(files); files = next; }
+    while (files) { seed_file *next = files->next; free(files->data); if (!files->slab_owned) free(files); files = next; }
+    free(seed_slab); seed_slab = NULL; totk_seed_idx_fini(&fast_inv);
     free(inventory.keys); free(inventory.vals); inventory = (nvn_hmap){.klen = SEED_NAME};
     vk_seed_pack_close(&packed); free(seed_directory); free(learn_path); seed_directory = learn_path = NULL;
-    files_tail = warm_head = warm_tail = recent_head = recent_tail = NULL;
+    files_tail = warm_head = warm_tail = recent_head = recent_tail = NULL; warm_fast_head = warm_fast_tail = NULL;
     recent_count = learn_dirty = 0; warm_planned = request_bytes = 0;
     started = stopping = index_ready = warm_done = has_modules = 0;
     stats = window = (vk_seed_io_stats){0}; pthread_mutex_unlock(&io_mu);
