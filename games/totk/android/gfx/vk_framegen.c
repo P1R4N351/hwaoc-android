@@ -2,6 +2,7 @@
    memory is read at presentation time. Source history and UI captures stay pinned
    until both their real ticket and every generated presentation have retired. */
 #include "vk_framegen.h"
+#include "vk_fg_fast.h"
 #include "../../runtime/fps_hybrid_runtime.h"
 #include "../../runtime/fps_adaptive_runtime.h"
 #include "../../runtime/present_clock.h"
@@ -119,6 +120,11 @@ typedef struct {
     VkDeviceSize used;
     uint64_t frame;
     unsigned begun,failed,ready,writes,descriptors[5],copies;
+    unsigned n_write_batch,n_buf_batch,n_img_batch;
+    totk_fg_term_ht ht;
+    VkWriteDescriptorSet write_batch[VK_FG_TERMINAL_DESCRIPTORS];
+    VkDescriptorBufferInfo buf_batch[2*VK_FG_TERMINAL_DESCRIPTORS];
+    VkDescriptorImageInfo img_batch[3*VK_FG_TERMINAL_DESCRIPTORS];
     vk_fg_terminal_input input,refusal; /* DIAG-only, never admission authority */
     struct {
         VkBuffer buffer;
@@ -268,7 +274,8 @@ static struct {
     fg_output output[FG_OUTPUTS];
     uint64_t eligible, refused[VK_FG_TRACK_RESULTS], passes[4];
     uint64_t real, generated_count, measured;
-    uint64_t cuts, budget_skips, late_skips, history_skips;
+    uint64_t cuts, budget_skips, history_skips;
+    _Atomic uint64_t late_skips;
     uint64_t depth_range_pairs, depth_range_generated;
     fg_camera_pair_window camera_pairs;
     unsigned projection_diag_logged;
@@ -290,6 +297,11 @@ static struct {
        frame_end, so one frame never mixes skipped spans with copied sources. */
     int lean_latched, lean, lean_unknown, lean_refusal_logged;
     uint64_t lean_counts[VK_FG_LEAN_COUNTS], lean_reported[VK_FG_LEAN_COUNTS];
+    totk_fg_fmt_cache fmt_cache;
+    VkDescriptorPool render_pool;
+    VkDescriptorSet render_sets[FG_SOURCES*2+FG_OUTPUTS*2];
+    totk_fg_render_slot render_slots[FG_SOURCES*2+FG_OUTPUTS*2];
+    uint64_t res_epoch;
 } F;
 /* No external-engine state changes the ordinary source/policy layouts. */
 static struct {
@@ -568,7 +580,8 @@ int vk_fg_uncertified_plane(void) {
 }
 void vk_fg_late(void) {
     if (vk_fg_interpolating()) {
-        pthread_mutex_lock(&fg_stats_mu); F.late_skips++; pthread_mutex_unlock(&fg_stats_mu);
+        if (totk_fg_fast_on()) atomic_fetch_add_explicit(&F.late_skips,1,memory_order_relaxed);
+        else { pthread_mutex_lock(&fg_stats_mu); atomic_fetch_add_explicit(&F.late_skips,1,memory_order_relaxed); pthread_mutex_unlock(&fg_stats_mu); }
     } else fg_suspend("generated GPU work missed its display deadline");
 }
 void vk_fg_reset(void) {
@@ -579,6 +592,7 @@ void vk_fg_reset(void) {
 static void fg_consume_reset(void) {
     if (!atomic_exchange_explicit(&fg_reset_requested,0,memory_order_acquire)) return;
     fg_generation_cancel_all();
+    F.res_epoch++;
     F.previous_valid=0;
     if (F.ready) F.history=-1;
     if (F.have_camera || (F.ready && (F.current >= 0 || F.authority >= 0))) F.invalid=1;
@@ -598,6 +612,7 @@ static int fg_result(VkResult result, const char *operation) {
     return 0;
 }
 static void fg_buffer_free(fg_buffer *b, int host) {
+    if (b->buffer) F.res_epoch++;
     if (b->mapped) vkUnmapMemory(V.dev,b->memory);
     if (b->buffer) vkDestroyBuffer(V.dev,b->buffer,NULL);
     vk_memory_release(b->memory,host ? VK_MEMORY_READBACK : VK_MEMORY_SNAPSHOT);
@@ -713,6 +728,8 @@ int vk_fg_terminal_owned_begin(void) {
     if (o->begun || atomic_load_explicit(&s->referenced,memory_order_acquire))
         return fg_terminal_reject(s,"duplicate-or-retained-source");
     o->begun=1; o->frame=F.budget_frame+1;
+    o->n_write_batch=o->n_buf_batch=o->n_img_batch=0;
+    totk_fg_term_ht_reset(&o->ht);
     if (atomic_load_explicit(&F.job_trace,memory_order_relaxed)) {
         s->owned.input=(vk_fg_terminal_input){0};
         s->owned.refusal=(vk_fg_terminal_input){0};
@@ -734,32 +751,42 @@ int vk_fg_terminal_owned_begin(void) {
     }
     return 1;
 }
+static int fg_terminal_ht_find(fg_terminal_owned *o,uint32_t h,VkBuffer buf,
+        VkDeviceSize off,VkDeviceSize rng,VkDeviceSize align,uint64_t ser,VkDescriptorBufferInfo *out) {
+    for (unsigned step=0;step<TOTK_FG_TERM_HT_N;step++) {
+        uint32_t pos=(h+step)&TOTK_FG_TERM_HT_MASK;
+        if (o->ht.stamp[pos]!=o->ht.gen) break;
+        unsigned i=o->ht.slot[pos];
+        if (o->copy[i].buffer==buf && o->copy[i].offset==off && o->copy[i].bytes==rng &&
+                o->copy[i].serial==ser && o->copy[i].owned_offset%align==0) {
+            *out=(VkDescriptorBufferInfo){o->bytes.buffer,o->copy[i].owned_offset,rng}; return 1;
+        }
+    }
+    return 0;
+}
 static int fg_terminal_copy(fg_source *s,VkDescriptorBufferInfo source,VkDeviceSize align,
         VkDescriptorBufferInfo *out,vk_fg_terminal_input origin) {
     fg_terminal_owned *o=&s->owned;
     int trace=atomic_load_explicit(&F.job_trace,memory_order_relaxed);
-    if (trace) {
-        o->input=origin; o->input.buffer=source.buffer;
-        o->input.offset=source.offset; o->input.bytes=source.range;
-    }
-    if (!source.buffer) {
-        *out=source;
-        if (trace) o->input=(vk_fg_terminal_input){0};
-        return 1;
-    } /* supported Vulkan null descriptor */
+    if (trace) { o->input=origin; o->input.buffer=source.buffer; o->input.offset=source.offset; o->input.bytes=source.range; }
+    if (!source.buffer) { *out=source; if (trace) o->input=(vk_fg_terminal_input){0}; return 1; }
     if (!source.range || source.range==VK_WHOLE_SIZE || source.range>VK_FG_TERMINAL_BYTES)
         return fg_terminal_reject(s,"buffer-range");
     if (!align) align=16;
     uint64_t serial=vk_submit_serial();
-    for (unsigned i=0;i<o->copies;i++) if (o->copy[i].buffer==source.buffer &&
-            o->copy[i].offset==source.offset && o->copy[i].bytes==source.range &&
-            o->copy[i].serial==serial && o->copy[i].owned_offset%align==0) {
-        *out=(VkDescriptorBufferInfo){o->bytes.buffer,o->copy[i].owned_offset,source.range};
-        if (trace) o->input=(vk_fg_terminal_input){0};
-        return 1;
+    uint32_t h=totk_fg_term_hash((uint64_t)(uintptr_t)source.buffer,(uint64_t)source.offset,(uint64_t)source.range,serial);
+    if (totk_fg_fast_on()) {
+        if (fg_terminal_ht_find(o,h,source.buffer,source.offset,source.range,align,serial,out)) {
+            if (trace) o->input=(vk_fg_terminal_input){0}; return 1;
+        }
+    } else {
+        for (unsigned i=0;i<o->copies;i++) if (o->copy[i].buffer==source.buffer && o->copy[i].offset==source.offset &&
+                o->copy[i].bytes==source.range && o->copy[i].serial==serial && o->copy[i].owned_offset%align==0) {
+            *out=(VkDescriptorBufferInfo){o->bytes.buffer,o->copy[i].owned_offset,source.range};
+            if (trace) o->input=(vk_fg_terminal_input){0}; return 1;
+        }
     }
-    if (align>VK_FG_TERMINAL_BYTES || o->used>VK_FG_TERMINAL_BYTES-(align-1) ||
-            o->copies==VK_FG_TERMINAL_DESCRIPTORS)
+    if (align>VK_FG_TERMINAL_BYTES || o->used>VK_FG_TERMINAL_BYTES-(align-1) || o->copies==VK_FG_TERMINAL_DESCRIPTORS)
         return fg_terminal_reject(s,"storage-capacity");
     VkDeviceSize at=(o->used+align-1)/align*align;
     if (at>VK_FG_TERMINAL_BYTES-source.range) return fg_terminal_reject(s,"storage-capacity");
@@ -768,11 +795,30 @@ static int fg_terminal_copy(fg_source *s,VkDescriptorBufferInfo source,VkDeviceS
         if (trace) o->input.freeze=0;
         return fg_terminal_reject_detail(s,"buffer-not-owned-frozen-storage","written-host-arena-miss");
     }
+    uint16_t ci=(uint16_t)o->copies;
     o->copy[o->copies++]=(__typeof__(o->copy[0])){source.buffer,source.offset,source.range,at,serial};
-    o->used=at+source.range;
-    *out=(VkDescriptorBufferInfo){o->bytes.buffer,at,source.range};
-    if (trace) o->input=(vk_fg_terminal_input){0};
-    return 1;
+    totk_fg_term_ht_insert(&o->ht,h,ci);
+    o->used=at+source.range; *out=(VkDescriptorBufferInfo){o->bytes.buffer,at,source.range};
+    if (trace) o->input=(vk_fg_terminal_input){0}; return 1;
+}
+static int fg_terminal_owned_flush_or_queue(fg_terminal_owned *o,unsigned kind,VkWriteDescriptorSet owned,
+        const VkDescriptorBufferInfo *buffers,const VkDescriptorImageInfo *images) {
+    uint32_t cnt=owned.descriptorCount;
+    if (!totk_fg_fast_on()) {
+        owned.pBufferInfo=kind<2?buffers:NULL; owned.pImageInfo=kind>=2?images:NULL;
+        vkUpdateDescriptorSets(V.dev,1,&owned,0,NULL); return 1;
+    }
+    if (o->n_write_batch>=VK_FG_TERMINAL_DESCRIPTORS) return 0;
+    if (kind<2) {
+        if (o->n_buf_batch+cnt>2*VK_FG_TERMINAL_DESCRIPTORS) return 0;
+        VkDescriptorBufferInfo *dst=&o->buf_batch[o->n_buf_batch];
+        memcpy(dst,buffers,cnt*sizeof(VkDescriptorBufferInfo)); o->n_buf_batch+=cnt; owned.pBufferInfo=dst;
+    } else {
+        if (o->n_img_batch+cnt>3*VK_FG_TERMINAL_DESCRIPTORS) return 0;
+        VkDescriptorImageInfo *dst=&o->img_batch[o->n_img_batch];
+        memcpy(dst,images,cnt*sizeof(VkDescriptorImageInfo)); o->n_img_batch+=cnt; owned.pImageInfo=dst;
+    }
+    o->write_batch[o->n_write_batch++]=owned; return 1;
 }
 int vk_fg_terminal_owned_binding(unsigned set,VkDescriptorSetLayout layout,
         const VkWriteDescriptorSet *write,int writable) {
@@ -784,53 +830,40 @@ int vk_fg_terminal_owned_binding(unsigned set,VkDescriptorSetLayout layout,
         return fg_terminal_reject(s,"descriptor-shape-or-writable");
     unsigned kind;
     switch (write->descriptorType) {
-    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:kind=0;break;
-    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:kind=1;break;
-    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:kind=2;break;
-    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:kind=3;break;
-    case VK_DESCRIPTOR_TYPE_SAMPLER:kind=4;break;
-    default:return fg_terminal_reject(s,"descriptor-type");
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:kind=0;break; case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:kind=1;break;
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:kind=2;break; case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:kind=3;break;
+    case VK_DESCRIPTOR_TYPE_SAMPLER:kind=4;break; default:return fg_terminal_reject(s,"descriptor-type");
     }
-    if (o->descriptors[kind]>VK_FG_TERMINAL_DESCRIPTORS-write->descriptorCount ||
-        (o->layouts[set] && o->layouts[set]!=layout))
+    if (o->descriptors[kind]>VK_FG_TERMINAL_DESCRIPTORS-write->descriptorCount || (o->layouts[set] && o->layouts[set]!=layout))
         return fg_terminal_reject(s,"descriptor-capacity-or-layout");
     if (!o->sets[set]) {
-        VkDescriptorSetAllocateInfo ai={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-            .descriptorPool=o->pool,.descriptorSetCount=1,.pSetLayouts=&layout};
+        VkDescriptorSetAllocateInfo ai={VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,.descriptorPool=o->pool,.descriptorSetCount=1,.pSetLayouts=&layout};
         if (!fg_result(vkAllocateDescriptorSets(V.dev,&ai,&o->sets[set]),"immutable terminal set"))
             return fg_terminal_reject(s,"descriptor-allocation");
         o->layouts[set]=layout;
     }
-    VkDescriptorBufferInfo buffers[VK_FG_TERMINAL_DESCRIPTORS];
-    VkDescriptorImageInfo images[VK_FG_TERMINAL_DESCRIPTORS];
+    VkDescriptorBufferInfo buffers[VK_FG_TERMINAL_DESCRIPTORS]; VkDescriptorImageInfo images[VK_FG_TERMINAL_DESCRIPTORS];
     VkWriteDescriptorSet owned=*write; owned.dstSet=o->sets[set];
     if (kind<2) {
         if (!write->pBufferInfo) return fg_terminal_reject(s,"missing-buffer-payload");
         VkDeviceSize align=kind ? V.props.limits.minStorageBufferOffsetAlignment : V.props.limits.minUniformBufferOffsetAlignment;
         for (unsigned i=0;i<write->descriptorCount;i++)
             if (!fg_terminal_copy(s,write->pBufferInfo[i],align,&buffers[i],(vk_fg_terminal_input){
-                    .role=VK_FG_TERMINAL_INPUT_DESCRIPTOR,.stage=set,.set=set,
-                    .binding=write->dstBinding,.element=write->dstArrayElement+i,
-                    .descriptor_type=write->descriptorType})) return 0;
-        owned.pBufferInfo=buffers;
+                    .role=VK_FG_TERMINAL_INPUT_DESCRIPTOR,.stage=set,.set=set,.binding=write->dstBinding,
+                    .element=write->dstArrayElement+i,.descriptor_type=write->descriptorType})) return 0;
     } else {
         if (!write->pImageInfo) return fg_terminal_reject(s,"missing-image-payload");
         for (unsigned i=0;i<write->descriptorCount;i++) {
             images[i]=write->pImageInfo[i];
-            /* Terminal samples only the certified, source-private canvas.
-             * Cached sampler objects live for the process (vk_res.c); no
-             * mutable guest texture/view is borrowed by delayed generation. */
-            if (kind!=4 && images[i].imageView && images[i].imageView!=s->canvas.raw &&
-                    images[i].imageView!=s->canvas.display)
+            if (kind!=4 && images[i].imageView && images[i].imageView!=s->canvas.raw && images[i].imageView!=s->canvas.display)
                 return fg_terminal_reject(s,"image-not-source-canvas");
         }
-        owned.pImageInfo=images;
     }
-    vkUpdateDescriptorSets(V.dev,1,&owned,0,NULL);
-    o->descriptors[kind]+=write->descriptorCount; o->writes++;
-    return 1;
+    if (!fg_terminal_owned_flush_or_queue(o,kind,owned,buffers,images)) return fg_terminal_reject(s,"descriptor-capacity-or-layout");
+    o->descriptors[kind]+=write->descriptorCount; o->writes++; return 1;
 }
 static void fg_image_free(fg_image *im) {
+    if (im->image || im->raw || im->display) F.res_epoch++;
     if (im->display && im->display != im->raw) vkDestroyImageView(V.dev, im->display, NULL);
     if (im->raw) vkDestroyImageView(V.dev, im->raw, NULL);
     if (im->image) vkDestroyImage(V.dev, im->image, NULL);
@@ -1637,8 +1670,11 @@ static int fg_subresource(vk_tex *x, unsigned level, unsigned layer) {
         level < vk_tex_levels(x) && layer < vk_tex_layers(x);
 }
 static int fg_supports(VkFormat format, VkFormatFeatureFlags required) {
-    VkFormatProperties p;
-    V.get_format_props(V.pd, format, &p);
+    uint32_t f=0;
+    if (totk_fg_fast_on() && totk_fg_fmt_get(&F.fmt_cache,(uintptr_t)V.pd,(uint32_t)format,&f))
+        return ((VkFormatFeatureFlags)f & required) == required;
+    VkFormatProperties p; V.get_format_props(V.pd, format, &p);
+    if (totk_fg_fast_on()) totk_fg_fmt_put(&F.fmt_cache,(uintptr_t)V.pd,(uint32_t)format,(uint32_t)p.optimalTilingFeatures);
     return (p.optimalTilingFeatures & required) == required;
 }
 static void fg_copy_image(VkCommandBuffer cb, VkImage source, unsigned level, unsigned layer, fg_image *dest) {
@@ -2671,78 +2707,77 @@ int vk_fg_capture_real(VkCommandBuffer cb, vk_tex *real, unsigned level, unsigne
     return 1;
 }
 
-static void fg_render_record(VkCommandBuffer cb, fg_source *s, fg_image *target, VkPipeline pipeline,
-                       VkImageView final, VkImageLayout final_layout, float mode,int immutable) {
-    if (immutable || !F.known_ready) {
-        const uint32_t known[4]={0};
-        vkCmdUpdateBuffer(cb,F.known.buffer,0,sizeof known,known);
-        fg_buffer_barrier(cb,&F.known,VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
-        if (!immutable) F.known_ready=1;
+static int fg_render_set_get(int rslot, VkDescriptorSet *out) {
+    enum { FG_RENDER_SETS = FG_SOURCES*2 + FG_OUTPUTS*2 };
+    if (!totk_fg_fast_on() || rslot < 0 || rslot >= FG_RENDER_SETS) return 0;
+    if (!F.res_epoch) F.res_epoch = 1u;
+    if (!F.render_pool) {
+        VkDescriptorPoolSize psz[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, FG_RENDER_SETS*9u},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, FG_RENDER_SETS*2u}};
+        VkDescriptorPoolCreateInfo pi = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = FG_RENDER_SETS, .poolSizeCount = 2, .pPoolSizes = psz};
+        if (vkCreateDescriptorPool(V.dev, &pi, NULL, &F.render_pool) != VK_SUCCESS) { F.render_pool = VK_NULL_HANDLE; return 0; }
+        VkDescriptorSetLayout lays[FG_RENDER_SETS];
+        for (unsigned i = 0; i < FG_RENDER_SETS; i++) lays[i] = F.dsl;
+        VkDescriptorSetAllocateInfo ai = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = F.render_pool, .descriptorSetCount = FG_RENDER_SETS, .pSetLayouts = lays};
+        if (vkAllocateDescriptorSets(V.dev, &ai, F.render_sets) != VK_SUCCESS) return 0;
     }
-    VkDescriptorSet set = vk_alloc_set(F.dsl);
-    int interp = mode == 3;
-    int output = mode == 4;
-    int qcom = mode == 5 || mode == 6;
-    fg_source *first=interp || mode == 6 ? &F.source[F.history] :
-        output && s->pair_source >= 0 ? &F.source[s->pair_source] : s;
-    fg_image *first_scene=first->native_scene_ready ? &first->scene_scaled : &first->scene;
-    fg_image *second_scene=s->native_scene_ready ? &s->scene_scaled : &s->scene;
-    VkDescriptorImageInfo images[11] = {
-        {F.sampler[0],first_scene->raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {F.sampler[1],first->depth.raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {F.sampler[0],final,final_layout},
-        {F.sampler[0],second_scene->raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {F.sampler[1],s->depth.raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
-        {F.sampler[0],interp || qcom ? first->ui_black.raw : final,interp || qcom ? VK_IMAGE_LAYOUT_GENERAL : final_layout},
-        {F.sampler[0],interp || qcom ? first->ui_white.raw : final,interp || qcom ? VK_IMAGE_LAYOUT_GENERAL : final_layout},
-        {0},{0},
-        {F.sampler[1],output ? s->fallback.raw : final,output ? VK_IMAGE_LAYOUT_GENERAL : final_layout},
-        {F.sampler[1],first->real_ready ? first->real.raw : final,
-            first->real_ready ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : final_layout}};
-    fg_buffer *first_mask=interp && first->authority_compared ? &s->pair_authority[0] : &F.known;
-    fg_buffer *second_mask=interp && s->authority_compared ? &s->pair_authority[1] : &F.known;
-    VkDescriptorBufferInfo buffers[2]={{first_mask->buffer,0,first_mask->size},{second_mask->buffer,0,second_mask->size}};
+    *out = F.render_sets[rslot]; return *out != VK_NULL_HANDLE;
+}
+static VkDescriptorSet fg_render_bind_prepare(int rslot, const VkDescriptorImageInfo images[11], const VkDescriptorBufferInfo buffers[2]) {
+    VkDescriptorSet set = VK_NULL_HANDLE;
     VkWriteDescriptorSet writes[11];
-    for (unsigned i=0; i<11; i++) {
-        writes[i]=(VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet=set,.dstBinding=i,.descriptorCount=1,
-            .descriptorType=i == 7 || i == 8 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        if (i == 7 || i == 8) writes[i].pBufferInfo=&buffers[i-7];
-        else writes[i].pImageInfo=&images[i];
+    if (fg_render_set_get(rslot, &set)) {
+        uintptr_t views[11] = {0}; uint32_t layouts[11] = {0};
+        for (unsigned i = 0; i < 11u; i++) { views[i] = (uintptr_t)images[i].imageView; layouts[i] = (uint32_t)images[i].imageLayout; }
+        uintptr_t bhs[2] = {(uintptr_t)buffers[0].buffer, (uintptr_t)buffers[1].buffer};
+        uint64_t boffs[2] = {(uint64_t)buffers[0].offset, (uint64_t)buffers[1].offset};
+        uint64_t brngs[2] = {(uint64_t)buffers[0].range, (uint64_t)buffers[1].range};
+        uint32_t mask = totk_fg_desc_diff_mask(&F.render_slots[rslot], F.res_epoch, views, layouts, bhs, boffs, brngs);
+        unsigned nw = 0;
+        for (unsigned i = 0; i < 11u; i++) if ((mask >> i) & 1u) {
+            writes[nw++] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = i, .descriptorCount = 1,
+                .descriptorType = i == 7 || i == 8 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pBufferInfo = i == 7 || i == 8 ? &buffers[i - 7] : NULL, .pImageInfo = i == 7 || i == 8 ? NULL : &images[i]};
+        }
+        if (nw) vkUpdateDescriptorSets(V.dev, nw, writes, 0, NULL);
+        return set;
     }
-    vkUpdateDescriptorSets(V.dev,11,writes,0,NULL);
-    vk_barrier_all(cb);
+    set = vk_alloc_set(F.dsl);
+    for (unsigned i = 0; i < 11u; i++) {
+        writes[i] = (VkWriteDescriptorSet){VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = set, .dstBinding = i, .descriptorCount = 1,
+            .descriptorType = i == 7 || i == 8 ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER : VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pBufferInfo = i == 7 || i == 8 ? &buffers[i - 7] : NULL, .pImageInfo = i == 7 || i == 8 ? NULL : &images[i]};
+    }
+    vkUpdateDescriptorSets(V.dev, 11, writes, 0, NULL);
+    return set;
+}
+static void fg_render_draw_pass(VkCommandBuffer cb, fg_source *s, fg_image *target, VkPipeline pipeline,
+        VkDescriptorSet set, int interp, float mode) {
     fg_barrier(cb,target->image,(VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
         VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
         VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,
         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
     VkRenderingAttachmentInfo attachment[2] = {{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView=target->raw,
-        .imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-        .storeOp=VK_ATTACHMENT_STORE_OP_STORE}};
+        .imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, .loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp=VK_ATTACHMENT_STORE_OP_STORE}};
     if (interp) {
         fg_barrier(cb,s->fallback.image,(VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
             VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,
             VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
         attachment[1]=(VkRenderingAttachmentInfo){VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,.imageView=s->fallback.raw,
-            .imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,.loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,
-            .storeOp=VK_ATTACHMENT_STORE_OP_STORE};
+            .imageLayout=VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,.loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.storeOp=VK_ATTACHMENT_STORE_OP_STORE};
     }
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea={{0,0},{target->w,target->h}}, .layerCount=1,
         .colorAttachmentCount=interp ? 2 : 1, .pColorAttachments=attachment};
-    vkCmdBeginRendering(cb,&ri);
-    vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
+    vkCmdBeginRendering(cb,&ri); vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,pipeline);
     vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_GRAPHICS,F.layout,0,1,&set,0,NULL);
-    float push[32];
-    memcpy(push,s->transform,sizeof s->transform);
+    float push[32]; memcpy(push,s->transform,sizeof s->transform);
     if (interp) memcpy(push+16,s->next_transform,sizeof s->next_transform);
-    else {
-        push[16]=mode; push[17]=s->camera[56]; push[18]=1.0f/target->w; push[19]=1.0f/target->h;
-    }
+    else { push[16]=mode; push[17]=s->camera[56]; push[18]=1.0f/target->w; push[19]=1.0f/target->h; }
     vkCmdPushConstants(cb,F.layout,VK_SHADER_STAGE_FRAGMENT_BIT,0,interp ? sizeof push : 80,push);
-    VkViewport viewport={0,0,(float)target->w,(float)target->h,0,1};
-    VkRect2D scissor={{0,0},{target->w,target->h}};
+    VkViewport viewport={0,0,(float)target->w,(float)target->h,0,1}; VkRect2D scissor={{0,0},{target->w,target->h}};
     vkCmdSetViewport(cb,0,1,&viewport); vkCmdSetScissor(cb,0,1,&scissor);
     vkCmdDraw(cb,3,1,0,0); vkCmdEndRendering(cb);
     fg_barrier(cb,target->image,(VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
@@ -2754,11 +2789,46 @@ static void fg_render_record(VkCommandBuffer cb, fg_source *s, fg_image *target,
         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 }
+static void fg_render_record_slot(VkCommandBuffer cb, fg_source *s, fg_image *target, VkPipeline pipeline,
+                       VkImageView final, VkImageLayout final_layout, float mode, int immutable, int rslot) {
+    if (immutable || !F.known_ready) {
+        const uint32_t known[4]={0}; vkCmdUpdateBuffer(cb,F.known.buffer,0,sizeof known,known);
+        fg_buffer_barrier(cb,&F.known,VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,VK_ACCESS_2_TRANSFER_WRITE_BIT,
+            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,VK_ACCESS_2_SHADER_STORAGE_READ_BIT);
+        if (!immutable) F.known_ready=1;
+    }
+    int interp = mode == 3, output = mode == 4, qcom = mode == 5 || mode == 6;
+    fg_source *first=interp || mode == 6 ? &F.source[F.history] : output && s->pair_source >= 0 ? &F.source[s->pair_source] : s;
+    fg_image *first_scene=first->native_scene_ready ? &first->scene_scaled : &first->scene;
+    fg_image *second_scene=s->native_scene_ready ? &s->scene_scaled : &s->scene;
+    VkDescriptorImageInfo images[11] = {
+        {F.sampler[0],first_scene->raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {F.sampler[1],first->depth.raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},{F.sampler[0],final,final_layout},
+        {F.sampler[0],second_scene->raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {F.sampler[1],s->depth.raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {F.sampler[0],interp || qcom ? first->ui_black.raw : final,interp || qcom ? VK_IMAGE_LAYOUT_GENERAL : final_layout},
+        {F.sampler[0],interp || qcom ? first->ui_white.raw : final,interp || qcom ? VK_IMAGE_LAYOUT_GENERAL : final_layout},
+        {0},{0},{F.sampler[1],output ? s->fallback.raw : final,output ? VK_IMAGE_LAYOUT_GENERAL : final_layout},
+        {F.sampler[1],first->real_ready ? first->real.raw : final,first->real_ready ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : final_layout}};
+    fg_buffer *first_mask=interp && first->authority_compared ? &s->pair_authority[0] : &F.known;
+    fg_buffer *second_mask=interp && s->authority_compared ? &s->pair_authority[1] : &F.known;
+    VkDescriptorBufferInfo buffers[2]={{first_mask->buffer,0,first_mask->size},{second_mask->buffer,0,second_mask->size}};
+    VkDescriptorSet set = fg_render_bind_prepare(rslot, images, buffers);
+    vk_barrier_all(cb); fg_render_draw_pass(cb, s, target, pipeline, set, interp, mode);
+}
+static void fg_render_record(VkCommandBuffer cb, fg_source *s, fg_image *target, VkPipeline pipeline,
+                       VkImageView final, VkImageLayout final_layout, float mode,int immutable) {
+    fg_render_record_slot(cb, s, target, pipeline, final, final_layout, mode, immutable, -1);
+}
+static void fg_render_slot(VkCommandBuffer cb,fg_source *s,fg_image *target,VkPipeline pipeline,
+        VkImageView final,VkImageLayout final_layout,float mode,int rslot) {
+    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
+    fg_render_record_slot(cb,s,target,pipeline,final,final_layout,mode,0,rslot);
+    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
+}
 static void fg_render(VkCommandBuffer cb,fg_source *s,fg_image *target,VkPipeline pipeline,
         VkImageView final,VkImageLayout final_layout,float mode) {
-    if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "framegen");
-    fg_render_record(cb,s,target,pipeline,final,final_layout,mode,0);
-    if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
+    fg_render_slot(cb,s,target,pipeline,final,final_layout,mode,F.current>=0 ? F.current*2 : -1);
 }
 static int fg_scale_scene(VkCommandBuffer cb, fg_source *s, fg_image *input, fg_image *target) {
     vk_post_output dst={target->image,target->raw,target->w,target->h,vk_fg_raw_format(target->format)},scratch={0};
@@ -2796,85 +2866,55 @@ int vk_fg_prepare_canvas(VkCommandBuffer cb, uint32_t width, uint32_t height) {
     s->prepared = 1;
     return 1;
 }
+static int fg_interp_compose_lsfg(VkCommandBuffer cb, fg_source *s, fg_source *old) {
+    if (!vk_fg_lsfg_can_generate() || !fg_budget_pre_admit()) return 0;
+    if (!FQ.pipeline && !fg_make_pipeline(s->scene.format,&FQ.pipeline,2)) return 0;
+    if (!fg_budget_reserve_work()) return 0;
+    VkImage image; VkImageView view; vk_fg_lsfg_provenance provenance,*probe=NULL; uint64_t frame=F.budget_frame+1;
+    if (vk_fg_lsfg_probe_requested() && !fg_dump_captured && fg_dump_frame() && frame>=fg_dump_frame()) {
+        provenance=(vk_fg_lsfg_provenance){.frame={old->captured_real_frame,s->captured_real_frame},
+            .epoch={old->capture_epoch,s->capture_epoch},.capture_ticket={old->capture_ticket_predicted,s->capture_ticket_predicted},
+            .capture_cb={old->capture_cb,s->capture_cb},.retire={old->retire,s->retire},
+            .references={(unsigned)atomic_load_explicit(&old->referenced,memory_order_acquire),(unsigned)atomic_load_explicit(&s->referenced,memory_order_acquire)},
+            .history=F.history,.pair_source=s->pair_source}; probe=&provenance;
+    }
+    if (vk_fg_lsfg_interpolate((unsigned)F.history,(unsigned)F.current,frame,0.5f,probe,&image,&view)) {
+        cb=vk_cb(); fg_render_slot(cb,s,&s->canvas,FQ.pipeline,view,VK_IMAGE_LAYOUT_GENERAL,6,F.current*2+1);
+        vk_fg_lsfg_release(cb,(unsigned)F.current); FQ.generated[F.current]=2; s->pair_source=F.history; F.passes[0]++; return 1;
+    }
+    (void)vk_cb(); return 0;
+}
 int vk_fg_interp_compose(VkCommandBuffer cb) {
-    /* Adaptive generates only after assigning its actual display target. UI
-     * capture still occurs here; no speculative fixed midpoint is submitted. */
     if (vk_fg_adaptive()) return 0;
-    if (!vk_fg_interpolating() || !vk_fg_canvas_view() || F.history < 0) {
-        F.history_skips++; return 0;
-    }
+    if (!vk_fg_interpolating() || !vk_fg_canvas_view() || F.history < 0) { F.history_skips++; return 0; }
     fg_source *s=&F.source[F.current], *old=&F.source[F.history];
-    if (vk_fg_lsfg_active() && s->predicted && old->ui_ready==3 &&
-        old->scene.format==s->scene.format && old->ui_black.w==s->canvas.w &&
-        old->ui_black.h==s->canvas.h && FQ.copy[F.current] && FQ.copy[F.history]) {
-        if (!vk_fg_lsfg_can_generate() || !fg_budget_pre_admit()) return 0;
-        if (!FQ.pipeline && !fg_make_pipeline(s->scene.format,&FQ.pipeline,2)) return 0;
-        if (!fg_budget_reserve_work()) return 0;
-        VkImage image; VkImageView view;
-        vk_fg_lsfg_provenance provenance,*probe=NULL;
-        uint64_t frame=F.budget_frame+1;
-        if (vk_fg_lsfg_probe_requested() && !fg_dump_captured && fg_dump_frame() &&
-            frame>=fg_dump_frame()) {
-            provenance=(vk_fg_lsfg_provenance){
-                .frame={old->captured_real_frame,s->captured_real_frame},
-                .epoch={old->capture_epoch,s->capture_epoch},
-                .capture_ticket={old->capture_ticket_predicted,s->capture_ticket_predicted},
-                .capture_cb={old->capture_cb,s->capture_cb},.retire={old->retire,s->retire},
-                .references={(unsigned)atomic_load_explicit(&old->referenced,memory_order_acquire),
-                    (unsigned)atomic_load_explicit(&s->referenced,memory_order_acquire)},
-                .history=F.history,.pair_source=s->pair_source};
-            probe=&provenance;
-        }
-        if (vk_fg_lsfg_interpolate((unsigned)F.history,(unsigned)F.current,frame,0.5f,probe,&image,&view)) {
-            cb=vk_cb();
-            /* Same exact affine shader as QCOM; midpoint retains the older UI. */
-            fg_render(cb,s,&s->canvas,FQ.pipeline,view,VK_IMAGE_LAYOUT_GENERAL,6);
-            vk_fg_lsfg_release(cb,(unsigned)F.current);
-            FQ.generated[F.current]=2; s->pair_source=F.history; F.passes[0]++;
-            return 1;
-        }
-        cb=vk_cb(); /* signal may have sealed the old primary, even on refusal */
-        return 0;
-    }
-    if (vk_fg_qcom_active() && s->predicted && s->ui_ready==3 &&
-        FQ.copy[F.current] && FQ.copy[F.history]) {
+    if (vk_fg_lsfg_active() && s->predicted && old->ui_ready==3 && old->scene.format==s->scene.format &&
+        old->ui_black.w==s->canvas.w && old->ui_black.h==s->canvas.h && FQ.copy[F.current] && FQ.copy[F.history])
+        return fg_interp_compose_lsfg(cb, s, old);
+    if (vk_fg_qcom_active() && s->predicted && s->ui_ready==3 && FQ.copy[F.current] && FQ.copy[F.history]) {
         if (!vk_fg_qcom_can_generate() || !fg_budget_pre_admit()) return 0;
         if (!FQ.pipeline && !fg_make_pipeline(s->scene.format,&FQ.pipeline,2)) return 0;
         if (!fg_budget_reserve_work()) return 0;
         VkImage image; VkImageView view;
-        if (vk_fg_qcom_extrapolate((unsigned)F.history,(unsigned)F.current,
-                (unsigned)F.current,F.budget_frame+1,0.5f,&image,&view)) {
-            cb=vk_cb();
-            fg_render(cb,s,&s->canvas,FQ.pipeline,view,VK_IMAGE_LAYOUT_GENERAL,5);
-            vk_fg_qcom_release(cb,(unsigned)F.current);
-            FQ.generated[F.current]=1; s->pair_source=F.history; F.passes[0]++;
-            return 1;
+        if (vk_fg_qcom_extrapolate((unsigned)F.history,(unsigned)F.current,(unsigned)F.current,F.budget_frame+1,0.5f,&image,&view)) {
+            cb=vk_cb(); fg_render_slot(cb,s,&s->canvas,FQ.pipeline,view,VK_IMAGE_LAYOUT_GENERAL,5,F.current*2+1);
+            vk_fg_qcom_release(cb,(unsigned)F.current); FQ.generated[F.current]=1; s->pair_source=F.history; F.passes[0]++; return 1;
         }
-        /* The handoff may have sealed the old primary even on failure. */
-        cb=vk_cb();
-        return 0; /* Keep this real frame; fallback starts with the next pair. */
+        (void)vk_cb(); return 0;
     }
-    if (!s->predicted || old->ui_ready != 3 || old->scene.format != s->scene.format ||
-        old->ui_black.w != s->canvas.w || old->ui_black.h != s->canvas.h) return 0;
+    if (!s->predicted || old->ui_ready != 3 || old->scene.format != s->scene.format || old->ui_black.w != s->canvas.w || old->ui_black.h != s->canvas.h) return 0;
     if ((s->authority_snapshot || old->authority_snapshot) && !old->real_ready) { vk_fg_skip(); return 0; }
     if (!fg_budget_pre_admit()) return 0;
-    if (vk_scene_post_enabled() &&
-        (!s->native_scene_ready || !old->native_scene_ready ||
-         s->scene_scaled.w!=s->canvas.w || s->scene_scaled.h!=s->canvas.h ||
-         old->scene_scaled.w!=s->canvas.w || old->scene_scaled.h!=s->canvas.h))
+    if (vk_scene_post_enabled() && (!s->native_scene_ready || !old->native_scene_ready || s->scene_scaled.w!=s->canvas.w || s->scene_scaled.h!=s->canvas.h || old->scene_scaled.w!=s->canvas.w || old->scene_scaled.h!=s->canvas.h))
         return fg_real_reject("retained native scenes do not match current native UI extent");
     fg_image *target=&s->canvas;
-    if (!fg_supports(VK_FORMAT_R8_UNORM,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) ||
-        !fg_image_make(&s->fallback,target->w,target->h,VK_FORMAT_R8_UNORM,VK_IMAGE_ASPECT_COLOR_BIT,1)) return 0;
+    if (!fg_supports(VK_FORMAT_R8_UNORM,VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT|VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) || !fg_image_make(&s->fallback,target->w,target->h,VK_FORMAT_R8_UNORM,VK_IMAGE_ASPECT_COLOR_BIT,1)) return 0;
     if (!F.interp_pipeline && !fg_make_pipeline(s->scene.format,&F.interp_pipeline,1)) return 0;
     if (!fg_budget_reserve_work()) return 0;
     if (!fg_pair_dilate(cb,s,old)) { vk_fg_skip(); return 0; }
     fg_profile_source_begin(cb,(unsigned)F.current,FG_PROFILE_INTERP_UI);
-    fg_render(cb,s,target,F.interp_pipeline,vk_scene_post_enabled()?s->scene_scaled.raw:s->scene.raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,3);
-    fg_profile_source_end(cb,(unsigned)F.current,FG_PROFILE_INTERP_UI);
-    s->pair_source=F.history;
-    F.passes[0]++;
-    return 1;
+    fg_render_slot(cb,s,target,F.interp_pipeline,vk_scene_post_enabled()?s->scene_scaled.raw:s->scene.raw,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,3,F.current*2+1);
+    fg_profile_source_end(cb,(unsigned)F.current,FG_PROFILE_INTERP_UI); s->pair_source=F.history; F.passes[0]++; return 1;
 }
 int vk_fg_qcom_picture(void) {
     return F.current>=0 && vk_fg_qcom_requested() && FQ.generated[F.current];
@@ -3020,6 +3060,7 @@ void vk_fg_adaptive_terminal(const vk_record_draw *draw, const VkDescriptorSet s
                 .offset=0,.size=VK_WHOLE_SIZE};
             if (!fg_result(vkFlushMappedMemoryRanges(V.dev,1,&range),"immutable terminal flush")) return;
         }
+        if (o->n_write_batch) { unsigned nw=totk_fg_term_flush_count(o->n_write_batch); if (nw) vkUpdateDescriptorSets(V.dev,nw,o->write_batch,0,NULL); o->n_write_batch=o->n_buf_batch=o->n_img_batch=0; }
         s->terminal=owned; memcpy(s->terminal_sets,o->sets,sizeof s->terminal_sets);
         s->terminal_w=width; s->terminal_h=height; s->terminal_format=format;
         o->ready=1; s->terminal_ready=1;
@@ -3111,113 +3152,64 @@ unsigned vk_fg_generation_state_mask(void) {
 static void fg_generation_cancel_all(void) {
     for (unsigned i=0;i<FG_OUTPUTS;i++) vk_fg_generation_cancel(&fg_generation[i]);
 }
-vk_fg_generation *vk_fg_generation_prepare(unsigned slot,uint32_t fw,uint32_t fh,
-        int srgb,const vk_fg_generation_stamp *stamp) {
-    if ((!vk_fg_adaptive() && !fg_generation_test_bridge) || !vk_fg_enabled() || !stamp || !stamp->frame ||
-        !stamp->epoch || slot>=FG_OUTPUTS || !fw || !fh) return NULL;
-    fg_consume_reset();
-    if (!F.ready || F.invalid || F.current<0 || F.history<0 || F.current==F.history ||
-        stamp->frame!=vk_fg_real_frame_id() || !fg_generation_engine_ready()) return NULL;
-    fg_source *s=&F.source[F.current];
-    fg_output *o=&F.output[slot];
-    vk_fg_generation *g=&fg_generation[slot];
-    if (vk_fg_generation_state(g) || atomic_load_explicit(&o->busy,memory_order_acquire) ||
-        s->generation_template || FQ.generated[F.current] || !s->predicted || !s->prepared || s->ui_ready!=3 ||
-        !s->terminal_ready || (!fg_generation_test_bridge && (!FQ.copy[F.current] || !FQ.copy[F.history])) ||
-        fw>V.props.limits.maxImageDimension2D || fh>V.props.limits.maxImageDimension2D ||
-        fabs((double)fw/fh-(double)s->scene.w/s->scene.h)>0.01) return NULL;
-    VkFormat format=srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-    if (!fg_image_make(&o->image,fw,fh,format,VK_IMAGE_ASPECT_COLOR_BIT,1) ||
-        !fg_image_make(&s->final,s->terminal_w,s->terminal_h,s->terminal_format,VK_IMAGE_ASPECT_COLOR_BIT,1) ||
-        (!FQ.pipeline && !fg_make_pipeline(s->scene.format,&FQ.pipeline,2))) return NULL;
+static int fg_gen_prep_pools(vk_fg_generation *g) {
     if (!g->pool) {
-        VkCommandPoolCreateInfo pi={VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-            .flags=VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,.queueFamilyIndex=V.qfam};
-        if (!fg_result(vkCreateCommandPool(V.dev,&pi,NULL,&g->pool),"template command pool")) return NULL;
-        VkCommandBufferAllocateInfo ai={VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-            .commandPool=g->pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
-        if (!fg_result(vkAllocateCommandBuffers(V.dev,&ai,&g->cb),"template command storage")) return NULL;
-    } else if (!g->cb || !fg_result(vkResetCommandPool(V.dev,g->pool,0),"template pool reset")) return NULL;
-    uint64_t lease=s->owned.ready ? vk_replay_lease_begin_immutable() : vk_replay_lease_begin();
-    if (!lease) return NULL;
+        VkCommandPoolCreateInfo pi={VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,.flags=VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,.queueFamilyIndex=V.qfam};
+        if (!fg_result(vkCreateCommandPool(V.dev,&pi,NULL,&g->pool),"template command pool")) return 0;
+        VkCommandBufferAllocateInfo ai={VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,.commandPool=g->pool,.level=VK_COMMAND_BUFFER_LEVEL_PRIMARY,.commandBufferCount=1};
+        if (!fg_result(vkAllocateCommandBuffers(V.dev,&ai,&g->cb),"template command storage")) return 0;
+    } else if (!g->cb || !fg_result(vkResetCommandPool(V.dev,g->pool,0),"template pool reset")) return 0;
+    return 1;
+}
+static void fg_gen_prep_record(vk_fg_generation *g, fg_source *s, fg_output *o, VkImageView view, unsigned slot, uint32_t fw, uint32_t fh, VkFormat format) {
+    VkCommandBuffer cb=g->cb;
+    if (g->immutable_terminal && s->owned.used)
+        fg_buffer_barrier(cb,&s->owned.bytes,VK_PIPELINE_STAGE_2_HOST_BIT,VK_ACCESS_2_HOST_WRITE_BIT,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT);
+    if (!fg_generation_test_bridge) vk_fg_qcom_acquire(cb,slot);
+    fg_render_record_slot(cb,s,&s->canvas,FQ.pipeline,view,fg_generation_test_bridge ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,5,1,FG_SOURCES*2+(int)(slot*2));
+    if (!fg_generation_test_bridge) vk_fg_qcom_release(cb,slot);
+    int direct=atomic_load_explicit(&fg_adaptive_direct_config,memory_order_relaxed)==1 && !fg_dump_frame();
+    if (direct) { direct=s->terminal_format==format && s->terminal_w==fw && s->terminal_h==fh; F.lean_counts[direct ? VK_FG_LEAN_DIRECT : VK_FG_LEAN_DIRECT_FALLBACK]++; }
+    fg_image *terminal=direct ? &o->image : &s->final;
+    fg_barrier(cb,terminal->image,(VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL,
+        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRenderingAttachmentInfo attachment={VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,.imageView=terminal->display,.imageLayout=VK_IMAGE_LAYOUT_GENERAL,.loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.storeOp=VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo ri={VK_STRUCTURE_TYPE_RENDERING_INFO,.renderArea={{0,0},{s->terminal_w,s->terminal_h}},.layerCount=1,.colorAttachmentCount=1,.pColorAttachments=&attachment};
+    vkCmdBeginRendering(cb,&ri); vk_fg_replay_draw(cb,&s->terminal,s->terminal_sets); vkCmdEndRendering(cb); vk_barrier_all(cb);
+    unsigned query=(FG_SOURCES+slot)*2; vkCmdResetQueryPool(cb,F.queries,query,2); vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,F.queries,query);
+    if (F.profile_queries) fg_profile_begin(cb,fg_profile_output_query(slot,FG_PROFILE_OUTPUT_RENDER));
+    if (!direct) fg_render_record_slot(cb,s,&o->image,F.pipeline,s->final.raw,VK_IMAGE_LAYOUT_GENERAL,2,1,FG_SOURCES*2+(int)(slot*2+1));
+    if (F.profile_queries) { vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,F.profile_queries,fg_profile_output_query(slot,FG_PROFILE_OUTPUT_RENDER)+1); g->profile_mask=1; fg_profile_begin(cb,fg_profile_output_query(slot,FG_PROFILE_OUTPUT_POST)); }
+    atomic_store_explicit(&o->raw,o->image.raw,memory_order_release);
+}
+vk_fg_generation *vk_fg_generation_prepare(unsigned slot,uint32_t fw,uint32_t fh,int srgb,const vk_fg_generation_stamp *stamp) {
+    if ((!vk_fg_adaptive() && !fg_generation_test_bridge) || !vk_fg_enabled() || !stamp || !stamp->frame || !stamp->epoch || slot>=FG_OUTPUTS || !fw || !fh) return NULL;
+    fg_consume_reset();
+    if (!F.ready || F.invalid || F.current<0 || F.history<0 || F.current==F.history || stamp->frame!=vk_fg_real_frame_id() || !fg_generation_engine_ready()) return NULL;
+    fg_source *s=&F.source[F.current]; fg_output *o=&F.output[slot]; vk_fg_generation *g=&fg_generation[slot];
+    if (vk_fg_generation_state(g) || atomic_load_explicit(&o->busy,memory_order_acquire) || s->generation_template || FQ.generated[F.current] || !s->predicted || !s->prepared || s->ui_ready!=3 || !s->terminal_ready || (!fg_generation_test_bridge && (!FQ.copy[F.current] || !FQ.copy[F.history])) || fw>V.props.limits.maxImageDimension2D || fh>V.props.limits.maxImageDimension2D || fabs((double)fw/fh-(double)s->scene.w/s->scene.h)>0.01) return NULL;
+    VkFormat format=srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    if (!fg_image_make(&o->image,fw,fh,format,VK_IMAGE_ASPECT_COLOR_BIT,1) || !fg_image_make(&s->final,s->terminal_w,s->terminal_h,s->terminal_format,VK_IMAGE_ASPECT_COLOR_BIT,1) || (!FQ.pipeline && !fg_make_pipeline(s->scene.format,&FQ.pipeline,2))) return NULL;
+    if (!fg_gen_prep_pools(g)) return NULL;
+    uint64_t lease=s->owned.ready ? vk_replay_lease_begin_immutable() : vk_replay_lease_begin(); if (!lease) return NULL;
     atomic_store_explicit(&vk_fg_generation_snapshot_retained,1,memory_order_relaxed);
     VkImageView view=s->native_scene_ready ? s->scene_scaled.raw : s->scene.raw;
-    if (!fg_generation_test_bridge &&
-        !vk_fg_qcom_output_prepare((unsigned)F.history,(unsigned)F.current,slot,&view)) {
-        (void)vk_replay_lease_end(lease,0); return NULL;
-    }
+    if (!fg_generation_test_bridge && !vk_fg_qcom_output_prepare((unsigned)F.history,(unsigned)F.current,slot,&view)) { (void)vk_replay_lease_end(lease,0); return NULL; }
 #ifdef TOTK_VK_TESTS
     if (fg_generation_test_bridge && !g->test_bridge) {
         VkSemaphoreCreateInfo si={VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-        if (!fg_result(vkCreateSemaphore(V.dev,&si,NULL,&g->test_bridge),"test bridge semaphore")) {
-            (void)vk_replay_lease_end(lease,0); return NULL;
-        }
+        if (!fg_result(vkCreateSemaphore(V.dev,&si,NULL,&g->test_bridge),"test bridge semaphore")) { (void)vk_replay_lease_end(lease,0); return NULL; }
     }
-#endif
-    g->lease=lease; g->ticket=0; g->first_ticket=0; g->charge_frame=0;
-    g->stamp=*stamp; g->slot=slot; g->source=(unsigned)F.current; g->previous=(unsigned)F.history;
-    g->immutable_terminal=s->owned.ready;
-    g->output=(vk_post_output){o->image.image,o->image.display,fw,fh,format};
-    g->profile_mask=0; g->profile_copy_started=0;
-    g->trace.enabled=0;
-#ifdef TOTK_VK_TESTS
     g->test_phase=0;
 #endif
-    atomic_store_explicit(&g->cancel_reason,FG_SLOT_CANCEL_NONE,memory_order_relaxed);
-    atomic_store_explicit(&g->canceled,0,memory_order_relaxed);
-    atomic_fetch_add_explicit(&s->referenced,1,memory_order_release);
-    atomic_fetch_add_explicit(&F.source[g->previous].referenced,1,memory_order_release);
-    atomic_store_explicit(&g->state,VK_FG_GENERATION_PREPARING,memory_order_release);
-    s->generation_template=1;
-    VkCommandBufferBeginInfo bi={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
-    if (!fg_result(vkBeginCommandBuffer(g->cb,&bi),"template begin")) {
-        vk_fg_generation_cancel(g); return NULL;
-    }
-    VkCommandBuffer cb=g->cb;
-    if (g->immutable_terminal && s->owned.used)
-        fg_buffer_barrier(cb,&s->owned.bytes,VK_PIPELINE_STAGE_2_HOST_BIT,VK_ACCESS_2_HOST_WRITE_BIT,
-            VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT);
-    if (!fg_generation_test_bridge) vk_fg_qcom_acquire(cb,slot);
-    fg_render_record(cb,s,&s->canvas,FQ.pipeline,view,
-        fg_generation_test_bridge ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL,5,1);
-    if (!fg_generation_test_bridge) vk_fg_qcom_release(cb,slot);
-    /* Exact terminal replay, record-only: no F.current lookup, profile mark,
-     * ui_ready/transferred/pass mutation, allocation or callback at dispatch.
-     * DIRECT_OUT replays straight into the output only when its pipeline's
-     * attachment format and frozen viewport/scissor extent are the output's;
-     * the mode-2 copy would then reproduce the same encoded texels. */
-    int direct=atomic_load_explicit(&fg_adaptive_direct_config,memory_order_relaxed)==1 && !fg_dump_frame();
-    if (direct) {
-        direct=s->terminal_format==format && s->terminal_w==fw && s->terminal_h==fh;
-        F.lean_counts[direct ? VK_FG_LEAN_DIRECT : VK_FG_LEAN_DIRECT_FALLBACK]++;
-    }
-    fg_image *terminal=direct ? &o->image : &s->final;
-    fg_barrier(cb,terminal->image,(VkImageSubresourceRange){VK_IMAGE_ASPECT_COLOR_BIT,0,1,0,1},
-        VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_GENERAL,
-        VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,VK_ACCESS_2_MEMORY_READ_BIT|VK_ACCESS_2_MEMORY_WRITE_BIT,
-        VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT,VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-    VkRenderingAttachmentInfo attachment={VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-        .imageView=terminal->display,.imageLayout=VK_IMAGE_LAYOUT_GENERAL,
-        .loadOp=VK_ATTACHMENT_LOAD_OP_DONT_CARE,.storeOp=VK_ATTACHMENT_STORE_OP_STORE};
-    VkRenderingInfo ri={VK_STRUCTURE_TYPE_RENDERING_INFO,.renderArea={{0,0},{s->terminal_w,s->terminal_h}},
-        .layerCount=1,.colorAttachmentCount=1,.pColorAttachments=&attachment};
-    vkCmdBeginRendering(cb,&ri);
-    vk_fg_replay_draw(cb,&s->terminal,s->terminal_sets);
-    vkCmdEndRendering(cb); vk_barrier_all(cb);
-    unsigned query=(FG_SOURCES+slot)*2;
-    vkCmdResetQueryPool(cb,F.queries,query,2);
-    vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,F.queries,query);
-    if (F.profile_queries) fg_profile_begin(cb,fg_profile_output_query(slot,FG_PROFILE_OUTPUT_RENDER));
-    if (!direct) fg_render_record(cb,s,&o->image,F.pipeline,s->final.raw,VK_IMAGE_LAYOUT_GENERAL,2,1);
-    if (F.profile_queries) {
-        vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,F.profile_queries,
-            fg_profile_output_query(slot,FG_PROFILE_OUTPUT_RENDER)+1);
-        g->profile_mask=1;
-        fg_profile_begin(cb,fg_profile_output_query(slot,FG_PROFILE_OUTPUT_POST));
-    }
-    atomic_store_explicit(&o->raw,o->image.raw,memory_order_release);
-    return g;
+    g->lease=lease; g->ticket=0; g->first_ticket=0; g->charge_frame=0; g->stamp=*stamp; g->slot=slot; g->source=(unsigned)F.current; g->previous=(unsigned)F.history;
+    g->immutable_terminal=s->owned.ready; g->output=(vk_post_output){o->image.image,o->image.display,fw,fh,format}; g->profile_mask=0; g->profile_copy_started=0; g->trace.enabled=0;
+    atomic_store_explicit(&g->cancel_reason,FG_SLOT_CANCEL_NONE,memory_order_relaxed); atomic_store_explicit(&g->canceled,0,memory_order_relaxed);
+    atomic_fetch_add_explicit(&s->referenced,1,memory_order_release); atomic_fetch_add_explicit(&F.source[g->previous].referenced,1,memory_order_release);
+    atomic_store_explicit(&g->state,VK_FG_GENERATION_PREPARING,memory_order_release); s->generation_template=1;
+    VkCommandBufferBeginInfo bi={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,.flags=VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+    if (!fg_result(vkBeginCommandBuffer(g->cb,&bi),"template begin")) { vk_fg_generation_cancel(g); return NULL; }
+    fg_gen_prep_record(g, s, o, view, slot, fw, fh, format); return g;
 }
 int vk_fg_generation_prepare_finish(vk_fg_generation *g) {
     if (vk_fg_generation_state(g)!=VK_FG_GENERATION_PREPARING) return 0;
@@ -3398,86 +3390,46 @@ int vk_fg_generate_phase(VkCommandBuffer cb, unsigned slot, uint32_t fw, uint32_
     return vk_fg_generate(cb,slot,fw,fh,srgb,out);
 }
 
-int vk_fg_generate(VkCommandBuffer cb, unsigned slot, uint32_t fw, uint32_t fh,
-                   int srgb, vk_post_output *out) {
-    if (!vk_fg_enabled()) return 0;
-    fg_consume_reset();
-    if (!F.ready || F.current < 0 || F.invalid || (F.generated && !vk_fg_adaptive()) || !cb || !out ||
-        !fw || !fh || slot >= FG_OUTPUTS) { if (F.diag) F.admission[0]++; return 0; }
-    fg_source *s = &F.source[F.current];
-    if (vk_fg_adaptive() && s->generation_template) return 0; /* no mixed/multi-child replay */
+static int fg_gen_adaptive_run(VkCommandBuffer *cbp, fg_source *s, unsigned slot) {
+    VkCommandBuffer cb = *cbp;
+    if (!vk_fg_qcom_active() || F.history<0 || !s->terminal_ready || !s->predicted || s->ui_ready!=3 || !FQ.copy[F.current] || !FQ.copy[F.history] ||
+        !vk_fg_qcom_can_generate() || !fg_budget_reserve_work() || !fg_image_make(&s->final,s->terminal_w,s->terminal_h,s->terminal_format,VK_IMAGE_ASPECT_COLOR_BIT,1))
+        return 0;
+    if (!FQ.pipeline && !fg_make_pipeline(s->scene.format,&FQ.pipeline,2)) return 0;
+    VkImage image; VkImageView view;
+    if (!vk_fg_qcom_extrapolate((unsigned)F.history,(unsigned)F.current,slot,F.budget_frame+1,fg_adaptive_target_phase,&image,&view)) return 0;
+    cb=vk_cb(); fg_render_slot(cb,s,&s->canvas,FQ.pipeline,view,VK_IMAGE_LAYOUT_GENERAL,5,FG_SOURCES*2+(int)(slot*2));
+    vk_fg_qcom_release(cb,slot); FQ.generated[F.current]=1; s->pair_source=F.history;
+    (void)vk_fg_replay_begin(cb,s->terminal_w,s->terminal_h,s->terminal_format,1);
+    vk_fg_replay_draw(cb,&s->terminal,s->terminal_sets); vk_fg_replay_end(cb,1); *cbp = cb; return 1;
+}
+int vk_fg_generate(VkCommandBuffer cb, unsigned slot, uint32_t fw, uint32_t fh, int srgb, vk_post_output *out) {
+    if (!vk_fg_enabled()) return 0; fg_consume_reset();
+    if (!F.ready || F.current < 0 || F.invalid || (F.generated && !vk_fg_adaptive()) || !cb || !out || !fw || !fh || slot >= FG_OUTPUTS) { if (F.diag) F.admission[0]++; return 0; }
+    fg_source *s = &F.source[F.current]; if (vk_fg_adaptive() && s->generation_template) return 0;
     fg_output *o = &F.output[slot];
     if (!s->predicted) { if (F.diag) F.admission[1]++; return 0; }
     if (!s->prepared || (!vk_fg_adaptive() && !s->transferred)) { if (F.diag) F.admission[2]++; return 0; }
     if (atomic_load_explicit(&o->busy,memory_order_acquire)) { if (F.diag) F.admission[3]++; return 0; }
     if (!fg_budget_pre_admit()) return 0;
-    int masked=!vk_fg_adaptive() && vk_fg_interpolating() && !((vk_fg_qcom_requested() || vk_fg_lsfg_requested()) &&
-        FQ.generated[F.current]) && s->pair_source >= 0 &&
-        (s->authority_snapshot || F.source[s->pair_source].authority_snapshot);
-    if (masked) {
-        const fg_source *old=&F.source[s->pair_source];
-        if (!old->real_ready || old->real.w != s->final.w || old->real.h != s->final.h ||
-            vk_fg_raw_format(old->real.format) != vk_fg_raw_format(s->final.format))
-            return fg_real_reject("earlier real fallback and replayed terminal extent/encoding differ");
-    }
-    if (fw > V.props.limits.maxImageDimension2D || fh > V.props.limits.maxImageDimension2D ||
-        fabs((double)fw/fh - (double)s->scene.w/s->scene.h) > 0.01) {
-        if (F.diag) F.admission[4]++;
-        return 0;
-    }
+    int masked=!vk_fg_adaptive() && vk_fg_interpolating() && !((vk_fg_qcom_requested() || vk_fg_lsfg_requested()) && FQ.generated[F.current]) && s->pair_source >= 0 && (s->authority_snapshot || F.source[s->pair_source].authority_snapshot);
+    if (masked) { const fg_source *old=&F.source[s->pair_source]; if (!old->real_ready || old->real.w != s->final.w || old->real.h != s->final.h || vk_fg_raw_format(old->real.format) != vk_fg_raw_format(s->final.format)) return fg_real_reject("earlier real fallback and replayed terminal extent/encoding differ"); }
+    if (fw > V.props.limits.maxImageDimension2D || fh > V.props.limits.maxImageDimension2D || fabs((double)fw/fh - (double)s->scene.w/s->scene.h) > 0.01) { if (F.diag) F.admission[4]++; return 0; }
     VkFormat format = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
-    if (!fg_image_make(&o->image,fw,fh,format,VK_IMAGE_ASPECT_COLOR_BIT,1)) {
-        if (F.diag) F.admission[5]++;
-        return 0;
-    }
-    if (vk_fg_adaptive()) {
-        if (!vk_fg_qcom_active() || F.history<0 || !s->terminal_ready ||
-            !s->predicted || s->ui_ready!=3 || !FQ.copy[F.current] || !FQ.copy[F.history] ||
-            !vk_fg_qcom_can_generate() || !fg_budget_reserve_work() ||
-            !fg_image_make(&s->final,s->terminal_w,s->terminal_h,s->terminal_format,VK_IMAGE_ASPECT_COLOR_BIT,1))
-            return 0;
-        if (!FQ.pipeline && !fg_make_pipeline(s->scene.format,&FQ.pipeline,2)) return 0;
-        VkImage image; VkImageView view;
-        if (!vk_fg_qcom_extrapolate((unsigned)F.history,(unsigned)F.current,slot,
-                F.budget_frame+1,fg_adaptive_target_phase,&image,&view)) return 0;
-        cb=vk_cb();
-        fg_render(cb,s,&s->canvas,FQ.pipeline,view,VK_IMAGE_LAYOUT_GENERAL,5);
-        vk_fg_qcom_release(cb,slot);
-        FQ.generated[F.current]=1; s->pair_source=F.history;
-        /* Canvas and exact terminal image were validated/allocated before the
-         * external job. No allocation/refusal remains after handing it off. */
-        (void)vk_fg_replay_begin(cb,s->terminal_w,s->terminal_h,s->terminal_format,1);
-        vk_fg_replay_draw(cb,&s->terminal,s->terminal_sets);
-        vk_fg_replay_end(cb,1);
-    }
-    unsigned query = (FG_SOURCES+slot)*2;
-    vkCmdResetQueryPool(cb,F.queries,query,2);
-    vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,F.queries,query);
-    o->profile_mask=0;
-    o->profile_copy_started=0;
+    if (!fg_image_make(&o->image,fw,fh,format,VK_IMAGE_ASPECT_COLOR_BIT,1)) { if (F.diag) F.admission[5]++; return 0; }
+    if (vk_fg_adaptive() && !fg_gen_adaptive_run(&cb, s, slot)) return 0;
+    unsigned query = (FG_SOURCES+slot)*2; vkCmdResetQueryPool(cb,F.queries,query,2); vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,F.queries,query);
+    o->profile_mask=0; o->profile_copy_started=0;
     if (F.profile_queries) fg_profile_begin(cb,fg_profile_output_query(slot,FG_PROFILE_OUTPUT_RENDER));
-    fg_render(cb,s,&o->image,F.pipeline,s->final.raw,VK_IMAGE_LAYOUT_GENERAL,masked ? 4 : 2);
-    if (F.profile_queries) {
-        vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,F.profile_queries,
-            fg_profile_output_query(slot,FG_PROFILE_OUTPUT_RENDER)+1);
-        o->profile_mask=1;
-        fg_profile_begin(cb,fg_profile_output_query(slot,FG_PROFILE_OUTPUT_POST));
-    }
-    F.passes[3]++;
-    o->source=(unsigned)F.current;
-    o->previous=vk_fg_interpolating() && s->pair_source >= 0 ? (unsigned)s->pair_source : FG_SOURCES;
-    if (o->previous < FG_SOURCES)
-        atomic_fetch_add_explicit(&F.source[o->previous].referenced,1,memory_order_release);
-    atomic_store_explicit(&o->ended,0,memory_order_relaxed);
-    F.output_budget_frame[slot]=F.budget_frame+1;
-    atomic_fetch_add_explicit(&s->referenced,1,memory_order_release);
-    atomic_store_explicit(&o->raw,o->image.raw,memory_order_release);
-    atomic_store_explicit(&o->busy,1,memory_order_release);
-    F.generated=1;
+    fg_render_slot(cb,s,&o->image,F.pipeline,s->final.raw,VK_IMAGE_LAYOUT_GENERAL,masked ? 4 : 2,FG_SOURCES*2+(int)(slot*2+1));
+    if (F.profile_queries) { vkCmdWriteTimestamp2(cb,VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,F.profile_queries,fg_profile_output_query(slot,FG_PROFILE_OUTPUT_RENDER)+1); o->profile_mask=1; fg_profile_begin(cb,fg_profile_output_query(slot,FG_PROFILE_OUTPUT_POST)); }
+    F.passes[3]++; o->source=(unsigned)F.current; o->previous=vk_fg_interpolating() && s->pair_source >= 0 ? (unsigned)s->pair_source : FG_SOURCES;
+    if (o->previous < FG_SOURCES) atomic_fetch_add_explicit(&F.source[o->previous].referenced,1,memory_order_release);
+    atomic_store_explicit(&o->ended,0,memory_order_relaxed); F.output_budget_frame[slot]=F.budget_frame+1;
+    atomic_fetch_add_explicit(&s->referenced,1,memory_order_release); atomic_store_explicit(&o->raw,o->image.raw,memory_order_release);
+    atomic_store_explicit(&o->busy,1,memory_order_release); F.generated=1;
     pthread_mutex_lock(&fg_stats_mu); F.recorded++; pthread_mutex_unlock(&fg_stats_mu);
-    if (F.diag) F.admission[6]++;
-    *out=(vk_post_output){o->image.image,o->image.display,fw,fh,format};
-    return 1;
+    if (F.diag) F.admission[6]++; *out=(vk_post_output){o->image.image,o->image.display,fw,fh,format}; return 1;
 }
 VkImageView vk_fg_raw_view(unsigned slot) {
     return slot < FG_OUTPUTS ? atomic_load_explicit(&F.output[slot].raw,memory_order_acquire) : VK_NULL_HANDLE;
@@ -4053,169 +4005,105 @@ int vk_fg_test_profile(unsigned slot, uint32_t counts[2], double limits[2]) {
     return counts[0]>0 && counts[1]>0;
 }
 #endif
+static void fg_stats_log_headroom(int qcom, int lsfg) {
+    uint64_t late = atomic_load_explicit(&F.late_skips, memory_order_relaxed);
+    if (vk_fg_interpolating()) LOGV("framegen %s last 300 real: synthesized=%llu skipped budget=%llu camera-cut=%llu history=%llu late=%llu inputs(boundary/chain/depth/capacity/structure/backoff)=%llu/%llu/%llu/%llu/%llu/%llu latency-added=%s%s",
+        lsfg ? "lsfg-present" : qcom ? "qcom-present" : "interp",
+        (unsigned long long)F.generated_count,(unsigned long long)F.budget_skips,
+        (unsigned long long)F.cuts,(unsigned long long)F.history_skips,(unsigned long long)late,
+        (unsigned long long)F.refused[VK_FG_NO_BOUNDARY],(unsigned long long)F.refused[VK_FG_CHAIN_BROKEN],
+        (unsigned long long)F.refused[VK_FG_DEPTH_LOST],(unsigned long long)F.refused[VK_FG_TRACK_CAPACITY],
+        (unsigned long long)F.refused[VK_FG_STRUCTURE_CHANGED],(unsigned long long)F.refused[VK_FG_BACKOFF],
+        qcom ? "no-real-tick" : "one-real-tick",
+        qcom ? (vk_fg_lead_refreshes()==1 ? "+one-physical-refresh (about16.7 ms at60Hz)" : "+two-physical-refreshes (about33.3 ms at60Hz)") :
+        vk_fg_locked() ? (vk_fg_lead_refreshes()==1 ? "+one-physical-refresh (about50 ms total at60Hz)" : "+two-physical-refreshes (about66.7 ms total at60Hz)") : " (33.333 ms)");
+    if (vk_fg_interpolating()) LOGV("framegen depth-range last 300 real: newly-accepted-pairs=%llu generated=%llu (independent source near/far, bounded smooth FOV, unchanged pose/aspect/extent/off-center cut guards)",
+        (unsigned long long)F.depth_range_pairs,(unsigned long long)F.depth_range_generated);
+    F.depth_range_pairs=F.depth_range_generated=0;
+    LOGV("framegen budget last 300 real: mode=%s ceiling=%.3f ms pre-skips missing/stale=%llu overload=%llu completion-skips missing=%llu overload=%llu",
+        F.budget_override ? "fixed-override-incremental" : vk_fg_interpolating() ? "adaptive-total" : "legacy-incremental",
+        F.budget_ms,(unsigned long long)F.budget_pre_skips[0],(unsigned long long)F.budget_pre_skips[1],
+        (unsigned long long)F.budget_post_skips[0],(unsigned long long)F.budget_post_skips[1]);
+    if (vk_fg_adaptive()) LOGV("[framegen-prepared-budget] mode=predictive-real-max-latest-two-complete measured-incremental ceiling_ms=%.3f actual_audits=%llu actual_overshoots=%llu actual_missing=%llu completion_decisions=%llu completion_accepts=%llu backoff_intervals=%u cooldown_until=%llu (lifetime per arm; ordinary immutable actual aggregate includes ALL charged children; not a strict current-actual publication guarantee)",
+        FG_BUDGET_TARGET_MS,(unsigned long long)F.prepared_budget.audits,(unsigned long long)F.prepared_budget.overshoots,(unsigned long long)F.prepared_budget.missing,(unsigned long long)F.prepared_budget.decisions,(unsigned long long)F.prepared_budget.publications,FG_QCOM_PREPARED_BACKOFF,(unsigned long long)F.prepared_budget.cooldown_until);
+    if (vk_fg_adaptive() && fg_adaptive_budget_selected())
+        LOGV("[framegen-adaptive-budget] mode=stale-incremental-estimate ceiling_ms=%.3f window=%u fresh_age=%u stale_admits=%llu stale_refusals=%llu stale_reservations=%llu stale_audits=%llu stale_overshoots=%llu stale_missing=%llu probes=%llu backoff_intervals=%u (lifetime per arm; same ceiling, immutable audits and back-off; probes only without a measured incremental in window)",
+            FG_BUDGET_TARGET_MS,(unsigned)FG_BUDGET_WINDOW,(unsigned)FG_BUDGET_MAX_AGE,(unsigned long long)F.adaptive_budget_admits,(unsigned long long)F.adaptive_budget_refusals,(unsigned long long)F.adaptive_budget_reservations,(unsigned long long)F.adaptive_budget_audits,(unsigned long long)F.adaptive_budget_overshoots,(unsigned long long)F.adaptive_budget_missing,(unsigned long long)F.budget.probes,FG_QCOM_PREPARED_BACKOFF);
+    if (F.budget_samples) LOGV("framegen headroom decision mean real=%.3f ms incremental=%.3f ms total=%.3f ms min-tick-margin=%.3f ms samples=%llu last frame=%llu tickets=%llu..%llu real/incremental/total/margin=%.3f/%.3f/%.3f/%.3f ms (adaptive REAL may be predicted; measured incremental; immutable actual aggregates/overshoots reported separately)",
+        F.budget_real_sum/F.budget_samples,F.budget_incremental_sum/F.budget_samples,F.budget_total_sum/F.budget_samples,F.budget_margin_min,(unsigned long long)F.budget_samples,(unsigned long long)F.budget_last.frame,(unsigned long long)F.budget_last.first,(unsigned long long)F.budget_last.last,F.budget_last.real_ms,F.budget_last.incremental_ms,F.budget_last.total_ms,F.budget_last.margin_ms);
+    else if (vk_fg_interpolating() && !F.budget_override)
+        LOGV("framegen headroom decision real/incremental/total/margin unavailable (no complete measured incremental decision)");
+    if (vk_fg_interpolating() && !F.budget_override && F.budget_pre_frame && F.budget_pre.status != FG_BUDGET_MISSING)
+        LOGV("framegen headroom latest pre-admission p90 real/incremental/total/tick-margin=%.3f/%.3f/%.3f/%.3f ms real-p90-frame=%llu tickets=%llu..%llu real/incremental-samples=%u/%u incremental-frame=%llu tickets=%llu..%llu probe=%u reason=%u retry-frame=%llu (nan=unmeasured probe cost, not zero)",
+            F.budget_pre.real_ms,F.budget_pre.incremental_ms,F.budget_pre.total_ms,F.budget_pre.margin_ms,(unsigned long long)F.budget_pre.frame,(unsigned long long)F.budget_pre.first,(unsigned long long)F.budget_pre.last,F.budget_pre.real_samples,F.budget_pre.incremental_samples,(unsigned long long)F.budget_pre.incremental_frame,(unsigned long long)F.budget_pre.incremental_first,(unsigned long long)F.budget_pre.incremental_last,F.budget_pre.probe,F.budget_pre.reason,(unsigned long long)F.budget_pre.retry_frame);
+    if (vk_fg_interpolating() && !F.budget_override)
+        LOGV("framegen headroom bootstrap/feedback: lifetime reservations=%llu probes=%llu last-probe=%llu real-fence samples=%llu missed-target=%llu correlated-pauses=%llu cooldown-until=%llu backoff=%u (framework present fences >=one refresh after real target; NOT hardware scanout)",
+            (unsigned long long)F.budget.reservations,(unsigned long long)F.budget.probes,(unsigned long long)F.budget.last_probe,(unsigned long long)F.budget_feedback_samples,(unsigned long long)F.budget_feedback_late,(unsigned long long)F.budget_feedback_pauses,(unsigned long long)F.budget.cooldown_until,F.budget.feedback_backoff);
+    F.budget_feedback_samples=F.budget_feedback_late=F.budget_feedback_pauses=0;
+    memset(F.budget_pre_skips,0,sizeof F.budget_pre_skips); memset(F.budget_post_skips,0,sizeof F.budget_post_skips);
+    F.budget_samples=0; F.budget_real_sum=F.budget_incremental_sum=F.budget_total_sum=F.budget_margin_min=0;
+    F.budget_skips=F.cuts=F.history_skips=0; atomic_store_explicit(&F.late_skips,0,memory_order_relaxed);
+}
+static void fg_stats_log_diag(void) {
+    if (F.diag) LOGV("[framegen-diag] last 300 real: eligible=%llu generated=%llu eligible-not-generated=%llu refused boundary=%llu chain=%llu depth=%llu capacity=%llu structure=%llu suspended=%llu backoff=%llu",
+        (unsigned long long)F.eligible,(unsigned long long)F.generated_count,(unsigned long long)(F.eligible >= F.generated_count ? F.eligible-F.generated_count : 0),(unsigned long long)F.refused[VK_FG_NO_BOUNDARY],(unsigned long long)F.refused[VK_FG_CHAIN_BROKEN],(unsigned long long)F.refused[VK_FG_DEPTH_LOST],(unsigned long long)F.refused[VK_FG_TRACK_CAPACITY],(unsigned long long)F.refused[VK_FG_STRUCTURE_CHANGED],(unsigned long long)F.refused[VK_FG_SUSPENDED],(unsigned long long)F.refused[VK_FG_BACKOFF]);
+    if (F.diag) LOGV("[framegen-generate-admission] state=%llu prediction=%llu capture=%llu output-busy=%llu extent=%llu allocation=%llu recorded=%llu",
+        (unsigned long long)F.admission[0],(unsigned long long)F.admission[1],(unsigned long long)F.admission[2],(unsigned long long)F.admission[3],(unsigned long long)F.admission[4],(unsigned long long)F.admission[5],(unsigned long long)F.admission[6]);
+    memset(F.admission,0,sizeof F.admission);
+    if (F.job_trace) for (unsigned i=0;i<FG_AUTH_FAILURES;i++) {
+        uint64_t total=F.authority_failures[i];
+        LOGV("[framegen-authority-begin-counts] real=%llu reason=%s last300=%llu total=%llu; failed-calls-not-probe-skips",(unsigned long long)F.budget_frame,fg_authority_failure_names[i],(unsigned long long)(total-F.authority_failures_reported[i]),(unsigned long long)total);
+        F.authority_failures_reported[i]=total;
+    }
+    if (F.job_trace && (atomic_load_explicit(&fg_adaptive_lean_config,memory_order_relaxed)==1 || atomic_load_explicit(&fg_adaptive_direct_config,memory_order_relaxed)==1)) {
+        uint64_t d[VK_FG_LEAN_COUNTS];
+        for (unsigned i=0;i<VK_FG_LEAN_COUNTS;i++) { d[i]=F.lean_counts[i]-F.lean_reported[i]; F.lean_reported[i]=F.lean_counts[i]; }
+        LOGV("[framegen-adaptive-lean-summary] real=%llu last300 lean-sources=%llu skipped scene-copies=%llu depth-copies=%llu real-copies=%llu unknown-writer-draws=%llu authority-roots=%llu direct-out=%llu direct-out-fallback=%llu (unknown-writer draws bound the skipped spans/pass splits from above; each root also skipped its init and final census/readback)",
+            (unsigned long long)F.budget_frame,(unsigned long long)d[VK_FG_LEAN_SOURCES],(unsigned long long)d[VK_FG_LEAN_SCENE_COPIES],(unsigned long long)d[VK_FG_LEAN_DEPTH_COPIES],(unsigned long long)d[VK_FG_LEAN_REAL_COPIES],(unsigned long long)d[VK_FG_LEAN_UNKNOWN_DRAWS],(unsigned long long)d[VK_FG_LEAN_ROOTS],(unsigned long long)d[VK_FG_LEAN_DIRECT],(unsigned long long)d[VK_FG_LEAN_DIRECT_FALLBACK]);
+    }
+    if (F.diag) {
+        fg_camera_pair_window *c=&F.camera_pairs;
+        if (c->samples) LOGV("[framegen-camera] last 300 real: reject translation=%llu rotation=%llu projection=%llu validation=%llu relative-rotation-deg mean=%.4f max=%.4f translation-distance mean=%.5f max=%.5f compared-pairs=%llu pose-samples=%llu (first fired predicate; invalid poses excluded; DIAG only)",
+            (unsigned long long)c->translation,(unsigned long long)c->rotation,(unsigned long long)c->projection,(unsigned long long)c->validation,c->rotation_sum/c->samples,c->rotation_max,c->translation_sum/c->samples,c->translation_max,(unsigned long long)c->comparisons,(unsigned long long)c->samples);
+        else LOGV("[framegen-camera] last 300 real: reject translation=%llu rotation=%llu projection=%llu validation=%llu compared-pairs=%llu pose-samples=0; relative pose mean/max unavailable",
+            (unsigned long long)c->translation,(unsigned long long)c->rotation,(unsigned long long)c->projection,(unsigned long long)c->validation,(unsigned long long)c->comparisons);
+    }
+    memset(&F.camera_pairs,0,sizeof F.camera_pairs); F.projection_diag_logged=0; F.eligible=0; memset(F.refused,0,sizeof F.refused);
+}
+static void fg_stats_log_authority(void) {
+    LOGV("framegen authority last 300 real: state-reservations=%llu final-depth-copies=%llu compares=%llu recorded=%llu accepted=%llu over-limit=%llu dilated-limit=%.3f%% (ordered clipped unproven VALUE spans; no initial depth snapshot; post-fence/pre-handoff rejection; no recorder wait)",
+        (unsigned long long)F.reservations,(unsigned long long)F.authority_copies,(unsigned long long)F.comparisons,(unsigned long long)F.recorded,(unsigned long long)F.generated_count,(unsigned long long)F.authority_skips,F.unknown_limit);
+    if (F.authority_samples) LOGV("framegen authority unknown raw mean=%.3f%% max=%.3f%% dilated mean=%.3f%% max=%.3f%% halo+tile-growth mean=%.3f percentage-points samples=%llu (coarse4x4 conservative mask, native-pixel-weighted partial edges; tile-only overhead not separately measured; extra unknown may reject more pairs at unchanged limit)",
+        F.raw_unknown_sum/F.authority_samples*100,F.raw_unknown_max*100,F.dilated_unknown_sum/F.authority_samples*100,F.dilated_unknown_max*100,(F.dilated_unknown_sum-F.raw_unknown_sum)/F.authority_samples*100,(unsigned long long)F.authority_samples);
+    else LOGV("framegen authority unknown raw/dilated mean/max unavailable (no completed comparisons)");
+    if (F.motion_samples) LOGV("framegen authority pair motion UV bound x mean=%.7f max=%.7f y mean=%.7f max=%.7f radius-texels x mean=%.3f max=%.0f y mean=%.3f max=%.0f samples=%llu (native-pixel radii unchanged; coarse4x4 mask; certified all-final-depth range; hard UV cap .04; pair dilation+compose timed once)",
+        F.motion_sum[0]/F.motion_samples,F.motion_max[0],F.motion_sum[1]/F.motion_samples,F.motion_max[1],F.radius_sum[0]/F.motion_samples,F.radius_max[0],F.radius_sum[1]/F.motion_samples,F.radius_max[1],(unsigned long long)F.motion_samples);
+    if (F.authority_cost_samples) LOGV("framegen authority total GPU mean=%.3f ms max=%.3f ms samples=%llu (state initialization + clipped before/after copies/VALUE updates + one final raw copy/prefix/range/readback; pair dilation charged once inside replay)",
+        F.authority_sum_ms/F.authority_cost_samples,F.authority_max_ms,(unsigned long long)F.authority_cost_samples);
+    else LOGV("framegen authority total GPU mean/max unavailable (no completed comparisons)");
+    LOGV("framegen authority spans last 300 real: before-copies=%llu after-copies=%llu completed-spans=%llu copied-native-texels=%llu failed-roots=%llu (ordinary and experimental share bounded state; scissor bounds copies, NOT certified coverage)",
+        (unsigned long long)F.span_before_copies,(unsigned long long)F.span_after_copies,(unsigned long long)F.span_count,(unsigned long long)F.span_copied_texels,(unsigned long long)F.span_failed);
+    if (F.span_cost_samples) LOGV("framegen authority clipped-copy+VALUE-update GPU mean=%.3f ms max=%.3f ms samples=%llu (sum of before/after work only; excludes real draws and proven gaps)",
+        F.span_sum_ms/F.span_cost_samples,F.span_max_ms,(unsigned long long)F.span_cost_samples);
+    else LOGV("framegen authority clipped-copy+VALUE-update GPU unavailable (no completed span work)");
+    if (F.init_only_samples) LOGV("framegen authority refused-capture initialization+span-work GPU mean=%.3f ms max=%.3f ms samples=%llu (no final copy/census)",F.init_only_sum_ms/F.init_only_samples,F.init_only_max_ms,(unsigned long long)F.init_only_samples);
+    if (vk_fg_uncertified_plane()) { LOGV("framegen UNCERTIFIED plane last 300 real: final-unknown-pixels-admitted=%llu source-frames=%llu final-compared=%llu (fenced sources counted once including warmup/refused captures; only changed exact-qualified spans may assume VALUE authority; NOT proof/error bound; ordinary span costs reported separately)", (unsigned long long)F.uncertified_pixels,(unsigned long long)F.uncertified_sources,(unsigned long long)F.uncertified_compared); F.uncertified_pixels=F.uncertified_sources=F.uncertified_compared=0; }
+    F.reservations=F.authority_copies=F.comparisons=F.authority_skips=F.recorded=0; F.span_before_copies=F.span_after_copies=F.span_count=F.span_copied_texels=F.span_failed=0;
+    F.span_cost_samples=0; F.span_sum_ms=F.span_max_ms=0; F.authority_samples=F.authority_cost_samples=0; F.raw_unknown_sum=F.raw_unknown_max=F.dilated_unknown_sum=F.dilated_unknown_max=0;
+    F.authority_sum_ms=F.authority_max_ms=0; F.init_only_samples=0; F.init_only_sum_ms=F.init_only_max_ms=0;
+    memset(F.motion_sum,0,sizeof F.motion_sum); memset(F.motion_max,0,sizeof F.motion_max); memset(F.radius_sum,0,sizeof F.radius_sum); memset(F.radius_max,0,sizeof F.radius_max); F.motion_samples=0;
+}
 void vk_fg_stats(void) {
     if (atomic_load_explicit(&fg_config,memory_order_relaxed) < 1) return;
-    int qcom=vk_fg_qcom_active();
-    if (F.real==299) vk_fg_qcom_stats();
-    int lsfg=vk_fg_lsfg_active();
-    if (F.real==299) vk_fg_lsfg_stats();
+    int qcom=vk_fg_qcom_active(); if (F.real==299) vk_fg_qcom_stats();
+    int lsfg=vk_fg_lsfg_active(); if (F.real==299) vk_fg_lsfg_stats();
     pthread_mutex_lock(&fg_stats_mu);
     if (++F.real == 300) {
-        fg_profile_stats();
-        fg_writer_stats();
-        if (vk_fg_interpolating()) LOGV("framegen %s last 300 real: synthesized=%llu skipped budget=%llu camera-cut=%llu history=%llu late=%llu inputs(boundary/chain/depth/capacity/structure/backoff)=%llu/%llu/%llu/%llu/%llu/%llu latency-added=%s%s",
-            lsfg ? "lsfg-present" : qcom ? "qcom-present" : "interp",
-            (unsigned long long)F.generated_count,(unsigned long long)F.budget_skips,
-            (unsigned long long)F.cuts,(unsigned long long)F.history_skips,(unsigned long long)F.late_skips,
-            (unsigned long long)F.refused[VK_FG_NO_BOUNDARY],(unsigned long long)F.refused[VK_FG_CHAIN_BROKEN],
-            (unsigned long long)F.refused[VK_FG_DEPTH_LOST],(unsigned long long)F.refused[VK_FG_TRACK_CAPACITY],
-            (unsigned long long)F.refused[VK_FG_STRUCTURE_CHANGED],(unsigned long long)F.refused[VK_FG_BACKOFF],
-            qcom ? "no-real-tick" : "one-real-tick",
-            qcom ? (vk_fg_lead_refreshes()==1 ? "+one-physical-refresh (about16.7 ms at60Hz)" :
-                "+two-physical-refreshes (about33.3 ms at60Hz)") :
-            vk_fg_locked() ? (vk_fg_lead_refreshes()==1 ?
-                "+one-physical-refresh (about50 ms total at60Hz)" :
-                "+two-physical-refreshes (about66.7 ms total at60Hz)") : " (33.333 ms)");
-        if (vk_fg_interpolating()) LOGV("framegen depth-range last 300 real: newly-accepted-pairs=%llu generated=%llu (independent source near/far, bounded smooth FOV, unchanged pose/aspect/extent/off-center cut guards)",
-            (unsigned long long)F.depth_range_pairs,(unsigned long long)F.depth_range_generated);
-        F.depth_range_pairs=F.depth_range_generated=0;
-        LOGV("framegen budget last 300 real: mode=%s ceiling=%.3f ms pre-skips missing/stale=%llu overload=%llu completion-skips missing=%llu overload=%llu",
-            F.budget_override ? "fixed-override-incremental" : vk_fg_interpolating() ? "adaptive-total" : "legacy-incremental",
-            F.budget_ms,(unsigned long long)F.budget_pre_skips[0],(unsigned long long)F.budget_pre_skips[1],
-            (unsigned long long)F.budget_post_skips[0],(unsigned long long)F.budget_post_skips[1]);
-        if (vk_fg_adaptive()) LOGV("[framegen-prepared-budget] mode=predictive-real-max-latest-two-complete measured-incremental ceiling_ms=%.3f actual_audits=%llu actual_overshoots=%llu actual_missing=%llu completion_decisions=%llu completion_accepts=%llu backoff_intervals=%u cooldown_until=%llu (lifetime per arm; ordinary immutable actual aggregate includes ALL charged children; not a strict current-actual publication guarantee)",
-            FG_BUDGET_TARGET_MS,(unsigned long long)F.prepared_budget.audits,
-            (unsigned long long)F.prepared_budget.overshoots,(unsigned long long)F.prepared_budget.missing,
-            (unsigned long long)F.prepared_budget.decisions,(unsigned long long)F.prepared_budget.publications,
-            FG_QCOM_PREPARED_BACKOFF,(unsigned long long)F.prepared_budget.cooldown_until);
-        if (vk_fg_adaptive() && fg_adaptive_budget_selected())
-            LOGV("[framegen-adaptive-budget] mode=stale-incremental-estimate ceiling_ms=%.3f window=%u fresh_age=%u stale_admits=%llu stale_refusals=%llu stale_reservations=%llu stale_audits=%llu stale_overshoots=%llu stale_missing=%llu probes=%llu backoff_intervals=%u (lifetime per arm; same ceiling, immutable audits and back-off; probes only without a measured incremental in window)",
-                FG_BUDGET_TARGET_MS,(unsigned)FG_BUDGET_WINDOW,(unsigned)FG_BUDGET_MAX_AGE,
-                (unsigned long long)F.adaptive_budget_admits,(unsigned long long)F.adaptive_budget_refusals,
-                (unsigned long long)F.adaptive_budget_reservations,(unsigned long long)F.adaptive_budget_audits,
-                (unsigned long long)F.adaptive_budget_overshoots,(unsigned long long)F.adaptive_budget_missing,
-                (unsigned long long)F.budget.probes,FG_QCOM_PREPARED_BACKOFF);
-        if (F.budget_samples) LOGV("framegen headroom decision mean real=%.3f ms incremental=%.3f ms total=%.3f ms min-tick-margin=%.3f ms samples=%llu last frame=%llu tickets=%llu..%llu real/incremental/total/margin=%.3f/%.3f/%.3f/%.3f ms (adaptive REAL may be predicted; measured incremental; immutable actual aggregates/overshoots reported separately)",
-            F.budget_real_sum/F.budget_samples,F.budget_incremental_sum/F.budget_samples,F.budget_total_sum/F.budget_samples,
-            F.budget_margin_min,(unsigned long long)F.budget_samples,(unsigned long long)F.budget_last.frame,
-            (unsigned long long)F.budget_last.first,(unsigned long long)F.budget_last.last,
-            F.budget_last.real_ms,F.budget_last.incremental_ms,F.budget_last.total_ms,F.budget_last.margin_ms);
-        else if (vk_fg_interpolating() && !F.budget_override)
-            LOGV("framegen headroom decision real/incremental/total/margin unavailable (no complete measured incremental decision)");
-        if (vk_fg_interpolating() && !F.budget_override && F.budget_pre_frame && F.budget_pre.status != FG_BUDGET_MISSING)
-            LOGV("framegen headroom latest pre-admission p90 real/incremental/total/tick-margin=%.3f/%.3f/%.3f/%.3f ms real-p90-frame=%llu tickets=%llu..%llu real/incremental-samples=%u/%u incremental-frame=%llu tickets=%llu..%llu probe=%u reason=%u retry-frame=%llu (nan=unmeasured probe cost, not zero)",
-                F.budget_pre.real_ms,F.budget_pre.incremental_ms,F.budget_pre.total_ms,F.budget_pre.margin_ms,
-                (unsigned long long)F.budget_pre.frame,(unsigned long long)F.budget_pre.first,(unsigned long long)F.budget_pre.last,
-                F.budget_pre.real_samples,F.budget_pre.incremental_samples,
-                (unsigned long long)F.budget_pre.incremental_frame,
-                (unsigned long long)F.budget_pre.incremental_first,(unsigned long long)F.budget_pre.incremental_last,
-                F.budget_pre.probe,F.budget_pre.reason,(unsigned long long)F.budget_pre.retry_frame);
-        if (vk_fg_interpolating() && !F.budget_override)
-            LOGV("framegen headroom bootstrap/feedback: lifetime reservations=%llu probes=%llu last-probe=%llu real-fence samples=%llu missed-target=%llu correlated-pauses=%llu cooldown-until=%llu backoff=%u (framework present fences >=one refresh after real target; NOT hardware scanout)",
-                (unsigned long long)F.budget.reservations,(unsigned long long)F.budget.probes,
-                (unsigned long long)F.budget.last_probe,(unsigned long long)F.budget_feedback_samples,
-                (unsigned long long)F.budget_feedback_late,(unsigned long long)F.budget_feedback_pauses,
-                (unsigned long long)F.budget.cooldown_until,F.budget.feedback_backoff);
-        F.budget_feedback_samples=F.budget_feedback_late=F.budget_feedback_pauses=0;
-        memset(F.budget_pre_skips,0,sizeof F.budget_pre_skips); memset(F.budget_post_skips,0,sizeof F.budget_post_skips);
-        F.budget_samples=0; F.budget_real_sum=F.budget_incremental_sum=F.budget_total_sum=F.budget_margin_min=0;
-        F.budget_skips=F.cuts=F.history_skips=F.late_skips=0;
-        if (F.diag) LOGV("[framegen-diag] last 300 real: eligible=%llu generated=%llu eligible-not-generated=%llu refused boundary=%llu chain=%llu depth=%llu capacity=%llu structure=%llu suspended=%llu backoff=%llu",
-            (unsigned long long)F.eligible,(unsigned long long)F.generated_count,
-            (unsigned long long)(F.eligible >= F.generated_count ? F.eligible-F.generated_count : 0),
-            (unsigned long long)F.refused[VK_FG_NO_BOUNDARY],(unsigned long long)F.refused[VK_FG_CHAIN_BROKEN],
-            (unsigned long long)F.refused[VK_FG_DEPTH_LOST],(unsigned long long)F.refused[VK_FG_TRACK_CAPACITY],
-            (unsigned long long)F.refused[VK_FG_STRUCTURE_CHANGED],(unsigned long long)F.refused[VK_FG_SUSPENDED],
-            (unsigned long long)F.refused[VK_FG_BACKOFF]);
-        if (F.diag) LOGV("[framegen-generate-admission] state=%llu prediction=%llu capture=%llu output-busy=%llu extent=%llu allocation=%llu recorded=%llu",
-            (unsigned long long)F.admission[0],(unsigned long long)F.admission[1],
-            (unsigned long long)F.admission[2],(unsigned long long)F.admission[3],
-            (unsigned long long)F.admission[4],(unsigned long long)F.admission[5],
-            (unsigned long long)F.admission[6]);
-        memset(F.admission,0,sizeof F.admission);
-        if (F.job_trace) for (unsigned i=0;i<FG_AUTH_FAILURES;i++) {
-            uint64_t total=F.authority_failures[i];
-            LOGV("[framegen-authority-begin-counts] real=%llu reason=%s last300=%llu total=%llu; failed-calls-not-probe-skips",
-                (unsigned long long)F.budget_frame,fg_authority_failure_names[i],
-                (unsigned long long)(total-F.authority_failures_reported[i]),(unsigned long long)total);
-            F.authority_failures_reported[i]=total;
-        }
-        if (F.job_trace && (atomic_load_explicit(&fg_adaptive_lean_config,memory_order_relaxed)==1 ||
-                atomic_load_explicit(&fg_adaptive_direct_config,memory_order_relaxed)==1)) {
-            uint64_t d[VK_FG_LEAN_COUNTS];
-            for (unsigned i=0;i<VK_FG_LEAN_COUNTS;i++) {
-                d[i]=F.lean_counts[i]-F.lean_reported[i]; F.lean_reported[i]=F.lean_counts[i];
-            }
-            LOGV("[framegen-adaptive-lean-summary] real=%llu last300 lean-sources=%llu skipped scene-copies=%llu depth-copies=%llu real-copies=%llu unknown-writer-draws=%llu authority-roots=%llu direct-out=%llu direct-out-fallback=%llu (unknown-writer draws bound the skipped spans/pass splits from above; each root also skipped its init and final census/readback)",
-                (unsigned long long)F.budget_frame,(unsigned long long)d[VK_FG_LEAN_SOURCES],
-                (unsigned long long)d[VK_FG_LEAN_SCENE_COPIES],(unsigned long long)d[VK_FG_LEAN_DEPTH_COPIES],
-                (unsigned long long)d[VK_FG_LEAN_REAL_COPIES],(unsigned long long)d[VK_FG_LEAN_UNKNOWN_DRAWS],
-                (unsigned long long)d[VK_FG_LEAN_ROOTS],(unsigned long long)d[VK_FG_LEAN_DIRECT],
-                (unsigned long long)d[VK_FG_LEAN_DIRECT_FALLBACK]);
-        }
-        if (F.diag) {
-            fg_camera_pair_window *c=&F.camera_pairs;
-            if (c->samples) LOGV("[framegen-camera] last 300 real: reject translation=%llu rotation=%llu projection=%llu validation=%llu relative-rotation-deg mean=%.4f max=%.4f translation-distance mean=%.5f max=%.5f compared-pairs=%llu pose-samples=%llu (first fired predicate; invalid poses excluded; DIAG only)",
-                (unsigned long long)c->translation,(unsigned long long)c->rotation,
-                (unsigned long long)c->projection,(unsigned long long)c->validation,
-                c->rotation_sum/c->samples,c->rotation_max,
-                c->translation_sum/c->samples,c->translation_max,
-                (unsigned long long)c->comparisons,(unsigned long long)c->samples);
-            else LOGV("[framegen-camera] last 300 real: reject translation=%llu rotation=%llu projection=%llu validation=%llu compared-pairs=%llu pose-samples=0; relative pose mean/max unavailable",
-                (unsigned long long)c->translation,(unsigned long long)c->rotation,
-                (unsigned long long)c->projection,(unsigned long long)c->validation,
-                (unsigned long long)c->comparisons);
-        }
-        memset(&F.camera_pairs,0,sizeof F.camera_pairs);
-        F.projection_diag_logged=0;
-        F.eligible=0; memset(F.refused,0,sizeof F.refused);
-        LOGV("framegen authority last 300 real: state-reservations=%llu final-depth-copies=%llu compares=%llu recorded=%llu accepted=%llu over-limit=%llu dilated-limit=%.3f%% (ordered clipped unproven VALUE spans; no initial depth snapshot; post-fence/pre-handoff rejection; no recorder wait)",
-            (unsigned long long)F.reservations,(unsigned long long)F.authority_copies,
-            (unsigned long long)F.comparisons,(unsigned long long)F.recorded,
-            (unsigned long long)F.generated_count,(unsigned long long)F.authority_skips,F.unknown_limit);
-        if (F.authority_samples) LOGV("framegen authority unknown raw mean=%.3f%% max=%.3f%% dilated mean=%.3f%% max=%.3f%% halo+tile-growth mean=%.3f percentage-points samples=%llu (coarse4x4 conservative mask, native-pixel-weighted partial edges; tile-only overhead not separately measured; extra unknown may reject more pairs at unchanged limit)",
-            F.raw_unknown_sum/F.authority_samples*100,F.raw_unknown_max*100,
-            F.dilated_unknown_sum/F.authority_samples*100,F.dilated_unknown_max*100,
-            (F.dilated_unknown_sum-F.raw_unknown_sum)/F.authority_samples*100,
-            (unsigned long long)F.authority_samples);
-        else LOGV("framegen authority unknown raw/dilated mean/max unavailable (no completed comparisons)");
-        if (F.motion_samples) LOGV("framegen authority pair motion UV bound x mean=%.7f max=%.7f y mean=%.7f max=%.7f radius-texels x mean=%.3f max=%.0f y mean=%.3f max=%.0f samples=%llu (native-pixel radii unchanged; coarse4x4 mask; certified all-final-depth range; hard UV cap .04; pair dilation+compose timed once)",
-            F.motion_sum[0]/F.motion_samples,F.motion_max[0],F.motion_sum[1]/F.motion_samples,F.motion_max[1],
-            F.radius_sum[0]/F.motion_samples,F.radius_max[0],F.radius_sum[1]/F.motion_samples,F.radius_max[1],
-            (unsigned long long)F.motion_samples);
-        if (F.authority_cost_samples) LOGV("framegen authority total GPU mean=%.3f ms max=%.3f ms samples=%llu (state initialization + clipped before/after copies/VALUE updates + one final raw copy/prefix/range/readback; pair dilation charged once inside replay)",
-            F.authority_sum_ms/F.authority_cost_samples,F.authority_max_ms,(unsigned long long)F.authority_cost_samples);
-        else LOGV("framegen authority total GPU mean/max unavailable (no completed comparisons)");
-        LOGV("framegen authority spans last 300 real: before-copies=%llu after-copies=%llu completed-spans=%llu copied-native-texels=%llu failed-roots=%llu (ordinary and experimental share bounded state; scissor bounds copies, NOT certified coverage)",
-            (unsigned long long)F.span_before_copies,(unsigned long long)F.span_after_copies,
-            (unsigned long long)F.span_count,(unsigned long long)F.span_copied_texels,(unsigned long long)F.span_failed);
-        if (F.span_cost_samples) LOGV("framegen authority clipped-copy+VALUE-update GPU mean=%.3f ms max=%.3f ms samples=%llu (sum of before/after work only; excludes real draws and proven gaps)",
-            F.span_sum_ms/F.span_cost_samples,F.span_max_ms,(unsigned long long)F.span_cost_samples);
-        else LOGV("framegen authority clipped-copy+VALUE-update GPU unavailable (no completed span work)");
-        if (F.init_only_samples) LOGV("framegen authority refused-capture initialization+span-work GPU mean=%.3f ms max=%.3f ms samples=%llu (no final copy/census)",
-            F.init_only_sum_ms/F.init_only_samples,F.init_only_max_ms,(unsigned long long)F.init_only_samples);
-        if (vk_fg_uncertified_plane()) {
-            LOGV("framegen UNCERTIFIED plane last 300 real: final-unknown-pixels-admitted=%llu source-frames=%llu final-compared=%llu (fenced sources counted once including warmup/refused captures; only changed exact-qualified spans may assume VALUE authority; NOT proof/error bound; ordinary span costs reported separately)",
-                (unsigned long long)F.uncertified_pixels,(unsigned long long)F.uncertified_sources,
-                (unsigned long long)F.uncertified_compared);
-            F.uncertified_pixels=F.uncertified_sources=F.uncertified_compared=0;
-        }
-        F.reservations=F.authority_copies=F.comparisons=F.authority_skips=F.recorded=0;
-        F.span_before_copies=F.span_after_copies=F.span_count=F.span_copied_texels=F.span_failed=0;
-        F.span_cost_samples=0; F.span_sum_ms=F.span_max_ms=0;
-        F.authority_samples=F.authority_cost_samples=0;
-        F.raw_unknown_sum=F.raw_unknown_max=F.dilated_unknown_sum=F.dilated_unknown_max=0;
-        F.authority_sum_ms=F.authority_max_ms=0;
-        F.init_only_samples=0; F.init_only_sum_ms=F.init_only_max_ms=0;
-        memset(F.motion_sum,0,sizeof F.motion_sum); memset(F.motion_max,0,sizeof F.motion_max);
-        memset(F.radius_sum,0,sizeof F.radius_sum); memset(F.radius_max,0,sizeof F.radius_max);
-        F.motion_samples=0;
+        fg_profile_stats(); fg_writer_stats(); fg_stats_log_headroom(qcom, lsfg); fg_stats_log_diag(); fg_stats_log_authority();
         if (F.measured) LOGV("framegen last 300 real: generated=%llu skipped=%llu GPU charged-stage-sum mean=%.3f ms max=%.3f ms samples=%llu%s",
-            (unsigned long long)F.generated_count,(unsigned long long)(F.real >= F.generated_count ? F.real-F.generated_count : 0),F.sum_ms/F.measured,F.max_ms,
-            (unsigned long long)F.measured,atomic_load_explicit(&fg_suspended,memory_order_relaxed)?" suspended":"");
+            (unsigned long long)F.generated_count,(unsigned long long)(F.real >= F.generated_count ? F.real-F.generated_count : 0),F.sum_ms/F.measured,F.max_ms,(unsigned long long)F.measured,atomic_load_explicit(&fg_suspended,memory_order_relaxed)?" suspended":"");
         else LOGV("framegen last 300 real: generated=%llu skipped=%llu GPU mean/max unavailable (no completed samples)%s",
-            (unsigned long long)F.generated_count,(unsigned long long)(F.real >= F.generated_count ? F.real-F.generated_count : 0),
-            atomic_load_explicit(&fg_suspended,memory_order_relaxed)?" suspended":"");
+            (unsigned long long)F.generated_count,(unsigned long long)(F.real >= F.generated_count ? F.real-F.generated_count : 0),atomic_load_explicit(&fg_suspended,memory_order_relaxed)?" suspended":"");
         F.real=F.generated_count=F.measured=0; F.sum_ms=F.max_ms=0;
     }
     pthread_mutex_unlock(&fg_stats_mu);
