@@ -18,6 +18,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include "mprotect_stats.h"
+#include "totk_svc_fast.h"
 
 #include <time.h>
 #include <unistd.h>
@@ -52,14 +53,17 @@ static uint64_t alias_size(void){if(!alias_len)alias_len=alias_requested();retur
 #define STACK_SIZE 0x10000000ULL
 #define HEAP_OFF (STACK_OFF+STACK_SIZE+0x10000000ULL)
 static uint8_t *alias_space,*low_space,*heap;
-static size_t heap_size;
-static unsigned char alias_pages[ALIAS_SIZE_MAX/4096];
+static _Atomic size_t heap_size;
+static _Alignas(8) unsigned char alias_pages[ALIAS_SIZE_MAX/4096];
 /* 4 KiB guest pages that are unmapped but whose host 16 KiB page is still committed with old contents: only these are
    zeroed when mapped again. Every other free page is untouched anonymous memory (zero on first touch), so mapping does
    not make it resident; a fully free 16 KiB host page is handed back to the system (fresh anonymous mapping). On the
    iPhone, where the app may use about 4 GB in total, memory the game maps but never touches must stay unbacked. */
 static unsigned char alias_stale[ALIAS_SIZE_MAX/4096];
-static uint64_t alias_bytes;
+static _Atomic uint64_t alias_bytes;
+static _Atomic uint32_t g_mem_seq = 2;
+static _Atomic uint32_t g_smap_count;
+static _Thread_local totk_qmem_tls g_qmem_tls;
 static uint8_t user_exception_context[0x1000] __attribute__((aligned(0x1000)));
 #define SYSTEM_RESOURCE_BUDGET (32ULL<<20)
 #ifdef GAME_BOTW
@@ -180,7 +184,8 @@ static int overlaps(uint64_t a,uint64_t n,uint64_t b,uint64_t m){return a<b+m&&b
 static uint64_t stack_move(int unmap,uint64_t dst,uint64_t src,uint64_t size){
  if(!size||((dst|src|size)&4095))return 0xcc01;
  if(dst<STACK_START||size>STACK_SIZE||dst-STACK_START>STACK_SIZE-size)return 0xdc01;
- int inHeap=src>=(uintptr_t)heap&&size<=heap_size&&src-(uintptr_t)heap<=heap_size-size;
+ size_t hcur=atomic_load_explicit(&heap_size,memory_order_acquire);
+ int inHeap=src>=(uintptr_t)heap&&size<=hcur&&src-(uintptr_t)heap<=hcur-size;
  uint64_t aliasStart=ALIAS_START;
  int inAlias=src>=aliasStart&&size<=ALIAS_SIZE&&src-aliasStart<=ALIAS_SIZE-size;
  if(!inHeap&&!inAlias)return 0xdc01;
@@ -193,7 +198,8 @@ static uint64_t stack_move(int unmap,uint64_t dst,uint64_t src,uint64_t size){
  if(unmap){
   if(found==nstack_maps){pthread_mutex_unlock(&memory_lock);return 0xd401;}
   if(shi>slo&&runtime_mprotect((void *)slo,shi-slo,PROT_READ|PROT_WRITE,NVN_DIRTY_MP_STACK))runtime_fail("restore moved stack source");
-  memcpy((void *)src,(const void *)dst,size);stack_maps[found]=stack_maps[--nstack_maps];
+  totk_svc_seq_begin(&g_mem_seq); memcpy((void *)src,(const void *)dst,size);stack_maps[found]=stack_maps[--nstack_maps];
+  atomic_store_explicit(&g_smap_count,nstack_maps,memory_order_release);
   for(uint64_t page=lo;page<hi;page+=0x4000){int used=0;for(unsigned i=0;i<nstack_maps;i++)if(overlaps(page,0x4000,stack_maps[i].dst,stack_maps[i].size))used=1;
    if(!used&&runtime_mprotect((void *)page,0x4000,PROT_NONE,NVN_DIRTY_MP_STACK))runtime_fail("decommit moved stack");}
  }else{
@@ -201,9 +207,10 @@ static uint64_t stack_move(int unmap,uint64_t dst,uint64_t src,uint64_t size){
   for(unsigned i=0;i<nstack_maps;i++)if(overlaps(dst,size,stack_maps[i].dst,stack_maps[i].size)||overlaps(src,size,stack_maps[i].src,stack_maps[i].size)){pthread_mutex_unlock(&memory_lock);return 0xdc01;}
   if(runtime_mprotect((void *)lo,hi-lo,PROT_READ|PROT_WRITE,NVN_DIRTY_MP_STACK))runtime_fail("commit moved stack");memcpy((void *)dst,(const void *)src,size);
   if(shi>slo&&runtime_mprotect((void *)slo,shi-slo,PROT_NONE,NVN_DIRTY_MP_STACK))runtime_fail("protect moved stack source");
-  stack_maps[nstack_maps++]=(StackMap){dst,src,size};
+  totk_svc_seq_begin(&g_mem_seq); stack_maps[nstack_maps++]=(StackMap){dst,src,size};
+  atomic_store_explicit(&g_smap_count,nstack_maps,memory_order_release);
  }
- pthread_mutex_unlock(&memory_lock);return 0;
+ totk_svc_seq_end(&g_mem_seq); pthread_mutex_unlock(&memory_lock);return 0;
 }
 static uint64_t alias_map(int unmap,uint64_t addr,uint64_t size){
  uint64_t start=ALIAS_START;
@@ -216,31 +223,35 @@ static uint64_t alias_map(int unmap,uint64_t addr,uint64_t size){
  /* Physical-memory resource reservation failure is LimitReached (132), not
     InvalidCurrentMemory (106). The original SDK maps LimitReached to its
     recoverable out-of-memory result; 0xd401 makes AllocateMemoryPages abort. */
- if(!unmap&&fresh+alias_bytes+heap_size+runtime_image_bytes()>APP_POOL){
+ if(!unmap&&fresh+atomic_load_explicit(&alias_bytes,memory_order_relaxed)+atomic_load_explicit(&heap_size,memory_order_acquire)+runtime_image_bytes()>APP_POOL){
   pthread_mutex_unlock(&memory_lock);
   const char *negative=getenv("TOTK_PROBE_NEGATIVE");
   return negative&&atoi(negative)==14?0xd401:0x10801;
  }
  if(unmap){
   for(unsigned i=0;i<nstack_maps;i++)if(overlaps(addr,size,stack_maps[i].src,stack_maps[i].size)){pthread_mutex_unlock(&memory_lock);return 0xdc01;}
-  uint64_t released=0;for(unsigned i=0;i<count;i++)if(alias_pages[first+i]){alias_pages[first+i]=0;alias_stale[first+i]=1;released+=4096;}alias_bytes-=released;
+  totk_svc_seq_begin(&g_mem_seq);
+  uint64_t released=0;for(unsigned i=0;i<count;i++)if(alias_pages[first+i]){alias_pages[first+i]=0;alias_stale[first+i]=1;released+=4096;}
+  atomic_fetch_sub_explicit(&alias_bytes,released,memory_order_release);
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
   for(uint64_t page=low;page<high;page+=0x4000){unsigned p=(unsigned)((page-start)/4096);if(!alias_pages[p]&&!alias_pages[p+1]&&!alias_pages[p+2]&&!alias_pages[p+3]){
    if(!decommit_unit(page))runtime_fail("decommit physical alias page");
    memset(alias_stale+p,0,4);}}
  }else if(fresh){
+  totk_svc_seq_begin(&g_mem_seq);
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
   if(runtime_mprotect((void *)low,high-low,PROT_READ|PROT_WRITE,NVN_DIRTY_MP_VM_COMMIT))runtime_fail("commit physical alias pages");
   for(unsigned i=0;i<count;i++)if(!alias_pages[first+i]){   /* new pages only: zero-filled like fresh pool pages */
    if(alias_stale[first+i]){memset((void *)(addr+(uint64_t)i*4096),0,4096);alias_stale[first+i]=0;}
    alias_pages[first+i]=1;}
-  alias_bytes+=fresh;
+  atomic_fetch_add_explicit(&alias_bytes,fresh,memory_order_release);
  }
+ if(unmap||fresh)totk_svc_seq_end(&g_mem_seq);
  pthread_mutex_unlock(&memory_lock);return 0;
 }
 uint64_t runtime_heap_base(void){return (uintptr_t)heap;}
 /* Guest memory the game has committed (heap size + mapped alias pages), for memory reports (iOS app monitor). */
-void runtime_guest_committed(uint64_t *heap_bytes,uint64_t *alias_mapped){*heap_bytes=heap_size;*alias_mapped=alias_bytes;}
+void runtime_guest_committed(uint64_t *heap_bytes,uint64_t *alias_mapped){*heap_bytes=atomic_load_explicit(&heap_size,memory_order_acquire);*alias_mapped=atomic_load_explicit(&alias_bytes,memory_order_acquire);}
 /* Physical memory behind the guest regions (stack+heap and alias): resident pages, of which dirty, and pages the system
    compressed. Committed sizes overstate what the game uses; these are what count against the iOS memory limit. */
 #if defined(__APPLE__)
@@ -444,16 +455,18 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
  if(runtime_ipc_svc(num,r))return r[0];
  memory_init();
  switch(num) {
- case 0x02:r[0]=runtime_module_permission(r[0],r[1],(unsigned)r[2]);return r[0];
- case 0x03:r[0]=runtime_module_lock_permission(r[0],r[1],(unsigned)r[2],(unsigned)r[3]);return r[0];
+ case 0x02:totk_svc_seq_begin(&g_mem_seq);r[0]=runtime_module_permission(r[0],r[1],(unsigned)r[2]);totk_svc_seq_end(&g_mem_seq);return r[0];
+ case 0x03:totk_svc_seq_begin(&g_mem_seq);r[0]=runtime_module_lock_permission(r[0],r[1],(unsigned)r[2],(unsigned)r[3]);totk_svc_seq_end(&g_mem_seq);return r[0];
  case 0x29: {
   uint64_t value=0;unsigned id=(unsigned)r[1];
   switch(id) {
   case 0:value=7;break;case 1:value=0x0ffffffff0000000ULL;break;
   case 2:value=ALIAS_START;break;case 3:value=ALIAS_SIZE;break;
   case 4:value=(uintptr_t)heap;break;case 5:value=HEAP_CAP;break;
-  case 6:case 21:value=APP_POOL;break;case 7:case 22:value=runtime_image_bytes()+heap_size+alias_bytes+(!heap_size?startup_mem_reserve():0);
-   { static unsigned polls; if(mem_log_on()&&(polls++%600)==0) fprintf(stderr,"[totk-mem] GetInfo(%u) total=%#llx used=%#llx image=%#llx heap=%#llx alias=%#llx\n",id,(unsigned long long)APP_POOL,(unsigned long long)value,(unsigned long long)runtime_image_bytes(),(unsigned long long)heap_size,(unsigned long long)alias_bytes); }
+  case 6:case 21:value=APP_POOL;break;case 7:case 22:{
+   size_t hs=atomic_load_explicit(&heap_size,memory_order_acquire);uint64_t ab=atomic_load_explicit(&alias_bytes,memory_order_acquire);
+   value=runtime_image_bytes()+hs+ab+(!hs?startup_mem_reserve():0);
+   { static unsigned polls; if(mem_log_on()&&(polls++%600)==0) fprintf(stderr,"[totk-mem] GetInfo(%u) total=%#llx used=%#llx image=%#llx heap=%#llx alias=%#llx\n",id,(unsigned long long)APP_POOL,(unsigned long long)value,(unsigned long long)runtime_image_bytes(),(unsigned long long)hs,(unsigned long long)ab); }}
    break;
   case 8:value=0;break;case 10:value=0;break;
   case 11:arc4random_buf(&value,8);break;
@@ -469,39 +482,66 @@ uint64_t runtime_svc(unsigned num,uint64_t *r,const char *module,uint64_t offset
   r[0]=0;r[1]=value;return 0;
  }
  case 0x2c:case 0x2d:{uint64_t a=r[0],n=r[1];r[0]=alias_map(num==0x2d,a,n);
-  if(mem_log_on())fprintf(stderr,"[totk-mem] %sMapPhysicalMemory %#llx+%#llx -> %#llx alias=%#llx remaining=%#llx\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)(APP_POOL-runtime_image_bytes()-heap_size-alias_bytes));
-  if(r[0])fprintf(stderr,"[totk] %sMapPhysicalMemory %#llx+%#llx failed %#llx (alias %#llx used, heap %#llx)\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)alias_bytes,(unsigned long long)heap_size);return r[0];}
+  if(mem_log_on()){size_t hs=atomic_load_explicit(&heap_size,memory_order_acquire);uint64_t ab=atomic_load_explicit(&alias_bytes,memory_order_acquire);fprintf(stderr,"[totk-mem] %sMapPhysicalMemory %#llx+%#llx -> %#llx alias=%#llx remaining=%#llx\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)ab,(unsigned long long)(APP_POOL-runtime_image_bytes()-hs-ab));}
+  if(r[0]){size_t hs=atomic_load_explicit(&heap_size,memory_order_acquire);uint64_t ab=atomic_load_explicit(&alias_bytes,memory_order_acquire);fprintf(stderr,"[totk] %sMapPhysicalMemory %#llx+%#llx failed %#llx (alias %#llx used, heap %#llx)\n",num==0x2d?"Un":"",(unsigned long long)a,(unsigned long long)n,(unsigned long long)r[0],(unsigned long long)ab,(unsigned long long)hs);}return r[0];}
  case 0x04:case 0x05:r[0]=stack_move(num==5,r[0],r[1],r[2]);return r[0];
  case 0x06: {
   uint64_t addr=r[2],base=addr&~0xfffULL,size=0x1000;unsigned state=0,perm=0,attr=0;
+  if(totk_svc_fast_enabled()){
+   totk_svc_qmem_info ci;
+   if(totk_qmem_lookup(&g_qmem_tls,addr,atomic_load_explicit(&g_mem_seq,memory_order_acquire),&ci)){
+    if(r[0])memcpy((void *)(uintptr_t)r[0],&ci,sizeof(ci));r[0]=0;r[1]=0;return 0;}}
+  int in_alias=addr>=ALIAS_START&&addr<ALIAS_START+ALIAS_SIZE;
+  uint32_t s1=atomic_load_explicit(&g_mem_seq,memory_order_acquire);
+  int lockfree=totk_svc_fast_enabled()&&!in_alias&&!(s1&1u)&&!atomic_load_explicit(&g_smap_count,memory_order_acquire);
+  if(!lockfree)pthread_mutex_lock(&memory_lock);
   uintptr_t top;size_t stack;host_thread_stack(&top,&stack);
-  if(addr>=top-stack&&addr<top){base=top-stack;size=stack;state=0xb;perm=3;}
-  else if(addr>=(uintptr_t)heap&&addr<(uintptr_t)heap+heap_size){base=(uintptr_t)heap;size=heap_size;state=5;perm=3;}
-  else if(addr>=(uintptr_t)low_space&&addr<(uintptr_t)low_space+LOW_SIZE){base=(uintptr_t)low_space;size=LOW_SIZE;if(addr<(uintptr_t)heap){size=(uintptr_t)heap-base;}else{base=(uintptr_t)heap+heap_size;size=(uintptr_t)low_space+LOW_SIZE-base;}}
-  else if(addr>=(uintptr_t)low_space+LOW_SIZE&&addr<ALIAS_START){base=(uintptr_t)low_space+LOW_SIZE;size=ALIAS_START-base;state=0x10;perm=0;}   /* host-owned: Inaccessible */
-  else if(!addr){base=0;size=ASLR_START;state=0;perm=0;}
-  else if(runtime_module_query(addr,&base,&size,&state,&perm,&attr)){}
-  else {state=3;perm=5;}
-  pthread_mutex_lock(&memory_lock);
-  if(addr>=ALIAS_START&&addr<ALIAS_START+ALIAS_SIZE){
-   unsigned p=(unsigned)((addr-ALIAS_START)/4096),low=p,high=p+1;unsigned allocated=alias_pages[p];
-   while(low>0&&alias_pages[low-1]==allocated)low--;while(high<sizeof(alias_pages)&&alias_pages[high]==allocated)high++;
-   base=ALIAS_START+(uint64_t)low*4096;size=(uint64_t)(high-low)*4096;state=allocated?5:0;perm=allocated?3:0;
+  for(int pass=0;pass<2;pass++){
+   base=addr&~0xfffULL;size=0x1000;state=0;perm=0;attr=0;
+   size_t hs=atomic_load_explicit(&heap_size,memory_order_acquire);
+   if(addr>=top-stack&&addr<top){base=top-stack;size=stack;state=0xb;perm=3;}
+   else if(addr>=(uintptr_t)heap&&addr<(uintptr_t)heap+hs){base=(uintptr_t)heap;size=hs;state=5;perm=3;}
+   else if(addr>=(uintptr_t)low_space&&addr<(uintptr_t)low_space+LOW_SIZE){base=(uintptr_t)low_space;size=LOW_SIZE;if(addr<(uintptr_t)heap){size=(uintptr_t)heap-base;}else{base=(uintptr_t)heap+hs;size=(uintptr_t)low_space+LOW_SIZE-base;}}
+   else if(addr>=(uintptr_t)low_space+LOW_SIZE&&addr<ALIAS_START){base=(uintptr_t)low_space+LOW_SIZE;size=ALIAS_START-base;state=0x10;perm=0;}
+   else if(!addr){base=0;size=ASLR_START;state=0;perm=0;}
+   else if(runtime_module_query(addr,&base,&size,&state,&perm,&attr)){}
+   else {state=3;perm=5;}
+   if(!lockfree)break;
+   uint32_t s2=atomic_load_explicit(&g_mem_seq,memory_order_acquire);
+   if(s1==s2&&!atomic_load_explicit(&g_smap_count,memory_order_acquire))break;
+   pthread_mutex_lock(&memory_lock);lockfree=0;}
+  if(!lockfree){
+   if(in_alias){
+    unsigned p=(unsigned)((addr-ALIAS_START)/4096),low=p,high=p+1;
+    if(totk_svc_fast_enabled())totk_alias_scan_run(alias_pages,sizeof(alias_pages),p,&low,&high);
+    else{unsigned allocated=alias_pages[p];while(low>0&&alias_pages[low-1]==allocated)low--;while(high<sizeof(alias_pages)&&alias_pages[high]==allocated)high++;}
+    unsigned allocated=alias_pages[p];
+    base=ALIAS_START+(uint64_t)low*4096;size=(uint64_t)(high-low)*4096;state=allocated?5:0;perm=allocated?3:0;
+   }
+   for(unsigned i=0;i<nstack_maps;i++){
+    StackMap *m=&stack_maps[i];uint64_t end=m->dst+m->size,send=m->src+m->size;
+    if(addr>=m->dst&&addr<end){base=m->dst;size=m->size;state=0xb;perm=3;break;}
+    if(addr>=m->src&&addr<send){base=m->src;size=m->size;state=5;perm=0;attr=4;break;}
+    if(state==0){uint64_t oldEnd=base+size;if(end<=addr&&end>base)base=end;if(m->dst>addr&&m->dst<oldEnd)oldEnd=m->dst;size=oldEnd-base;}
+    else if(state==5){uint64_t oldEnd=base+size;if(send<=addr&&send>base)base=send;if(m->src>addr&&m->src<oldEnd)oldEnd=m->src;size=oldEnd-base;}
+   }
+   s1=atomic_load_explicit(&g_mem_seq,memory_order_acquire);
+   pthread_mutex_unlock(&memory_lock);
   }
-  for(unsigned i=0;i<nstack_maps;i++){
-   StackMap *m=&stack_maps[i];uint64_t end=m->dst+m->size,send=m->src+m->size;
-   if(addr>=m->dst&&addr<end){base=m->dst;size=m->size;state=0xb;perm=3;break;}
-   if(addr>=m->src&&addr<send){base=m->src;size=m->size;state=5;perm=0;attr=4;break;}
-   if(state==0){uint64_t oldEnd=base+size;if(end<=addr&&end>base)base=end;if(m->dst>addr&&m->dst<oldEnd)oldEnd=m->dst;size=oldEnd-base;}
-   else if(state==5){uint64_t oldEnd=base+size;if(send<=addr&&send>base)base=send;if(m->src>addr&&m->src<oldEnd)oldEnd=m->src;size=oldEnd-base;}
-  }pthread_mutex_unlock(&memory_lock);
-  struct {uint64_t base,size;uint32_t state,attr,perm,ipc,device,pad;} info={base,size,state,attr,perm,0,0,0};
+  totk_svc_qmem_info info={base,size,state,attr,perm,0,0,0};
+  if(totk_svc_fast_enabled()&&((addr>=(uintptr_t)low_space&&addr<(uintptr_t)low_space+LOW_SIZE)||in_alias||state==0xb))
+   totk_qmem_store(&g_qmem_tls,s1,&info);
   if(r[0])memcpy((void *)(uintptr_t)r[0],&info,sizeof(info));r[0]=0;r[1]=0;return 0;
  }
- case 0x01:{size_t size=r[1];if(mem_log_on())fprintf(stderr,"[totk-mem] SetHeapSize %#zx (image=%#llx alias=%#llx pool=%#llx)\n",size,(unsigned long long)runtime_image_bytes(),(unsigned long long)alias_bytes,(unsigned long long)APP_POOL);
+ case 0x01:{size_t size=r[1];if(mem_log_on()){uint64_t ab=atomic_load_explicit(&alias_bytes,memory_order_acquire);fprintf(stderr,"[totk-mem] SetHeapSize %#zx (image=%#llx alias=%#llx pool=%#llx)\n",size,(unsigned long long)runtime_image_bytes(),(unsigned long long)ab,(unsigned long long)APP_POOL);}
   if(size>HEAP_CAP||size%0x200000||size+runtime_image_bytes()>APP_POOL){r[0]=0xd401;return r[0];}
-  if(size>heap_size&&runtime_mprotect(heap+heap_size,size-heap_size,PROT_READ|PROT_WRITE,NVN_DIRTY_MP_VM_COMMIT))runtime_fail("commit heap");
-  if(size<heap_size&&runtime_mprotect(heap+size,heap_size-size,PROT_NONE,NVN_DIRTY_MP_VM_DECOMMIT))runtime_fail("decommit heap");heap_size=size;r[0]=0;r[1]=(uintptr_t)heap;return 0;}
+  pthread_mutex_lock(&memory_lock);size_t hs=atomic_load_explicit(&heap_size,memory_order_relaxed);
+  totk_svc_seq_begin(&g_mem_seq);
+  if(size>hs&&runtime_mprotect(heap+hs,size-hs,PROT_READ|PROT_WRITE,NVN_DIRTY_MP_VM_COMMIT))runtime_fail("commit heap");
+  if(size<hs&&runtime_mprotect(heap+size,hs-size,PROT_NONE,NVN_DIRTY_MP_VM_DECOMMIT))runtime_fail("decommit heap");
+  atomic_store_explicit(&heap_size,size,memory_order_release);
+  totk_svc_seq_end(&g_mem_seq);pthread_mutex_unlock(&memory_lock);
+  r[0]=0;r[1]=(uintptr_t)heap;return 0;}
  case 0x0c: r[0]=0;r[1]=44;return 0;
  case 0x0e: r[0]=0;r[1]=0;r[2]=15;return 0;
  case 0x25: {uint64_t id=host_thread_id(pthread_self(),host_thread_port_self());r[0]=0;r[1]=id;return 0;}

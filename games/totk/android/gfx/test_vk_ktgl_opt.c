@@ -26,6 +26,7 @@
 #include "test_vk_ktgl_opt_w21.h"
 #include "test_vk_ktgl_opt_w22.h"
 #include "test_vk_ktgl_opt_w23.h"
+#include "test_vk_ktgl_opt_w24.h"
 #include "nvn_dirty.h"
 #include <assert.h>
 #include <stdint.h>
@@ -297,6 +298,7 @@ int main(void) {
     if (run_ktgl_w21_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w22_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w23_tests(g_fault_mode) != 0) g_fail++;
+    if (run_ktgl_w24_tests(g_fault_mode) != 0) g_fail++;
     printf("ktglopttest: fault_mode=%d failures=%d\n", g_fault_mode, g_fail);
     return g_fail != 0;
 }

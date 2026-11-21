@@ -50,6 +50,7 @@ static inline uintptr_t runtime_host_slots(void) { return 0; }
 #include <dlfcn.h>
 #include <string.h>
 #include "sync_fast.h"
+#include "totk_svc_fast.h"
 #include <sys/ucontext.h>
 
 #if defined(__ANDROID__) && defined(TOTK_ANDROID_APP)
@@ -93,7 +94,11 @@ static inline void fps_block_end(int began) { (void)began; }
 #define H_CUR_THREAD  0xFFFF8000u
 
 enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_SESSION, O_TMEM };   // O_SESSION / O_TMEM: IPC objects owned by ipc.c
-typedef struct event { int signaled; int refs; } event_t;
+typedef totk_svc_ev event_t;
+static totk_svc_thr_table g_thr_fast;
+static totk_svc_h_table g_ipc_h_fast;
+static totk_svc_ev_sys g_ev_fast;
+_Static_assert((int)O_EVENT_R == (int)TOTK_SVC_EV_R && (int)O_EVENT_W == (int)TOTK_SVC_EV_W, "ev enum");
 /* Opt-in, bounded accounting; no allocation or clock reads on the disabled path.
  * All profile state is protected by G, including the present-thread report. */
 enum { SP_SYNC, SP_LOCK, SP_CV, SP_ADDR, SP_SLEEP, SP_YIELD, SP_OTHER, SP_N };
@@ -136,7 +141,7 @@ typedef struct thr {
     int closed;                // 句柄已关：与 exited 同时成立才释放对象（Horizon：线程对象随最后一个引用消失） | Handle closed: the object is freed only when this holds together with exited (Horizon: the thread object goes away with the last reference)
     uint64_t nsvc;             // SVC 次数（现场导出用） | SVC count (for the state dump)
     host_thread_port_t mport;  // 宿主线程端口（取 CPU 时间） | Host thread port (to get CPU time)
-    uint32_t qos;
+    uint32_t qos; totk_svc_thr_meta fast_meta;
     int cur_core;              // virtual core held while running guest code, -1 while blocked / not started
     int preempt;               // a higher-priority thread waits for this thread's core
     uint64_t cseq, core_since; struct thr *cnext;
@@ -1095,11 +1100,13 @@ void runtime_core_hle_return(void) {
    highest core of its mask instead, as Horizon moves a thread whose core left its mask there. */
 static int reported_core(const thr_t *t) {
     if (t->cur_core >= 0) return t->cur_core;
+    int tc = __atomic_load_n(&t->core, __ATOMIC_RELAXED);
 #ifndef GAME_BOTW
-    if (g_ideal_core_fix > 0 && !(t->core >= 0 && t->core < NCORE && ((t->mask >> t->core) & 1)))
-        for (int c = NCORE - 1; c >= 0; c--) if ((t->mask >> c) & 1) return c;
+    uint64_t tm = __atomic_load_n(&t->mask, __ATOMIC_RELAXED);
+    if (g_ideal_core_fix > 0 && !(tc >= 0 && tc < NCORE && ((tm >> tc) & 1)))
+        for (int c = NCORE - 1; c >= 0; c--) if ((tm >> c) & 1) return c;
 #endif
-    return t->core;
+    return tc;
 }
 int runtime_current_core(void) { thr_t *t = me_or_null(); return t ? reported_core(t) : -1; }
 
@@ -1268,7 +1275,9 @@ uint32_t svc_thread_main_init(void) {
     t->started = 1; t->prio = 44; t->core = PROCESS_IDEAL_CORE; t->mask = horizon_cores() ? 1u << PROCESS_IDEAL_CORE : PROCESS_CORE_MASK;
     t->pt = pthread_self(); t->mport = host_thread_port_self();
     t->cur_core = -1;
-    pthread_mutex_lock(&G); profile_get(t); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; core_take(t); pthread_mutex_unlock(&G);
+    pthread_mutex_lock(&G); profile_get(t); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t;
+    totk_svc_thr_pub(&g_thr_fast, &t->fast_meta, t->handle, t->prio, t->core, t->mask, t->id);
+    core_take(t); pthread_mutex_unlock(&G);
 #ifdef GAME_BOTW
     g_main_handle = t->handle;
 #endif
@@ -1387,7 +1396,7 @@ static int sig_obj(uint32_t h, int *bad) {    // 1=已触发（持 G） | 1 = si
     if (i == 0 || i >= MAX_H) { *bad = 1; return 0; }
     switch (g_h[i].type) {
     case O_THREAD: return ((thr_t *)g_h[i].obj)->exited;
-    case O_EVENT_R: return ((event_t *)g_h[i].obj)->signaled;
+    case O_EVENT_R: return totk_svc_ev_is_sig((const event_t *)g_h[i].obj);
     default: *bad = 1; return 0;
     }
 }
@@ -1514,7 +1523,9 @@ int svc_thread(int num, uint64_t *regs) {
         } else { t->core = (int)regs[5]; t->mask = t->core >= 0 ? 1ull << t->core : 7; }   // old TotK bookkeeping
         t->prio = (int)regs[4];
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
-        pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; pthread_mutex_unlock(&G);
+        pthread_mutex_lock(&G); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t;
+        totk_svc_thr_pub(&g_thr_fast, &t->fast_meta, t->handle, t->prio, t->core, t->mask, t->id);
+        pthread_mutex_unlock(&G);
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // also the host-service stack of this guest thread
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // 退出即回收宿主资源（客体经句柄等待，不 join） | Host resources are reclaimed on exit (the guest waits through the handle, no join)
         if (pthread_create(&t->pt, &a, thread_main, t)) die("pthread_create");
@@ -1576,24 +1587,47 @@ int svc_thread(int num, uint64_t *regs) {
 
         return 1;
     }
-    case 0x0C: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; pthread_mutex_unlock(&G);return 1; }
-    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD); if (t) t->prio = (int)regs[1]; regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
-    case 0x0E: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
-                 regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
+    case 0x0C: { if (totk_svc_fast_enabled()) { uint32_t h = (uint32_t)regs[1]; int32_t p = 0;
+                 thr_t *me = (h == H_CUR_THREAD && g_keythr) ? pthread_getspecific(g_keythr) : NULL;
+                 int ok = me ? totk_svc_thr_read(&me->fast_meta, me->handle, &p, NULL, NULL, NULL)
+                             : totk_svc_thr_lookup(&g_thr_fast, h, &p, NULL, NULL, NULL);
+                 if (ok) { regs[0] = 0; regs[1] = (uint64_t)p; return 1; } }
+        pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)t->prio : 0; pthread_mutex_unlock(&G);return 1; }
+    case 0x0D: { if(regs[1]<28||regs[1]>59){regs[0]=R_BAD_STATE;return 1;}pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
+        if (t) { __atomic_store_n(&t->prio, (int)regs[1], __ATOMIC_RELAXED);
+            totk_svc_thr_pub(&g_thr_fast, &t->fast_meta, t->handle, t->prio, t->core, t->mask, t->id); }
+        regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1; }
+    case 0x0E: { if (totk_svc_fast_enabled()) { uint32_t h = (uint32_t)regs[2]; int32_t c = 0; uint64_t m = 0;
+                 thr_t *me = (h == H_CUR_THREAD && g_keythr) ? pthread_getspecific(g_keythr) : NULL;
+                 int ok = me ? totk_svc_thr_read(&me->fast_meta, me->handle, NULL, &c, &m, NULL)
+                             : totk_svc_thr_lookup(&g_thr_fast, h, NULL, &c, &m, NULL);
+                 if (ok) { regs[0] = 0; regs[1] = (uint64_t)(uint32_t)c; regs[2] = m; return 1; } }
+        pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[2], O_THREAD);
+        regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? (uint64_t)(uint32_t)t->core : 0; regs[2] = t ? t->mask : 0;pthread_mutex_unlock(&G); return 1; }
     case 0x0F: {  // SetThreadCoreMask(w0, w1 理想核, x2 掩码)；宿主只记账 | SetThreadCoreMask(w0, w1 ideal core, x2 mask); the host only keeps the bookkeeping
         pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[0], O_THREAD);
         if (t && horizon_cores()) {
-            uint32_t r = horizon_set_core_mask(&t->core, &t->mask, (int)regs[1], regs[2]);
-            if (!r && t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); }   // migrate off a core no longer allowed
+            int nc = t->core; uint64_t nm = t->mask;
+            uint32_t r = horizon_set_core_mask(&nc, &nm, (int)regs[1], regs[2]);
+            if (!r) { __atomic_store_n(&t->core, nc, __ATOMIC_RELAXED); __atomic_store_n(&t->mask, nm, __ATOMIC_RELAXED);
+                totk_svc_thr_pub(&g_thr_fast, &t->fast_meta, t->handle, t->prio, nc, nm, t->id); }
+            if (!r && t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); }
             regs[0] = r; pthread_mutex_unlock(&G); return 1;
         }
-        // Old TotK bookkeeping: -1 = core 0, -2/-3 = leave the ideal core unchanged, even outside the new mask.
-        if (t) { int c = (int)regs[1]; if (c >= 0) t->core = c; else if (c == -1) t->core = 0; if (regs[2]) t->mask = regs[2];
-                 if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }   // migrate off a core no longer allowed
+        if (t) { int nc = t->core, c = (int)regs[1]; uint64_t nm = regs[2] ? regs[2] : t->mask;
+            if (c >= 0) nc = c; else if (c == -1) nc = 0;
+            __atomic_store_n(&t->core, nc, __ATOMIC_RELAXED); __atomic_store_n(&t->mask, nm, __ATOMIC_RELAXED);
+            totk_svc_thr_pub(&g_thr_fast, &t->fast_meta, t->handle, t->prio, nc, nm, t->id);
+            if (t == cur() && t->cur_core >= 0 && !core_allowed(t, t->cur_core)) { core_put(t); core_take(t); } }
         regs[0] = t ? 0 : R_BAD_HANDLE;pthread_mutex_unlock(&G); return 1;
     }
     case 0x10: { thr_t *t = cur(); regs[0] = (uint64_t)(uint32_t)reported_core(t); return 1; }   // GetCurrentProcessorNumber
-    case 0x25: { pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
+    case 0x25: { if (totk_svc_fast_enabled()) { uint32_t h = (uint32_t)regs[1]; uint64_t id = 0;
+                 thr_t *me = (h == H_CUR_THREAD && g_keythr) ? pthread_getspecific(g_keythr) : NULL;
+                 int ok = me ? totk_svc_thr_read(&me->fast_meta, me->handle, NULL, NULL, NULL, &id)
+                             : totk_svc_thr_lookup(&g_thr_fast, h, NULL, NULL, NULL, &id);
+                 if (ok) { regs[0] = 0; regs[1] = id; return 1; } }
+        pthread_mutex_lock(&G);thr_t *t = h_get((uint32_t)regs[1], O_THREAD); regs[0] = t ? 0 : R_BAD_HANDLE; regs[1] = t ? t->id : 0;pthread_mutex_unlock(&G); return 1; }
 
     case 0x1A: {  // ArbitrateLock(w0 持有者句柄, x1 地址, w2 本线程标签) | ArbitrateLock(w0 owner handle, x1 address, w2 this thread's tag)
         thr_t *t = cur(); uint64_t addr = regs[1];
@@ -1687,23 +1721,26 @@ int svc_thread(int num, uint64_t *regs) {
     }
 
     case 0x45: {  // CreateEvent(→w1 写端, w2 读端) | CreateEvent(→w1 write end, w2 read end)
-        event_t *e = calloc(1, sizeof *e); e->refs = 2;
-        pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G);
+        pthread_mutex_lock(&G); event_t *e = totk_svc_ev_alloc(&g_ev_fast, 2); if (!e) die("event pool full");
+        uint32_t hw = h_new(O_EVENT_W, e), hr = h_new(O_EVENT_R, e);
+        totk_svc_ev_h_bind(&g_ev_fast, hw, O_EVENT_W, e); totk_svc_ev_h_bind(&g_ev_fast, hr, O_EVENT_R, e); pthread_mutex_unlock(&G);
         regs[0] = 0; regs[1] = hw; regs[2] = hr; return 1;
     }
     case 0x11: case 0x12: case 0x17: {  // SignalEvent(写端) / ClearEvent(任一端) / ResetSignal(读端，未触发报错) | SignalEvent(write end) / ClearEvent(either end) / ResetSignal(read end, error if not signaled)
+        uint32_t h = (uint32_t)regs[0]; int already_set = 0; int64_t fast_r = 0;
+        if (totk_svc_fast_enabled() && ((num == 0x11 && totk_svc_ev_signal_try(&g_ev_fast, h, &already_set, &fast_r)) ||
+            (num == 0x12 && totk_svc_ev_clear(&g_ev_fast, h, &fast_r)) ||
+            (num == 0x17 && totk_svc_ev_reset(&g_ev_fast, h, R_BAD_STATE, &fast_r)))) { regs[0] = (uint64_t)fast_r; return 1; }
         pthread_mutex_lock(&G);
-        // SignalEvent 只认写端；ClearEvent 两端都认；ResetSignal 只认读端
-        // SignalEvent accepts only the write end; ClearEvent accepts both ends; ResetSignal accepts only the read end
-        uint32_t h = (uint32_t)regs[0];
         event_t *e = num == 0x11 ? h_peek(h, O_EVENT_W) : num == 0x17 ? h_peek(h, O_EVENT_R)
                    : (h_peek(h, O_EVENT_W) ? h_peek(h, O_EVENT_W) : h_peek(h, O_EVENT_R));
         int64_t r = 0;
-        if (!e) { r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
+        if (num == 0x11 && already_set) { if (e) wake_sync_waiters_obj(e); }
+        else if (!e) { r = (num == 0x17 && h_peek(h, O_THREAD)) ? R_BAD_STATE : R_BAD_HANDLE;
                   if (r == R_BAD_HANDLE) LOG("事件 SVC %#x 句柄无效 %#x", num, h); }
-        else if (num == 0x11) { e->signaled = 1; wake_sync_waiters_obj(e); }
-        else if (num == 0x17 && !e->signaled) r = R_BAD_STATE;
-        else e->signaled = 0;
+        else if (num == 0x11) { totk_svc_ev_set_sig_locked(e, 1); wake_sync_waiters_obj(e); }
+        else if (num == 0x17 && !totk_svc_ev_is_sig(e)) r = R_BAD_STATE;
+        else totk_svc_ev_set_sig_locked(e, 0);
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; return 1;
     }
@@ -1712,6 +1749,7 @@ int svc_thread(int num, uint64_t *regs) {
         if(n<0||n>64||(!hs&&n)){regs[0]=R_BAD_STATE;return 1;}
         int64_t deadline = ns > 0 ? (dm_detclock_enabled() ? (int64_t)guest_ns() : now_mono_ns()) + ns : 0;
         pthread_mutex_lock(&G);
+        atomic_fetch_add_explicit(&g_ev_fast.wsync_count, 1u, memory_order_seq_cst);
         t->nwh = n; for (int i = 0; i < n && i < 4; i++) t->wh[i] = hs[i];
         int64_t r; int idx = -1;
         for (;;) {
@@ -1727,6 +1765,7 @@ int svc_thread(int num, uint64_t *regs) {
             t->whs = NULL; t->whn = 0;
             if (br == R_TIMEOUT) { r = R_TIMEOUT; break; }
         }
+        atomic_fetch_sub_explicit(&g_ev_fast.wsync_count, 1u, memory_order_seq_cst);
         pthread_mutex_unlock(&G);
         regs[0] = (uint64_t)r; regs[1] = idx >= 0 ? (uint64_t)idx : 0; return 1;
     }
@@ -1746,15 +1785,18 @@ int svc_thread(int num, uint64_t *regs) {
 #endif
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
             if (g_h[i].type == O_EVENT_W) se_unbind((uint32_t)regs[0]);   // 绑定随写端结束 | the binding ends with its write end
-            valid=1;event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
+            totk_svc_ev_h_unbind(&g_ev_fast, (uint32_t)regs[0]);
+            valid=1;event_t *e = g_h[i].obj; if (--e->refs == 0) totk_svc_ev_free(&g_ev_fast, e);
             g_h[i].type = O_FREE; g_h[i].obj = NULL; sync_hmap_free(&g_hmap, i);
         } else if (i > 0 && i < MAX_H && (g_h[i].type == O_SESSION || g_h[i].type == O_TMEM)) {
+            totk_svc_h_unbind(&g_ipc_h_fast, (uint32_t)regs[0]);
             valid=1;void *o = g_h[i].obj; int session = g_h[i].type == O_SESSION;
             g_h[i].type = O_FREE; g_h[i].obj = NULL; sync_hmap_free(&g_hmap, i);
             pthread_mutex_unlock(&G);
             if (session) runtime_ipc_session_closed(o); else runtime_ipc_tmem_closed(o);
             pthread_mutex_lock(&G);
         } else if (i > 0 && i < MAX_H && g_h[i].type == O_THREAD) {
+            totk_svc_thr_drop(&g_thr_fast, (uint32_t)regs[0]);
             valid=1;thr_t *t = g_h[i].obj;
             g_h[i].type = O_FREE; g_h[i].obj = NULL; sync_hmap_free(&g_hmap, i);
             t->closed = 1;
@@ -1802,7 +1844,7 @@ void hle_signal_system_event(void *ev) {
         if (wh) {
             event_t *e = h_get(wh, O_EVENT_W);
             if (!e) die("SystemEvent 写端句柄失效 %#x", wh);
-            e->signaled = 1; wake_sync_waiters_obj(e);
+            totk_svc_ev_set_sig_locked(e, 1); wake_sync_waiters_obj(e);
             pthread_mutex_unlock(&G);
             return;
         }
@@ -1819,21 +1861,22 @@ void hle_signal_system_event(void *ev) {
 // Weak fallbacks keep standalone thread tests linkable; the runtime links the real ipc.c versions.
 __attribute__((weak)) void runtime_ipc_session_closed(void *s) { (void)s; die("IPC session closed without ipc.c"); }
 __attribute__((weak)) void runtime_ipc_tmem_closed(void *t) { (void)t; die("transfer memory closed without ipc.c"); }
-uint32_t runtime_handle_new(int session, void *obj) { pthread_mutex_lock(&G); uint32_t h = h_new(session ? O_SESSION : O_TMEM, obj); pthread_mutex_unlock(&G); return h; }
-void *runtime_handle_get(uint32_t h, int session) { pthread_mutex_lock(&G); void *o = h_peek(h, session ? O_SESSION : O_TMEM); pthread_mutex_unlock(&G); return o; }
-// Service-side event: returns the writable handle kept by the service.
-uint32_t runtime_event_new(void) {
-    event_t *e = calloc(1, sizeof *e); if (!e) die("event allocation"); e->refs = 1;
-    pthread_mutex_lock(&G); uint32_t hw = h_new(O_EVENT_W, e); pthread_mutex_unlock(&G); return hw;
+uint32_t runtime_handle_new(int session, void *obj) { int tp = session ? O_SESSION : O_TMEM; pthread_mutex_lock(&G); uint32_t h = h_new(tp, obj); totk_svc_h_bind(&g_ipc_h_fast, h, tp, obj); pthread_mutex_unlock(&G); return h; }
+void *runtime_handle_get(uint32_t h, int session) {
+    if (totk_svc_fast_enabled()) { void *o = totk_svc_h_lookup(&g_ipc_h_fast, h, session ? O_SESSION : O_TMEM); if (o) return o; }
+    pthread_mutex_lock(&G); void *o = h_peek(h, session ? O_SESSION : O_TMEM); pthread_mutex_unlock(&G); return o;
 }
-// Copy-handle transfer of the readable end: each call gives the client its own handle to the same event.
+uint32_t runtime_event_new(void) {
+    pthread_mutex_lock(&G); event_t *e = totk_svc_ev_alloc(&g_ev_fast, 1); if (!e) die("event pool full");
+    uint32_t hw = h_new(O_EVENT_W, e); totk_svc_ev_h_bind(&g_ev_fast, hw, O_EVENT_W, e); pthread_mutex_unlock(&G); return hw;
+}
 uint32_t runtime_event_readable(uint32_t hw) {
     pthread_mutex_lock(&G); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
-    e->refs++; uint32_t hr = h_new(O_EVENT_R, e); pthread_mutex_unlock(&G); return hr;
+    e->refs++; uint32_t hr = h_new(O_EVENT_R, e); totk_svc_ev_h_bind(&g_ev_fast, hr, O_EVENT_R, e); pthread_mutex_unlock(&G); return hr;
 }
 void runtime_event_signal(uint32_t hw) {
     pthread_mutex_lock(&G); event_t *e = h_get(hw, O_EVENT_W); if (!e) die("service event handle %#x", hw);
-    e->signaled = 1; wake_sync_waiters_obj(e); pthread_mutex_unlock(&G);
+    totk_svc_ev_set_sig_locked(e, 1); wake_sync_waiters_obj(e); pthread_mutex_unlock(&G);
 }
 
 // ---------- Diagnostics: TOTK_DUMP_AFTER=<seconds> prints every guest thread's wait state and guest return chain ----------
