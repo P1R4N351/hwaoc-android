@@ -3622,7 +3622,7 @@ typedef struct pipe_ent {
     int fast_attempted, replaced;      /* walking thread only */
     uint64_t wait_sub, retry_at; unsigned skipped, seen_failure;   /* walking thread only */
     uint64_t frame;                    /* originating request; immutable while queued/building */
-    int predicted, capture; uint32_t list_index, collected; struct pipe_ent *next;
+    int predicted, capture; uint32_t list_index, collected; struct pipe_ent *next, *pw_prev; uint8_t in_pw;
     vk_lend lend;                      /* g_pq_mu: the worker building it and any nice a waiter lent it */
 } pipe_ent;
 #define PIPE_FAILED ((VkPipeline)(uintptr_t)1)
@@ -4187,7 +4187,8 @@ static void *pipe_worker(void *arg) {
         }
         pipe_ent *e;
         if (background) {
-            e = g_pw_head; g_pw_head = e->next; if (!g_pw_head) g_pw_tail = NULL;
+            e = g_pw_head; g_pw_head = e->next; if (g_pw_head) g_pw_head->pw_prev = NULL; else g_pw_tail = NULL;
+            e->pw_prev = NULL; e->in_pw = 0;
             g_pw_active = 1;
 #ifdef TOTK_VK_TESTS
             if (!e->capture) g_pso_test_screen_started = 1;
@@ -4384,7 +4385,11 @@ void vk_pipeline_prewarm(void) {
     if (g_pso_collect) {
         g_pso_records = pso_read(g_pso_path, &g_pso_count, NULL);
         g_pso_capacity = g_pso_count;
-        for (uint32_t i = 0; i < g_pso_count; i++) nvn_hm_put(&g_pso_keys, g_pso_records[i].key, (void *)(uintptr_t)(i+1));
+        if (totk_vk_pcache_fast_on()) {
+            totk_pso_idx_reserve(&g_pso_fast_idx, g_pso_count + 64u);
+            for (uint32_t i = 0; i < g_pso_count; i++)
+                totk_pso_idx_put_raw(&g_pso_fast_idx, (const uint8_t *)g_pso_records, sizeof *g_pso_records, i + 1u, totk_pso_hash64(g_pso_records[i].key, PSO_KEY_BYTES, 0));
+        } else { for (uint32_t i = 0; i < g_pso_count; i++) nvn_hm_put(&g_pso_keys, g_pso_records[i].key, (void *)(uintptr_t)(i+1)); }
         LOGV("[pso-collect] enabled; retained %u successful graphics keys", g_pso_count);
     }
     const char *path = getenv("TOTK_PSO_KEYS"), *enable = getenv("TOTK_PSO_PREWARM");
@@ -4409,6 +4414,7 @@ void vk_pipeline_prewarm(void) {
             e->k = k; e->layout = vk_layout_of(k.vs, k.fs); e->list_index = i+1;
             e->capture = r->capture; e->predicted = 1; /* first demand must build/join, never skip a formerly cached draw */
             nvn_hm_put(&g_pipes, &k, e);
+            if (totk_vk_pcache_fast_on()) { e->pw_prev = tail; e->in_pw = 1; }
             if (tail) tail->next = e; else head = e; tail = e;
         }
     }

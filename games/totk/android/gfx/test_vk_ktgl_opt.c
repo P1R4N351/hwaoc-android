@@ -36,6 +36,7 @@
 #include "test_vk_ktgl_opt_w31.h"
 #include "test_vk_ktgl_opt_w32.h"
 #include "test_vk_ktgl_opt_w33.h"
+#include "test_vk_ktgl_opt_w34.h"
 #include "nvn_dirty.h"
 #include <assert.h>
 #include <stdint.h>
@@ -317,6 +318,7 @@ int main(void) {
     if (run_ktgl_w31_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w32_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w33_tests(g_fault_mode) != 0) g_fail++;
+    if (run_ktgl_w34_tests(g_fault_mode) != 0) g_fail++;
     printf("ktglopttest: fault_mode=%d failures=%d\n", g_fault_mode, g_fail);
     return g_fail != 0;
 }

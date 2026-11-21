@@ -12,6 +12,7 @@
 #include <unistd.h>
 #include "../../runtime/host_os.h"
 #include "vk_pcache_store.h"
+#include "vk_pcache_fast.h"
 #define PSO_KEY_LIMIT 16384u
 #define PSO_STATE_WORDS 155u
 /* The stage word at byte 160: early-tests bit 0, alpha comparison (0=off, 1..7) bits 1..3. */
@@ -32,6 +33,7 @@ static inline void pso_hash(const void *p, size_t n, uint8_t sha[32]) {
     host_sha256_ctx c; host_sha256_init(&c); host_sha256_update(&c, p, n); host_sha256_final(&c, sha);
 }
 static inline int pso_name(const uint8_t *p, int optional) {
+    if (totk_vk_pcache_fast_on()) return totk_pso_name_fast(p, optional, totk_w34_fault());
     size_t n = strnlen((const char *)p, 80);
     if (!n) { if (!optional) return 0; }
     else if (n != 64 && n != 77) return 0;
@@ -41,6 +43,7 @@ static inline int pso_name(const uint8_t *p, int optional) {
     return 1;
 }
 static inline int pso_valid(const pso_record *r) {
+    if (totk_vk_pcache_fast_on()) return totk_pso_valid_fast(r->key, r->frequency, r->capture, totk_w34_fault());
     if (!pso_name(r->key, 0) || !pso_name(r->key + 80, 1) || pso_u32(r->key + 160) > 15 || !r->frequency || r->capture > 1) return 0;
     const uint8_t *s = r->key + 164;
     uint32_t n = pso_u32(s + 10*4), samples = pso_u32(s + 11*4);

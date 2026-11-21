@@ -13,6 +13,7 @@ static pso_record *g_pso_records;
 static uint32_t g_pso_count, g_pso_capacity;
 static uint64_t g_pso_generation, g_pso_saved;
 static nvn_hmap g_pso_keys = {.klen = PSO_KEY_BYTES};
+static totk_pso_idx g_pso_fast_idx;
 static uint8_t g_pw_digest[32], g_pw_done[PSO_BITMAP_BYTES];
 static uint32_t g_pw_total, g_pw_completed, g_pw_missing, g_pw_failed;
 static uint8_t g_pw_saved_done[PSO_BITMAP_BYTES]; /* saver-owned, initialized before ready */
@@ -63,7 +64,10 @@ static void pso_decode(const pso_record *r, pipe_key *k) {
 static void pso_collect_success(pipe_ent *e) {
     if (!g_pso_collect) return;
     pso_record r; pso_encode(&e->k, &r); r.capture = e->capture;
-    uintptr_t found = (uintptr_t)nvn_hm_get(&g_pso_keys, r.key);
+    int fast = totk_vk_pcache_fast_on(), wf = totk_w34_fault();
+    uint64_t rh = fast ? totk_pso_hash64(r.key, PSO_KEY_BYTES, wf) : 0u;
+    uintptr_t found = fast ? (uintptr_t)totk_pso_idx_get_raw(&g_pso_fast_idx, (const uint8_t *)g_pso_records, sizeof *g_pso_records, r.key, PSO_KEY_BYTES, rh, wf)
+                           : (uintptr_t)nvn_hm_get(&g_pso_keys, r.key);
     if (found) {
         pso_record *old = g_pso_records + found-1;
         if (old->frequency < UINT32_MAX) old->frequency++;
@@ -80,7 +84,7 @@ static void pso_collect_success(pipe_ent *e) {
         g_pso_records = next; g_pso_capacity = cap;
     }
     g_pso_records[g_pso_count++] = r;
-    nvn_hm_put(&g_pso_keys, r.key, (void *)(uintptr_t)g_pso_count);
+    if (fast) totk_pso_idx_put_raw(&g_pso_fast_idx, (const uint8_t *)g_pso_records, sizeof *g_pso_records, g_pso_count, rh); else nvn_hm_put(&g_pso_keys, r.key, (void *)(uintptr_t)g_pso_count);
     e->collected = g_pso_count; g_pso_generation++;
 }
 static void pso_demand(pipe_ent *e, int capture) {
@@ -93,11 +97,18 @@ static void pso_demand(pipe_ent *e, int capture) {
     }
     /* Promote screen demand too, but never mutate the entry currently being compiled. */
     if (e->list_index && atomic_load_explicit(&e->state, memory_order_acquire) == PE_QUEUED) {
-        pipe_ent *prev = NULL, *q = g_pw_head;
-        while (q && q != e) { prev = q; q = q->next; }
-        if (q) {
-            if (prev) prev->next = q->next; else g_pw_head = q->next;
-            if (g_pw_tail == q) g_pw_tail = prev;
+        int hit = 0;
+        if (totk_vk_pcache_fast_on() && e->in_pw) {
+            pipe_ent *pv = e->pw_prev, *nx = e->next;
+            if (pv) pv->next = nx; else g_pw_head = nx;
+            if (nx) nx->pw_prev = pv; else if (totk_w34_fault() != 124) g_pw_tail = pv;
+            e->pw_prev = NULL; e->in_pw = 0; hit = 1;
+        } else {
+            pipe_ent *prev = NULL, *q = g_pw_head;
+            while (q && q != e) { prev = q; q = q->next; }
+            if (q) { if (prev) prev->next = q->next; else g_pw_head = q->next; if (g_pw_tail == q) g_pw_tail = prev; hit = 1; }
+        }
+        if (hit) {
             e->next = NULL;
             if (g_pq_tail) g_pq_tail->next = e; else g_pq_head = e;
             g_pq_tail = e; pthread_cond_broadcast(&g_pq_cv);
@@ -120,7 +131,7 @@ void vk_pipeline_keys_collect_save(void) {
 int vk_pipeline_keys_dirty(void) {
     if (!atomic_load_explicit(&g_pso_ready, memory_order_acquire) || !g_pw_total) return 0;
     pthread_mutex_lock(&g_pq_mu);
-    int dirty = memcmp(g_pw_done, g_pw_saved_done, PSO_BITMAP_BYTES) != 0;
+    int dirty = totk_vk_pcache_fast_on() ? totk_pso_bitmap_dirty_fast(g_pw_done, g_pw_saved_done, g_pw_total, totk_w34_fault()) : (memcmp(g_pw_done, g_pw_saved_done, PSO_BITMAP_BYTES) != 0);
     pthread_mutex_unlock(&g_pq_mu); return dirty;
 }
 /* Sample BEFORE Vulkan extraction; only a successful atomic cache save can acknowledge these bits. */
@@ -149,7 +160,8 @@ static void pso_restore_from(const char *cache) {
     pso_hash(bytes, sizeof bytes-32, sha);
     if (memcmp(sha, bytes+sizeof bytes-32, 32) || !pcache_driver_hash(cache, cache_sha) || memcmp(cache_sha, bytes+40, 32)) return;
     memcpy(g_pw_done, bytes+72, PSO_BITMAP_BYTES);
-    for (uint32_t i = 0; i < g_pw_total; i++) g_pw_completed += (g_pw_done[i/8] >> (i%8)) & 1;
+    if (totk_vk_pcache_fast_on()) g_pw_completed += totk_pso_popcount_bits(g_pw_done, g_pw_total, totk_w34_fault());
+    else for (uint32_t i = 0; i < g_pw_total; i++) g_pw_completed += (g_pw_done[i/8] >> (i%8)) & 1;
     memcpy(g_pw_saved_done, g_pw_done, PSO_BITMAP_BYTES);
 }
 static void pso_restore(void) { pso_restore_from(vk_pcache_loaded_path()); }
