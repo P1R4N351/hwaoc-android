@@ -3,6 +3,7 @@
    MIT license: third_party/licenses/Ryujinx-Audio.txt. Samples are normalized floats. */
 #include "audio_reverb.h"
 #include "runtime.h"
+#include "totk_audren_fast.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,10 +65,13 @@ void audio_reverb_process(Reverb3d *s, float *const input[6], float *const outpu
     static const unsigned quad[20]={0,0,0,1,1,1,1,2,2,2,1,1,1,0,0,0,0,3,3,3};
     /* Preserve the reference's legacy surround channel ordering (L,R,BL,BR,C,LFE). */
     static const unsigned surround[20]={4,5,0,5,0,5,1,5,1,5,1,5,1,5,2,5,2,5,2,5};
-    const int channels=s->p.channels;
+    const int channels=s->p.channels, fast=totk_audren_fast_active();
+    const unsigned *route=fast?totk_reverb3d_route(channels):NULL;
+    const int pre_wrap=(int)s->pre.cap+1, f100=fast?(totk_audren_w29_fault()==100):0;
     for (int k=0;k<frames;k++) {
         float dry[6],early[6]={0},fb[4],v[4],sum=0,tap=delay_tap(&s->pre,s->reflection_time);
-        for (int i=0;i<20;i++) { unsigned out=channels==1?0:channels==2?stereo[i]:channels==4?quad[i]:surround[i]; float x=delay_tap(&s->pre,s->early_time[i])*early_gains[i]; early[out]+=x; if(channels==6)early[out]+=x; }
+        if (fast) totk_reverb3d_early_accum(s->pre.data,(int)s->pre.write-1,pre_wrap,s->early_time,early_gains,route,channels==6,f100,early);
+        else for (int i=0;i<20;i++) { unsigned out=channels==1?0:channels==2?stereo[i]:channels==4?quad[i]:surround[i]; float x=delay_tap(&s->pre,s->early_time[i])*early_gains[i]; early[out]+=x; if(channels==6)early[out]+=x; }
         for (int c=0;c<channels;c++) { dry[c]=input[c][k]; sum+=dry[c]; }
         s->pre_previous=sum*s->pre_target+s->pre_previous*s->pre_gain; delay_update(&s->pre,s->pre_previous);
         for (int i=0;i<4;i++) { float x=s->fdn[i].data[s->fdn[i].read]; fb[i]=x*s->direct[i]+s->history[i]; s->history[i]=x*s->current[i]+fb[i]*s->output[i]; }

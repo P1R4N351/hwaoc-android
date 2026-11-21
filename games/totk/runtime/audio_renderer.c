@@ -7,6 +7,8 @@
 #include "audio_renderer.h"
 #include "audio_mixer.h"
 #include "audio_reverb.h"
+#include "totk_audren_fast.h"
+_Static_assert(SV_STOPPED == 0, "SV_STOPPED zero");
 #include <math.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -135,6 +137,44 @@ void audio_voices_prepare(AudioRenderer *r) {
     }
 }
 
+static void request_update_voices(AudioRenderer *r, const uint8_t *voices, int vc,
+                                  int float_voices, size_t voice_stride) {
+    const int fast = totk_audren_fast_active();
+    const int f99 = fast ? (totk_audren_w29_fault() == 99) : 0;
+    for (int i = 0; i < vc; i++) {
+        const uint8_t *vp = voices + (size_t)i * voice_stride;
+        if (fast) {
+            uint32_t vid = 0u, tmp_id = 0u;
+            memcpy(&tmp_id, vp, sizeof tmp_id);
+            if (tmp_id < (uint32_t)vc) {
+                ServerVoice *sv = &r->voices[tmp_id];
+                int idle = !sv->in.in_use && sv->state == SV_STOPPED && sv->adpcm.buffer == -1;
+                if (totk_audren_voice_is_noop_idle(vp, float_voices, (uint32_t)vc, idle, f99, &vid)) {
+                    sv->in.id = vid; sv->in.is_new = 0; sv->in.in_use = 0; sv->use_float_biquads = 0; continue;
+                }
+            }
+        }
+        AudrenVoiceIn v; AudrenBiquadFloat fbq[2];
+        if (float_voices) {
+            if (fast) totk_audren_voice_v2_unpack(&v, fbq, vp);
+            else {
+                AudrenVoiceInV2 v2; memcpy(&v2, vp, sizeof v2); memset(&v, 0, sizeof v);
+                memcpy(&v, v2.prefix, sizeof v2.prefix); memcpy((uint8_t *)&v + 0x3cu, v2.tail, sizeof v2.tail);
+                memcpy(fbq, v2.biquads, sizeof fbq);
+            }
+            for (unsigned f = 0; f < 2; f++) {
+                v.biquads[f].enable = fbq[f].enable;
+                if (v.biquads[f].enable) {
+                    for (unsigned c = 0; c < 3; c++) need(isfinite(fbq[f].numerator[c]), "nonfinite voice biquad numerator");
+                    for (unsigned c = 0; c < 2; c++) need(isfinite(fbq[f].denominator[c]), "nonfinite voice biquad denominator");
+                }
+            }
+        } else memcpy(&v, vp, sizeof v);
+        update_voice(r, &v);
+        ServerVoice *server = &r->voices[v.id]; server->use_float_biquads = (uint8_t)float_voices;
+        if (float_voices) memcpy(server->float_biquads, fbq, sizeof fbq);
+    }
+}
 static uint32_t effect_out_bytes(const AudioRenderer *r) { return revision_number(r->revision) >= 9 ? 0x90u : 0x10u; }
 
 static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_size, uint8_t *output, uint64_t out_size, uint64_t perf_size) {
@@ -176,25 +216,7 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
         need(chans[i].id < (uint32_t)vc * 6, "channel resource id");
         r->channels[chans[i].id] = chans[i];
     }
-    for (int i = 0; i < vc; i++) {
-        AudrenVoiceIn v;
-        AudrenVoiceInV2 v2;
-        if(float_voices){
-            memcpy(&v2,voices+i*voice_stride,sizeof v2);memset(&v,0,sizeof v);
-            memcpy(&v,v2.prefix,sizeof v2.prefix);
-            memcpy((uint8_t *)&v+0x3c,v2.tail,sizeof v2.tail);
-            for(unsigned f=0;f<2;f++){
-                v.biquads[f].enable=v2.biquads[f].enable;
-                if(v.biquads[f].enable){
-                    for(unsigned c=0;c<3;c++)need(isfinite(v2.biquads[f].numerator[c]),"nonfinite voice biquad numerator");
-                    for(unsigned c=0;c<2;c++)need(isfinite(v2.biquads[f].denominator[c]),"nonfinite voice biquad denominator");
-                }
-            }
-        }else memcpy(&v,voices+i*voice_stride,sizeof v);
-        update_voice(r,&v);
-        ServerVoice *server=&r->voices[v.id];server->use_float_biquads=float_voices;
-        if(float_voices)memcpy(server->float_biquads,v2.biquads,sizeof v2.biquads);
-    }
+    request_update_voices(r, voices, vc, float_voices, voice_stride);
     for (int i = 0; i < ec; i++) r->effects[i] = effects[i];
     if (getenv("TOTK_AUDIO_DUMP")) { static unsigned dumped; unsigned active = 0; for (int i=0;i<ec;i++) if (effects[i].enabled && effects[i].type) active++;
         if (active > dumped) { dumped = active; FILE *f = fopen("analysis/audio-effects.bin", "wb"); if (f) { fwrite(effects, sizeof *effects, ec, f); fclose(f); } }
@@ -212,13 +234,20 @@ static void request_update(AudioRenderer *r, const uint8_t *input, uint64_t in_s
     o.performance = 0x10; o.behavior = BEHAVIOR_OUT; o.render_info = RENDER_INFO_OUT;
     o.total = (uint32_t)sizeof o + o.memory_pools + o.voices + o.effects + o.sinks + o.performance + o.behavior + o.render_info;
     if (o.total > out_size) { fprintf(stderr, "[totk-audio] output needs %u bytes, client gave %llu (effect out %u)\n", o.total, (unsigned long long)out_size, eo); runtime_fail("audio renderer output size"); }
-    memset(output, 0, out_size);
+    const int fast_out = totk_audren_fast_active();
+    if (fast_out) totk_audren_zero_tail(output, sizeof o + o.memory_pools + o.voices, (size_t)out_size);
+    else memset(output, 0, out_size);
     uint8_t *w = output; memcpy(w, &o, sizeof o); w += sizeof o;
-    for (uint32_t i = 0; i < npools; i++) {
-        uint32_t s = pools[i].state;
-        if (s == POOL_REQUEST_ATTACH) s = POOL_ATTACHED; else if (s == POOL_REQUEST_DETACH) s = POOL_DETACHED;
-        r->pools[i] = pools[i]; r->pools[i].state = s;
-        AudrenPoolOut po = {s, {0}}; memcpy(w, &po, sizeof po); w += sizeof po;
+    if (fast_out) {
+        totk_audren_pools_update(r->pools, pools, npools, w);
+        w += (size_t)npools * sizeof(AudrenPoolOut);
+    } else {
+        for (uint32_t i = 0; i < npools; i++) {
+            uint32_t s = pools[i].state;
+            if (s == POOL_REQUEST_ATTACH) s = POOL_ATTACHED; else if (s == POOL_REQUEST_DETACH) s = POOL_DETACHED;
+            r->pools[i] = pools[i]; r->pools[i].state = s;
+            AudrenPoolOut po = {s, {0}}; memcpy(w, &po, sizeof po); w += sizeof po;
+        }
     }
     for (int i = 0; i < vc; i++) {
         AudrenVoiceOut vo = {r->voices[i].played, r->voices[i].consumed, r->voices[i].drops};

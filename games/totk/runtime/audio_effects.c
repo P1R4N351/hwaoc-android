@@ -3,6 +3,7 @@
    third_party/licenses/Ryujinx-Audio.txt. Runtime samples are normalized floats. */
 #include "audio_effects.h"
 #include "runtime.h"
+#include "totk_audren_fast.h"
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,6 +127,11 @@ static void delay_process(AudioEffectDsp *s,float *const in[6],float *const out[
     float fb=p->feedback/16384.f,spread=p->spread/16384.f,base=(1-spread)*fb*.98f,cross=spread*fb*.98f/(n>=4?2:1),lp=.95f*(p->lowpass/16384.f);
     static const int quad[4][2]={{1,2},{0,3},{0,3},{1,2}};
     static const int surround[6][2]={{2,4},{2,5},{0,1},{3,3},{0,5},{1,4}};
+    if(n==2u && totk_audren_fast_active()){
+        const float g[6]={base,cross,lp,p->in_gain/16384.f,p->dry_gain/16384.f,p->out_gain/16384.f};
+        totk_delay_stereo_run(in[0],in[1],out[0],out[1],s->line[0].data,s->line[1].data,s->line[0].count,s->line[1].count,&s->line[0].at,&s->line[1].at,s->history,g,frames);
+        return;
+    }
     for(int k=0;k<frames;k++){
         float x[6],d[6],v[6];for(unsigned c=0;c<n;c++){x[c]=in[c][k]*64;d[c]=line_read(&s->line[c]);}
         for(unsigned c=0;c<n;c++){
@@ -143,20 +149,23 @@ static void reverb_process(AudioEffectDsp *s,float *const in[6],float *const out
     static const int mono[10]={0,0,0,0,0,0,0,0,0,0},stereo[10]={0,0,1,1,0,1,0,0,1,1},quad[10]={0,0,1,1,0,1,2,2,3,3},surround[10]={0,0,1,1,4,4,2,2,3,3};
     static const int feedback_stereo[4]={2,0,3,1},output_stereo[4]={0,0,1,1};
     const int *map=n==1?mono:n==2?stereo:n==4?quad:surround;
+    const int fast=totk_audren_fast_active();
+    const float rev_g=p->reverb_gain/16384.f,late_g=p->late_gain/16384.f,out_g=p->out_gain/16384.f,dry_g=p->dry_gain/16384.f;
+    const unsigned pre_at=s->pre_time>=s->line[8].count?s->line[8].count-1:s->pre_time;
     for(int k=0;k<frames;k++){
         float y[6]={0},x[6],fb[4],v[4],sum=0;
         for(int i=0;i<10;i++){float tap=line_tap(&s->line[8],s->early_time[i],0)*s->early_gain[i];y[map[i]]+=tap;if(n==6)y[5]+=tap;}
         if(n==6)y[5]*=.2f;
-        for(unsigned c=0;c<n;c++){x[c]=in[c][k]*64;sum+=x[c]*(p->reverb_gain/16384.f);}line_update(&s->line[8],sum);
-        unsigned at=s->pre_time;if(at>=s->line[8].count)at=s->line[8].count-1;
-        float late=line_tap(&s->line[8],at,-1)*(p->late_gain/16384.f);
+        for(unsigned c=0;c<n;c++){x[c]=in[c][k]*64;sum+=x[c]*(fast?rev_g:(p->reverb_gain/16384.f));}line_update(&s->line[8],sum);
+        unsigned at=fast?pre_at:(s->pre_time>=s->line[8].count?s->line[8].count-1:s->pre_time);
+        float late=line_tap(&s->line[8],at,-1)*(fast?late_g:(p->late_gain/16384.f));
         for(int i=0;i<4;i++){v[i]=line_read(&s->line[i])*s->direct[i]+s->history[i]*s->previous[i];s->history[i]=v[i];}
         fb[0]=v[2]+v[1];fb[1]=-v[0]-v[3];fb[2]=v[0]-v[3];fb[3]=v[1]-v[2];
         for(int i=0;i<4;i++){float d=line_read(&s->line[4+i]),z=fb[i]+late-s->decay_rate*d;v[i]=line_update(&s->line[4+i],z)+z*s->decay_rate;line_update(&s->line[i],v[i]);}
         if(n==1)for(int i=0;i<4;i++)y[0]+=v[i];
         else if(n==2)for(int i=0;i<4;i++)y[output_stereo[i]]+=v[feedback_stereo[i]];
         else {for(int i=0;i<4;i++)y[i]+=v[i];if(n==6){y[5]+=v[3];y[4]+=line_update(&s->line[9],(v[2]-v[3])*.5f);}}
-        for(unsigned c=0;c<n;c++)out[c][k]=(y[c]*(p->out_gain/16384.f)+x[c]*(p->dry_gain/16384.f))/64;
+        for(unsigned c=0;c<n;c++)out[c][k]=(y[c]*(fast?out_g:(p->out_gain/16384.f))+x[c]*(fast?dry_g:(p->dry_gain/16384.f)))/64;
     }
 }
 static void compressor_process(AudioEffectDsp *s,float *const in[6],float *const out[6],int frames) {
