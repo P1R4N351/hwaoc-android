@@ -29,6 +29,7 @@
 #include "totk_lifelog.h"
 #include "../../third_party/d2r_gfx/gfx/tex/nvn_deswizzle.h"
 #include "vk_upload_pool.h"
+#include "vk_upload_fast.h"
 #include "vk_edge_guard.h"
 #include "vk_res_fast.h"
 #include "vk_tbuf_fast.h"
@@ -697,6 +698,7 @@ void vk_upload_report(uint64_t frame) {
          (unsigned long long)s.jobs, (unsigned long long)s.runs, (unsigned long long)s.helper_runs, upload_pool_helpers());
 }
 /* Upload a mirrored texture from the guest's bytes (pre command buffer). */
+static void upload_staged(vk_tex *x, VkCommandBuffer cb, int is3d, int linear, int bw, int bh, int bpb);
 static void upload_inner(vk_tex *x) {
     const tex_t *t = &x->t; vk_img *im = x->im;
     if (totk_texcopy_match(t))
@@ -727,45 +729,50 @@ static void upload_inner(vk_tex *x) {
             return;
         }
     }
-    size_t total = 0;
+    upload_staged(x, cb, is3d, linear, bw, bh, bpb);
+}
+static void upload_staged(vk_tex *x, VkCommandBuffer cb, int is3d, int linear, int bw, int bh, int bpb) {
+    const tex_t *t = &x->t; vk_img *im = x->im; size_t total = 0;
     for (unsigned l = 0; l < im->levels; l++) {
         uint32_t w = MAXV(im->w >> l, 1u), h = MAXV(im->h >> l, 1u), z = is3d ? MAXV(im->d >> l, 1u) : 1;
         total += (((size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z + 15) & ~(size_t)15) * (is3d ? 1 : im->layers);
     }
     VkBuffer sb; VkDeviceSize so; uint8_t *stg = vk_transient(total ? total : 16, 16, &sb, &so);
-    VkBufferImageCopy *regions = calloc((size_t)im->levels * im->layers, sizeof *regions); int nr = 0;
-    /* With helpers, block-linear subresources are only collected here and decoded together below. */
+    size_t nsub_tot = (size_t)im->levels * im->layers;
+    int inline_ok = totk_vk_upload_fast_on() && nsub_tot <= TOTK_UPLOAD_INLINE_REG;
+    VkBufferImageCopy stack_reg[TOTK_UPLOAD_INLINE_REG];
+    VkBufferImageCopy *regions = inline_ok ? stack_reg : calloc(nsub_tot, sizeof *regions); int nr = 0;
     if (!linear) upload_threads_refresh();
     int pooled = !linear && upload_pool_helpers();
-    upload_sub *subs = pooled ? malloc((size_t)im->levels * im->layers * sizeof *subs) : NULL; unsigned ns = 0;
+    upload_sub stack_subs[TOTK_UPLOAD_INLINE_REG];
+    upload_sub *subs = pooled ? (inline_ok ? stack_subs : malloc(nsub_tot * sizeof *subs)) : NULL; unsigned ns = 0;
     if (!subs) pooled = 0;
     size_t off = 0;
     for (unsigned l = 0; l < im->levels; l++) {
         uint32_t w = MAXV(im->w >> l, 1u), h = MAXV(im->h >> l, 1u), z = is3d ? MAXV(im->d >> l, 1u) : 1;
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
         for (unsigned y = 0; y < (is3d ? 1u : im->layers); y++) {
-            int bad;
-            if (linear) { size_t stride = nvn_tex_linear_stride(&t->d); bad = 0; for (size_t r = 0; r < rows * z; r++) memcpy(stg + off + r * pitch, t->mem + r * stride, pitch); }
-            else if (pooled) { subs[ns++] = (upload_sub){l, y, stg + off, pitch}; bad = 0; }
+            int bad = 0;
+            if (linear) { size_t stride = nvn_tex_linear_stride(&t->d); for (size_t r = 0; r < rows * z; r++) memcpy(stg + off + r * pitch, t->mem + r * stride, pitch); }
+            else if (pooled) { subs[ns++] = (upload_sub){l, y, stg + off, pitch}; }
             else bad = nvn_deswizzle(&t->d, l, y, t->mem, stg + off, pitch);
-            if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); free(regions); return; }
+            if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); if (subs && subs != stack_subs) free(subs); if (regions && regions != stack_reg) free(regions); return; }
             regions[nr++] = (VkBufferImageCopy){.bufferOffset = so + off, .imageSubresource = {im->aspect, l, y, 1}, .imageExtent = {w, h, z}};
             off += (pitch * rows * z + 15) & ~(size_t)15;
         }
     }
     if (pooled) {
         int bad = upload_pool_deswizzle(&t->d, t->mem, subs, ns, UPLOAD_POOL_MIN_BYTES);
-        free(subs);
-        if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); free(regions); return; }
+        if (subs && subs != stack_subs) free(subs);
+        if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); if (regions && regions != stack_reg) free(regions); return; }
     }
     if (nr) {
         if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "upload");
         vkCmdCopyBufferToImage(cb, sb, im->img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)nr, regions);
-        for (unsigned level = 0; level < im->levels; level++)
-            vk_pso_life_external_write(x, level, 0, im->layers, "upload");
+        for (unsigned level = 0; level < im->levels; level++) vk_pso_life_external_write(x, level, 0, im->layers, "upload");
         totk_ft_count(FT_COUNT_TEX_UPLOADS, 1);
     }
-    free(regions);
+    if (regions && regions != stack_reg) free(regions);
     vk_barrier_all(cb);
     if (vk_gpuprof_on && nr) vk_gpuprof_scope_end(cb);
     g_stat_upload_bytes += total; atomic_fetch_add(&g_win_upload_bytes, total);
