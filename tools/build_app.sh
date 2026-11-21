@@ -6,7 +6,7 @@
 #     flavour: totk: fork | dev; botw/hwaoc: release | dev
 #
 # Package, launcher label, version, signing key and launcher art come from games/games.toml; the keys stay in
-# TOTK_KEYS_DIR (default /root/totk-work/keys) and never enter git. The defaults below are the build machine's (CT 923);
+# TOTK_KEYS_DIR (default /root/totk-work/keys) and never enter git. The defaults below are the build machine's (the build container);
 # override them through the environment:
 #   NDK, ANDROID_HOME, PREBUILT (libtotk_turnip.so, libtotk_xlate.so), VENV (Python 3.12+ with cryptography),
 #   WORK (work folder, default /dev/shm/app-<game>-<flavour>), JOBS (default 4), DUO_JOBS (default 2: libduo_host.so
