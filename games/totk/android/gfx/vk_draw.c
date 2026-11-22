@@ -30,6 +30,13 @@
 #include "vk_state_fast.h"
 #include "vk_cs_fast.h"
 #include "vk_img_fast.h"
+#include "vk_bind_fast.h"
+_Static_assert(sizeof(p_bind_buf) == sizeof(totk_bind_buf_slot_t), "p_bind_buf size");
+_Static_assert(offsetof(p_bind_buf, addr) == offsetof(totk_bind_buf_slot_t, addr), "p_bind_buf addr");
+_Static_assert(sizeof(vk_bind) == sizeof(totk_vk_bind_rec_t), "vk_bind size");
+_Static_assert(offsetof(vk_bind, sreg) == offsetof(totk_vk_bind_rec_t, sreg), "vk_bind sreg");
+_Static_assert(RB_DRV0 == TOTK_RB_DRV0 && RB_IMG == TOTK_RB_IMG && RB_ALPHA == TOTK_RB_ALPHA, "RB enum");
+_Static_assert(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER == TOTK_DT_SSBO, "DT enum");
 static int img_fast_draw_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static __thread totk_clear_read_memo4 *T_clear_read_memo;
 static totk_cs_pipe_state g_cs_pipe;
@@ -4583,6 +4590,7 @@ int vk_draw_test_pipeline_bench(vk_shader *vs, vk_shader *fs) {
 
 /* ---------- descriptor sets ---------- */
 static void driver_bank_fill(uint8_t *d, int bank, int stage, const uint32_t grid[3]) {   /* nvn_mtl.m driver_bank_fill */
+    if (totk_vk_bind_fast_on()) { totk_drv_bank_fill_fast(d, bank, stage, grid, (const totk_bind_buf_slot_t *)S.ssbo[stage], (const totk_bind_buf_slot_t *)S.ubo[5], S.tex[stage], S.samp[stage]); return; }
     memset(d, 0, 0xA00);
     if (bank == 0) {
         int base = stage == 0 ? 0x110 : stage == 5 ? 0x310 : stage == 1 ? 0x510 : -1;
@@ -4597,6 +4605,7 @@ static void driver_bank_fill(uint8_t *d, int bank, int stage, const uint32_t gri
     }
 }
 static void support_fill(uint8_t *d, uint32_t w, uint32_t h) {   /* Ryujinx SupportBuffer: render scale 1, no BGRA swap */
+    if (totk_vk_bind_fast_on()) { totk_support_fill_fast(d, w, h); return; }
     memset(d, 0, 1392);
     float vi[4] = {2.0f / (w ? w : 1), 2.0f / (h ? h : 1), 1, 1}, vs[4] = {(float)w, (float)h, 1, 1};
     memcpy(d + 144, vi, 16); memcpy(d + 160, vs, 16);
@@ -4742,6 +4751,7 @@ static totk_dsc_vic g_dsc_vic;
 /* Hash both identities in one word-wise pass over the zero-filled infos. The second uses add/multiply/rotate rather
    than the first's xor/multiply/shift, not just another seed of the same hash. */
 static void hash_words(const void *p, size_t n, uint64_t h[2]) {
+    if (totk_vk_bind_fast_on()) { totk_hash_words_fast(p, n, h); return; }
     const uint8_t *b = p; size_t i = 0; uint64_t a = h[0], c = h[1];
     for (; i + 8 <= n; i += 8) {
         uint64_t w; memcpy(&w, b + i, 8);
@@ -4754,7 +4764,20 @@ static void hash_words(const void *p, size_t n, uint64_t h[2]) {
 /* Exact shader-used binding values. Every kind uses at most two words; write
    directly to the destination instead of returning/copying a larger zero-padded key. */
 typedef struct { uint64_t value[2]; } record_binding;
+_Static_assert(sizeof(record_binding) == sizeof(totk_rec_bind_val_t), "record_binding size");
+static inline totk_bind_stage_ctx_t bind_stage_ctx(int stage) {
+    uint32_t bits = 0u; memcpy(&bits, &S.alpha_ref, 4);
+    return (totk_bind_stage_ctx_t){(const totk_bind_buf_slot_t *)S.ubo[stage], (const totk_bind_buf_slot_t *)S.ssbo[stage], S.tex[stage], S.samp[stage], S.img[stage], g_driver_revision[0][stage], g_driver_revision[1][stage], (uint64_t)bits};
+}
+static int record_bindings_same(const vk_shader *sh, int stage, const record_binding *prev) {
+    if (totk_vk_bind_fast_on()) {
+        totk_bind_stage_ctx_t ctx = bind_stage_ctx(stage);
+        return totk_bind_eq_fast(&ctx, (const totk_vk_bind_rec_t *)sh->b, sh->nb, (const totk_rec_bind_val_t *)prev);
+    }
+    return -1;
+}
 static void record_binding_of(const vk_bind *b, int stage, record_binding *r) {
+    if (totk_vk_bind_fast_on()) { totk_bind_stage_ctx_t ctx = bind_stage_ctx(stage); totk_bind_eval_one_fast(&ctx, (const totk_vk_bind_rec_t *)b, &r->value[0], &r->value[1]); return; }
     *r = (record_binding){{0}};
     if (b->kind == RB_SUPPORT || b->kind == RB_C1) return;
     if (b->kind == RB_ALPHA) { uint32_t bits; memcpy(&bits,&S.alpha_ref,4); r->value[0]=bits; return; }
@@ -4965,7 +4988,8 @@ static int record_stage_fast_hit(vk_shader *sh, int stage, uint32_t set, const s
     if (!g_stage_freeze_slots) g_stage_freeze_slots = calloc(TOTK_STAGE_FREEZE_SLOTS, sizeof *g_stage_freeze_slots);
     if (!g_stage_freeze_slots) return 0;
     record_binding cur[TOTK_STAGE_MAX_NB];
-    for (int i = 0; i < sh->nb; i++) record_binding_of(&sh->b[i], stage, &cur[i]);
+    if (totk_vk_bind_fast_on()) { totk_bind_stage_ctx_t ctx = bind_stage_ctx(stage); totk_bind_fill_fast(&ctx, (const totk_vk_bind_rec_t *)sh->b, sh->nb, (totk_rec_bind_val_t *)cur); }
+    else for (int i = 0; i < sh->nb; i++) record_binding_of(&sh->b[i], stage, &cur[i]);
     uint64_t sig = totk_stage_bind_hash((uint64_t)(uintptr_t)sh, (uint32_t)stage, cur, (uint32_t)sh->nb);
     totk_stage_env env; stage_env_pack(&env, k, sh, stage);
     stage_uni_ctx uctx = {sh, stage};
@@ -5008,9 +5032,9 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
     if (!c1off && last->valid && last->key.shader == sh && last->key.chunk == key.chunk &&
         last->key.submission == key.submission && last->key.stage == key.stage) {
         if (last->key.bindings != key.bindings) {
-            int same = 1;
-            for (int i = 0; i < sh->nb; i++) { record_binding value; record_binding_of(&sh->b[i], stage, &value);
-                if (memcmp(&last->bindings[i], &value, sizeof value)) { same = 0; break; } }
+            int same = record_bindings_same(sh, stage, last->bindings);
+            if (same < 0) { same = 1; for (int i = 0; i < sh->nb; i++) { record_binding value; record_binding_of(&sh->b[i], stage, &value);
+                if (memcmp(&last->bindings[i], &value, sizeof value)) { same = 0; break; } } }
             if (same) { last->key.bindings = key.bindings; vk_record_memo_saved(VK_REC_M_BINDING); }
         }
         if (last->key.uniforms != key.uniforms && record_uniforms_unchanged(sh, stage, last->key.uniforms)) {
