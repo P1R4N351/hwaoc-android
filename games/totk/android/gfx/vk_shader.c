@@ -28,6 +28,7 @@
 #include "vk_cs_fast.h"
 #include "vk_prog_fast.h"
 #include "vk_sig_fast.h"
+#include "vk_view_vfix_fast.h"
 #include "vk_spv_fast.h"
 #include "vk_subgroup.h"
 #include "vk_position.h"
@@ -840,6 +841,7 @@ void mtl_prog_release(prog_t *p) { if (!p->serial) return; pthread_mutex_lock(&g
 /* ---------- varyings a fragment shader reads that the vertex shader does not write (vk_varyings.h) ---------- */
 struct vk_vfix { uint32_t missing; uint64_t kind_pack; uint8_t kind[32]; VkShaderModule mod; struct vk_vfix *next; };
 static pthread_mutex_t g_vfix_mu = PTHREAD_MUTEX_INITIALIZER;
+static totk_vfix_map_t g_vfix_map;
 static _Thread_local totk_vfix_memo4 *t_vfix4;
 static totk_vfix_memo4 *vfix_tls(void) {
     if (!t_vfix4) t_vfix4 = calloc(1, sizeof *t_vfix4);
@@ -869,11 +871,17 @@ VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
     int fast = totk_vk_shader_fast_on(); uint64_t hit = 0;
     totk_vfix_memo4 *tm = fast ? vfix_tls() : NULL;
     if (tm && totk_vfix_memo4_find(tm, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs, &hit)) return (VkShaderModule)(uintptr_t)hit;
-    uint8_t kind[32] = {0};
-    for (int l = 0; l < 32; l++) if (missing >> l & 1) kind[l] = fs->fin_kind[l];
-    uint64_t kpack = totk_pack_vfix_kind(missing, kind);
+    uint8_t kind[32] = {0}; int vvfast = totk_vk_view_vfix_fast_on();
+    if (vvfast) totk_pack_vfix_sparse(missing, fs->fin_kind, kind);
+    else { for (int l = 0; l < 32; l++) if (missing >> l & 1) kind[l] = fs->fin_kind[l]; }
+    uint64_t kpack = totk_pack_vfix_kind(missing, kind), vhit = 0u;
     pthread_mutex_lock(&g_vfix_mu);
-    for (struct vk_vfix *f = vs->vfix; f; f = f->next)
+    if (vvfast && totk_vfix_map_find(&g_vfix_map, (uint64_t)(uintptr_t)vs, missing, kpack, &vhit)) {
+        VkShaderModule m = (VkShaderModule)(uintptr_t)vhit; pthread_mutex_unlock(&g_vfix_mu);
+        if (tm) totk_vfix_memo4_put(tm, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs, vhit);
+        return m;
+    }
+    if (!vvfast || g_vfix_map.partial) for (struct vk_vfix *f = vs->vfix; f; f = f->next)
         if (f->missing == missing && f->kind_pack == kpack) {
             VkShaderModule m = f->mod; pthread_mutex_unlock(&g_vfix_mu);
             if (tm) totk_vfix_memo4_put(tm, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs, (uint64_t)(uintptr_t)m);
@@ -888,7 +896,11 @@ VkShaderModule vk_vs_module_for(vk_shader *vs, const vk_shader *fs) {
     free(w); free(o);
     VkShaderModule out = mod ? mod : vs->mod;
     struct vk_vfix *f = calloc(1, sizeof *f);
-    if (f) { f->missing = missing; f->kind_pack = kpack; memcpy(f->kind, kind, sizeof kind); f->mod = out; f->next = vs->vfix; vs->vfix = f; }
+    if (f) {
+        f->missing = missing; f->kind_pack = kpack; memcpy(f->kind, kind, sizeof kind); f->mod = out; f->next = vs->vfix; vs->vfix = f;
+        if (vvfast) totk_vfix_map_put(&g_vfix_map, (uint64_t)(uintptr_t)vs, missing, kpack, (uint64_t)(uintptr_t)out);
+        else g_vfix_map.partial = 1u;
+    }
     pthread_mutex_unlock(&g_vfix_mu);
     if (tm) totk_vfix_memo4_put(tm, (uint64_t)(uintptr_t)vs, (uint64_t)(uintptr_t)fs, (uint64_t)(uintptr_t)out);
     static _Atomic unsigned logged;

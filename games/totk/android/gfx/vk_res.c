@@ -33,6 +33,7 @@
 #include "vk_edge_guard.h"
 #include "vk_res_fast.h"
 #include "vk_tbuf_fast.h"
+#include "vk_view_vfix_fast.h"
 #include "vk_view_fast.h"
 #include "vk_reg_wb_fast.h"
 #include "vk_serial_fast.h"
@@ -276,6 +277,7 @@ typedef struct vk_img {
     int trace_selected; uint64_t trace_serial, trace_storage; /* populated only by the opt-in copy diagnostic */
     int wbrefs, orphan;   /* write-back pins are separate from actual texture-object references */
     view_ent *views; int nviews, capviews;
+    uint64_t view_ep; uint32_t kv_tgen, rev_tgen;
     int gpu_written;
     int arr3d;      /* 3D, created 2D_ARRAY_COMPATIBLE: its slices can be render targets */
     int blk_rt;     /* block-compressed, created BLOCK_TEXEL_VIEW_COMPATIBLE | EXTENDED_USAGE with attachment usage */
@@ -690,7 +692,7 @@ static int img_upgrade_inner(vk_tex *x, VkFormat want) {
         totk_texcopy_log(vk_submit_serial(), "phase=res event=image-upgrade ser=%llu old_image=%#llx new_image=%#llx in_pass=%d",
             (unsigned long long)x->serial, (unsigned long long)(uintptr_t)old->img, (unsigned long long)(uintptr_t)nu->img, in_pass);
     retire((retired_t){.img = old->img, .mem = old->mem, .views = old->views, .nviews = old->nviews});
-    old->img = nu->img; old->mem = nu->mem; old->views = NULL; old->nviews = old->capviews = 0; old->nlst = 0;
+    old->img = nu->img; old->mem = nu->mem; old->views = NULL; old->nviews = old->capviews = 0; old->view_ep = 0; old->kv_tgen = old->rev_tgen = 0; old->nlst = 0;
     old->usage = nu->usage; old->blk_rt = nu->blk_rt; old->arr3d = nu->arr3d;
     tex_stamp_bump(&old->identity);
     tex_stamp_drop(nu->identity);
@@ -1885,6 +1887,75 @@ static VkImageViewType view_type_of(int target, const vk_img *im, uint32_t nlaye
     }
     return VK_IMAGE_VIEW_TYPE_2D;
 }
+static uint64_t g_view_ep_seq;
+static totk_view_kv_map_t g_view_kv_map;
+static totk_view_rev_map_t g_view_rev_map;
+static int img_view_kv_lookup_locked(vk_img *im, uint64_t k0, uint64_t k1, VkImageView *out) {
+    if (!im || !im->nviews) return 0;
+    int fast = totk_vk_view_vfix_fast_on();
+    if (fast && im->nviews > 2 && im->view_ep) {
+        uint64_t vu = 0u;
+        if (totk_view_kv_map_find(&g_view_kv_map, im->view_ep, k0, k1, &vu)) {
+            *out = (VkImageView)(uintptr_t)vu;
+            return 1;
+        }
+    }
+    for (int i = 0; i < im->nviews; i++) if (im->views[i].k0 == k0 && im->views[i].k1 == k1) {
+        VkImageView v = im->views[i].v;
+        if (i >= 2 && res_fast_on()) { view_ent tmp = im->views[1]; im->views[1] = im->views[i]; im->views[i] = tmp; }
+        if (fast && v != VK_NULL_HANDLE) {
+            if (!im->view_ep) im->view_ep = ++g_view_ep_seq;
+            im->kv_tgen = totk_view_kv_map_put(&g_view_kv_map, im->view_ep, k0, k1, (uint64_t)(uintptr_t)v);
+        }
+        *out = v;
+        return 1;
+    }
+    return 0;
+}
+static int img_view_rev_lookup_locked(vk_img *im, VkImageView view, uint64_t *k0_out, uint64_t *k1_out) {
+    if (!im || !im->nviews || view == VK_NULL_HANDLE) return 0;
+    int fast = totk_vk_view_vfix_fast_on();
+    if (fast && im->nviews > 2 && im->view_ep && totk_view_rev_map_find(&g_view_rev_map, im->view_ep, (uint64_t)(uintptr_t)view, k0_out, k1_out)) return 1;
+    for (int i = 0; i < im->nviews; i++) if (im->views[i].v == view) {
+        *k0_out = im->views[i].k0; *k1_out = im->views[i].k1;
+        if (fast) {
+            if (!im->view_ep) im->view_ep = ++g_view_ep_seq;
+            im->rev_tgen = totk_view_rev_map_put(&g_view_rev_map, im->view_ep, (uint64_t)(uintptr_t)view, *k0_out, *k1_out);
+        }
+        return 1;
+    }
+    return 0;
+}
+static VkImageView img_view_append_locked(vk_img *im, const tex_t *t, uint64_t k0, uint64_t k1, int attach,
+                                          VkImageViewType vt, VkFormat vf, VkComponentMapping sw,
+                                          VkImageAspectFlags aspect, unsigned l0, unsigned nl, unsigned s0, unsigned ns) {
+    VkImageView v = VK_NULL_HANDLE;
+    if (img_view_kv_lookup_locked(im, k0, k1, &v)) return v;
+    VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
+        .usage = attach == 1 ? im->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
+               : attach == 2 ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
+    if (!(im->usage & uci.usage)) { RED(16, "texture ser %llu cannot be %s (format %#x)", (unsigned long long)t->serial, attach == 1 ? "a render target" : attach == 2 ? "a storage image" : "sampled", t->d.format); return VK_NULL_HANDLE; }
+    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, .image = im->img, .viewType = vt, .format = vf, .components = sw,
+        .subresourceRange = {aspect, l0, nl, s0, ns}};
+    if (vkCreateImageView(V.dev, &ci, NULL, &v)) { RED(16, "vkCreateImageView failed (ser %llu fmt %d type %d)", (unsigned long long)t->serial, vf, vt); return VK_NULL_HANDLE; }
+    if (im->nviews == im->capviews) { im->capviews = im->capviews ? 2 * im->capviews : 4; im->views = realloc(im->views, (size_t)im->capviews * sizeof *im->views); }
+    im->views[im->nviews++] = (view_ent){k0, k1, v};
+    if (totk_vk_view_vfix_fast_on() && v != VK_NULL_HANDLE) {
+        if (!im->view_ep) im->view_ep = ++g_view_ep_seq;
+        im->kv_tgen = totk_view_kv_map_put(&g_view_kv_map, im->view_ep, k0, k1, (uint64_t)(uintptr_t)v);
+        im->rev_tgen = totk_view_rev_map_put(&g_view_rev_map, im->view_ep, (uint64_t)(uintptr_t)v, k0, k1);
+    }
+    return v;
+}
+static VkComponentMapping view_swizzle_map(const tex_t *t, const view_t *v, VkComponentMapping fs) {
+    unsigned sel[4] = {t->d.swizzle_r, t->d.swizzle_g, t->d.swizzle_b, t->d.swizzle_a};
+    if (v && v->set_swizzle) for (unsigned i = 0; i < 4; i++) sel[i] = v->swz[i];
+    if (!t->d.swizzle_r && !t->d.swizzle_g && !t->d.swizzle_b && !t->d.swizzle_a && !(v && v->set_swizzle)) return fs;
+    const VkComponentSwizzle fc[4] = {fs.r, fs.g, fs.b, fs.a};
+    VkComponentSwizzle c[4];
+    for (unsigned i = 0; i < 4; i++) c[i] = sel[i] == 0 ? VK_COMPONENT_SWIZZLE_ZERO : sel[i] == 1 ? VK_COMPONENT_SWIZZLE_ONE : sel[i] <= 5 ? fc[sel[i] - 2] : VK_COMPONENT_SWIZZLE_IDENTITY;
+    return (VkComponentMapping){c[0], c[1], c[2], c[3]};
+}
 /* attach: 0 sampling (want_target: the shader's declared target, -1 = the texture's own), 1 attachment, 2 storage */
 static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_target) {
     vk_img *im = x->im; const tex_t *t = &x->t;
@@ -1936,32 +2007,13 @@ static VkImageView view_get(vk_tex *x, const view_t *v, int attach, int want_tar
         int stencil_mode = v && v->set_dsmode ? v->dsmode : t->d.dsmode;
         if (aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))
             aspect = stencil_mode ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT;
-        if (attach == 0) {   /* NVN swizzle selectors over the format's own remap (nvn_mtl.m tex_swizzle_sel) */
-            unsigned sel[4] = {t->d.swizzle_r, t->d.swizzle_g, t->d.swizzle_b, t->d.swizzle_a};
-            if (v && v->set_swizzle) for (unsigned i = 0; i < 4; i++) sel[i] = v->swz[i];
-            const VkComponentSwizzle fc[4] = {fs.r, fs.g, fs.b, fs.a};
-            VkComponentSwizzle c[4];
-            for (unsigned i = 0; i < 4; i++) c[i] = sel[i] == 0 ? VK_COMPONENT_SWIZZLE_ZERO : sel[i] == 1 ? VK_COMPONENT_SWIZZLE_ONE : sel[i] <= 5 ? fc[sel[i] - 2] : VK_COMPONENT_SWIZZLE_IDENTITY;
-            if (!t->d.swizzle_r && !t->d.swizzle_g && !t->d.swizzle_b && !t->d.swizzle_a && !(v && v->set_swizzle)) { c[0] = fs.r; c[1] = fs.g; c[2] = fs.b; c[3] = fs.a; }   /* no selectors: the format's remap */
-            sw = (VkComponentMapping){c[0], c[1], c[2], c[3]};
-        }
+        if (attach == 0) sw = view_swizzle_map(t, v, fs);
     }
     if (vt == VK_IMAGE_VIEW_TYPE_3D && im->type != VK_IMAGE_TYPE_3D) vt = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     if (im->type == VK_IMAGE_TYPE_3D && attach != 1) { vt = VK_IMAGE_VIEW_TYPE_3D; s0 = 0; ns = 1; }
     uint64_t k0 = (uint64_t)vf | (uint64_t)vt << 32 | (uint64_t)aspect << 40 | (uint64_t)(attach & 3) << 48, k1 = (uint64_t)l0 | (uint64_t)nl << 8 | (uint64_t)s0 << 16 | (uint64_t)ns << 28
         | (uint64_t)(sw.r & 7) << 40 | (uint64_t)(sw.g & 7) << 43 | (uint64_t)(sw.b & 7) << 46 | (uint64_t)(sw.a & 7) << 49;
-    for (int i = 0; i < im->nviews; i++) if (im->views[i].k0 == k0 && im->views[i].k1 == k1) { if (i >= 2 && res_fast_on()) { view_ent tmp = im->views[1]; im->views[1] = im->views[i]; im->views[i] = tmp; return im->views[1].v; } return im->views[i].v; }
-    VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
-        .usage = attach == 1 ? im->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)
-               : attach == 2 ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
-    if (!(im->usage & uci.usage)) { RED(16, "texture ser %llu cannot be %s (format %#x)", (unsigned long long)t->serial, attach == 1 ? "a render target" : attach == 2 ? "a storage image" : "sampled", t->d.format); return VK_NULL_HANDLE; }
-    VkImageViewCreateInfo ci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &uci, .image = im->img, .viewType = vt, .format = vf, .components = sw,
-        .subresourceRange = {aspect, l0, nl, s0, ns}};
-    VkImageView view;
-    if (vkCreateImageView(V.dev, &ci, NULL, &view)) { RED(16, "vkCreateImageView failed (ser %llu fmt %d type %d)", (unsigned long long)t->serial, vf, vt); return VK_NULL_HANDLE; }
-    if (im->nviews == im->capviews) { im->capviews = im->capviews ? 2 * im->capviews : 4; im->views = realloc(im->views, (size_t)im->capviews * sizeof *im->views); }
-    im->views[im->nviews++] = (view_ent){k0, k1, view};
-    return view;
+    return img_view_append_locked(im, t, k0, k1, attach, vt, vf, sw, aspect, l0, nl, s0, ns);
 }
 /* Diagnostic identity comes from the actual cached Vulkan view, not a guessed registry range.
    No resource is created, content resolved or pass ended by this metadata query. */
@@ -1981,9 +2033,8 @@ int vk_tex_view_identity(vk_tex *x, VkImageView view, vk_canvas_image *image, Vk
     pthread_mutex_lock(&g_tex_mu);
     vk_img *images[2] = {x ? x->im : NULL, x && x->im ? x->im->native : NULL};
     for (unsigned k = 0; k < 2 && !found; k++) if (images[k]) {
-        vk_img *im = images[k];
-        for (int i = 0; i < im->nviews; i++) if (im->views[i].v == view) {
-            uint64_t a = im->views[i].k0, b = im->views[i].k1;
+        vk_img *im = images[k]; uint64_t a = 0u, b = 0u;
+        if (img_view_rev_lookup_locked(im, view, &a, &b)) {
             *range = (VkImageSubresourceRange){(VkImageAspectFlags)((a >> 40) & 255),
                 (uint32_t)(b & 255), (uint32_t)((b >> 8) & 255),
                 (uint32_t)((b >> 16) & 4095), (uint32_t)((b >> 28) & 4095)};
@@ -2026,13 +2077,13 @@ VkImageView vk_tex_view_levels(vk_tex *x, VkImageView view, uint32_t levels) {
     int found_view = 0;
     pthread_mutex_lock(&g_tex_mu);
     vk_img *im = x ? x->im : NULL;
-    for (int i = 0; im && levels && i < im->nviews; i++) if (im->views[i].v == view) {
+    uint64_t k0 = 0u, k1 = 0u;
+    if (im && levels && img_view_rev_lookup_locked(im, view, &k0, &k1)) {
         found_view = 1;
-        uint64_t k0 = im->views[i].k0, k1 = im->views[i].k1;
         uint32_t l0 = (uint32_t)(k1 & 255), nl = (uint32_t)((k1 >> 8) & 255);
-        if (levels >= nl) break;
+        if (levels < nl) {
         uint64_t cut = (k1 & ~(255ull << 8)) | (uint64_t)levels << 8;
-        for (int j = 0; j < im->nviews; j++) if (im->views[j].k0 == k0 && im->views[j].k1 == cut) { result = im->views[j].v; goto done; }
+        if (img_view_kv_lookup_locked(im, k0, cut, &result)) goto done;
         VkImageViewUsageCreateInfo uci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO,
             .usage = (k0 >> 48 & 3) == 2 ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT};
         VkComponentMapping sw = {(VkComponentSwizzle)(k1 >> 40 & 7), (VkComponentSwizzle)(k1 >> 43 & 7),
@@ -2041,10 +2092,16 @@ VkImageView vk_tex_view_levels(vk_tex *x, VkImageView view, uint32_t levels) {
             .viewType = (VkImageViewType)(k0 >> 32 & 0xff), .format = (VkFormat)(uint32_t)k0, .components = sw,
             .subresourceRange = {(VkImageAspectFlags)(k0 >> 40 & 0xff), l0, levels, (uint32_t)(k1 >> 16 & 4095), (uint32_t)(k1 >> 28 & 4095)}};
         VkImageView v;
-        if (vkCreateImageView(V.dev, &ci, NULL, &v)) { RED(16, "feedback-cut view failed (ser %llu)", (unsigned long long)x->serial); found_view = 0; break; }
+        if (vkCreateImageView(V.dev, &ci, NULL, &v)) { RED(16, "feedback-cut view failed (ser %llu)", (unsigned long long)x->serial); found_view = 0; goto done; }
         if (im->nviews == im->capviews) { im->capviews = im->capviews ? 2 * im->capviews : 4; im->views = realloc(im->views, (size_t)im->capviews * sizeof *im->views); }
         im->views[im->nviews++] = (view_ent){k0, cut, v};
-        result = v; break;
+        if (totk_vk_view_vfix_fast_on() && v != VK_NULL_HANDLE) {
+            if (!im->view_ep) im->view_ep = ++g_view_ep_seq;
+            im->kv_tgen = totk_view_kv_map_put(&g_view_kv_map, im->view_ep, k0, cut, (uint64_t)(uintptr_t)v);
+            im->rev_tgen = totk_view_rev_map_put(&g_view_rev_map, im->view_ep, (uint64_t)(uintptr_t)v, k0, cut);
+        }
+        result = v;
+        }
     }
 done:
     if (fast && found_view && im && result != VK_NULL_HANDLE && T_view_cut_memo) {
@@ -2066,9 +2123,8 @@ int vk_xlate_texture_view_type(vk_tex *x, VkImageView view) {
     pthread_mutex_lock(&g_tex_mu);
     vk_img *images[2] = {x ? x->im : NULL, x && x->im ? x->im->native : NULL};
     for (int k = 0; k < 2; k++) if (images[k]) {
-        vk_img *im = images[k];
-        for (int i = 0; i < im->nviews; i++) if (im->views[i].v == view) {
-            uint64_t a = im->views[i].k0, b = im->views[i].k1;
+        vk_img *im = images[k]; uint64_t a = 0u, b = 0u;
+        if (type < 0 && img_view_rev_lookup_locked(im, view, &a, &b)) {
             type = (int)((a >> 32) & 0xff);
             if (fast) {
                 if (!T_view_id_memo) T_view_id_memo = calloc(1, sizeof *T_view_id_memo);

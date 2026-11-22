@@ -33,6 +33,7 @@
 #include "vk_bind_fast.h"
 #include "vk_pso_key_fast.h"
 #include "vk_sig_fast.h"
+#include "vk_view_vfix_fast.h"
 _Static_assert(VK_PRIMITIVE_TOPOLOGY_POINT_LIST == 0 && VK_PRIMITIVE_TOPOLOGY_LINE_LIST == 1 && VK_PRIMITIVE_TOPOLOGY_LINE_STRIP == 2 && VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST == 3 && VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP == 4 && VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN == 5, "topology");
 _Static_assert(sizeof(VkDynamicState) == sizeof(uint32_t), "VkDynamicState size");
 _Static_assert(TOTK_DYN_VIEWPORT == VK_DYNAMIC_STATE_VIEWPORT && TOTK_DYN_SCISSOR == VK_DYNAMIC_STATE_SCISSOR && TOTK_DYN_LINE_WIDTH == VK_DYNAMIC_STATE_LINE_WIDTH && TOTK_DYN_DEPTH_BIAS == VK_DYNAMIC_STATE_DEPTH_BIAS && TOTK_DYN_BLEND_CONSTANTS == VK_DYNAMIC_STATE_BLEND_CONSTANTS && TOTK_DYN_STENCIL_COMPARE_MASK == VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK && TOTK_DYN_STENCIL_WRITE_MASK == VK_DYNAMIC_STATE_STENCIL_WRITE_MASK && TOTK_DYN_STENCIL_REFERENCE == VK_DYNAMIC_STATE_STENCIL_REFERENCE && TOTK_DYN_CULL_MODE == VK_DYNAMIC_STATE_CULL_MODE && TOTK_DYN_FRONT_FACE == VK_DYNAMIC_STATE_FRONT_FACE && TOTK_DYN_PRIMITIVE_TOPOLOGY == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY && TOTK_DYN_VERTEX_INPUT_BINDING_STRIDE == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE && TOTK_DYN_DEPTH_TEST_ENABLE == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE && TOTK_DYN_DEPTH_WRITE_ENABLE == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE && TOTK_DYN_DEPTH_COMPARE_OP == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP && TOTK_DYN_STENCIL_TEST_ENABLE == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE && TOTK_DYN_STENCIL_OP == VK_DYNAMIC_STATE_STENCIL_OP && TOTK_DYN_DEPTH_BIAS_ENABLE == VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE && TOTK_DYN_PRIMITIVE_RESTART_ENABLE == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, "totk dynamic states");
@@ -223,6 +224,7 @@ static struct {
     uint64_t frame, start, reads, writes, unknown, total_unknown, memo_pass, memo_sub;
     uint64_t color_draws[8], depth_draws, stencil_draws;
     pso_life_read_key *memo;
+    totk_pso_life_set_t *memo_set;
     size_t nmemo;
     VkImageView color_view[8], depth_view, stencil_view;
     uint32_t color_clear, depth_clear;
@@ -242,8 +244,10 @@ static void pso_life_init(void) {
     PL.frame = 1; PL.start = pso_life_number("TOTK_PSO_LIFE_START", 1, UINT32_MAX);
     PL.limit = (unsigned)pso_life_number("TOTK_PSO_LIFE_FRAMES", 12000, 30000);
     PL.memo = calloc(2048, sizeof *PL.memo);
+    PL.memo_set = calloc(1, sizeof *PL.memo_set);
     LOGV("[pso-life] kind=begin w=%u h=%u start=%llu limit=%u", PL.w, PL.h, (unsigned long long)PL.start, PL.limit);
-    if (!PL.memo) {
+    if (!PL.memo || !PL.memo_set) {
+        free(PL.memo); PL.memo = NULL; free(PL.memo_set); PL.memo_set = NULL;
         LOGV("[pso-life] kind=unknown frame=%llu reason=allocation-failed", (unsigned long long)PL.start);
         LOGV("[pso-life] kind=end frame=%llu complete=0 unknown=1", (unsigned long long)PL.start);
         return;
@@ -320,10 +324,10 @@ static void pso_life_present(void) {
         if (PL.frame - PL.start + 1 == PL.limit) {
             LOGV("[pso-life] kind=end frame=%llu complete=1 unknown=%llu", (unsigned long long)PL.frame,
                  (unsigned long long)PL.total_unknown);
-            PL.enabled = 0; free(PL.memo); PL.memo = NULL;
+            PL.enabled = 0; free(PL.memo); PL.memo = NULL; free(PL.memo_set); PL.memo_set = NULL;
         }
     }
-    PL.frame++; PL.reads = PL.writes = PL.unknown = 0; PL.nmemo = 0;
+    PL.frame++; PL.reads = PL.writes = PL.unknown = 0; PL.nmemo = 0; totk_pso_life_set_clear(PL.memo_set);
 }
 /* Opt-in until measured on Turnip: splitting a full clear can recover LRZ but costs another attachment load/store. */
 static int store_clear_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("TOTK_VK_STORE_CLEAR"); v = e && atoi(e) == 1; } return v; }
@@ -4861,11 +4865,34 @@ static VkImageView native_texture_by_id(int tid, int *want, vk_tex **object) {
 }
 /* Enumerate descriptor MAY-reads before freeze-memo reuse. The actual view cache supplies exact ranges,
    so a changed registration/serial cannot be mistaken for a new lifetime or the wrong mip/layer. */
+static int pso_life_read_dup(uint64_t image_u, uint64_t incarn, unsigned mip,
+                             unsigned layer, unsigned aspect, unsigned stage, uint32_t binding) {
+    pso_life_read_key key = {image_u, incarn, mip, layer, aspect, stage, binding};
+    if (totk_vk_view_vfix_fast_on() && PL.memo_set) {
+        uint64_t meta = 0u;
+        totk_pso_life_pack_meta(mip, layer, aspect, stage, binding, &meta);
+        int r = totk_pso_life_set_check_add(PL.memo_set, image_u, incarn, meta, PL.nmemo, 2048u);
+        if (r == 1) return 1;
+        if (r == 0 && PL.nmemo < 2048u) PL.memo[PL.nmemo++] = key;
+        else if (r == -1) pso_life_unknown("read-memo-capacity");
+        return 0;
+    }
+    int duplicate = 0;
+    for (size_t j = 0; j < PL.nmemo; j++) {
+        const pso_life_read_key *old = &PL.memo[j];
+        if (old->image == key.image && old->incarnation == key.incarnation && old->mip == key.mip &&
+            old->layer == key.layer && old->aspect == key.aspect && old->stage == key.stage &&
+            old->binding == key.binding) { duplicate = 1; break; }
+    }
+    if (!duplicate && PL.nmemo < 2048) PL.memo[PL.nmemo++] = key;
+    else if (!duplicate) pso_life_unknown("read-memo-capacity");
+    return duplicate;
+}
 static void pso_life_reads(const vk_shader *sh, unsigned stage) {
     if (!pso_life_active()) return;
     uint64_t sub = vk_game_submit_serial();
     if (!R.open || PL.memo_sub != sub || PL.memo_pass != g_stat_passes) {
-        PL.nmemo = 0; PL.memo_sub = sub; PL.memo_pass = g_stat_passes;
+        PL.nmemo = 0; PL.memo_sub = sub; PL.memo_pass = g_stat_passes; totk_pso_life_set_clear(PL.memo_set);
     }
     for (int i = 0; i < sh->nb; i++) {
         const vk_bind *b = &sh->b[i];
@@ -4895,18 +4922,8 @@ static void pso_life_reads(const vk_shader *sh, unsigned stage) {
             if (vk_tex_is3d(object)) { pso_life_unknown("3d-sampled-range"); continue; }
             for (unsigned layer = range.baseArrayLayer; layer < range.baseArrayLayer + range.layerCount; layer++)
                 for (unsigned aspect = 1; aspect <= VK_IMAGE_ASPECT_STENCIL_BIT; aspect <<= 1) if (range.aspectMask & aspect) {
-                    pso_life_read_key key = {image.image, image.incarnation, mip, layer, aspect, stage, b->binding};
-                    int duplicate = 0;
-                    if (R.open && b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
-                        for (size_t j = 0; j < PL.nmemo; j++) {
-                            const pso_life_read_key *old = &PL.memo[j];
-                            if (old->image == key.image && old->incarnation == key.incarnation && old->mip == key.mip &&
-                                old->layer == key.layer && old->aspect == key.aspect && old->stage == key.stage &&
-                                old->binding == key.binding) { duplicate = 1; break; }
-                        }
-                        if (!duplicate && PL.nmemo < 2048) PL.memo[PL.nmemo++] = key;
-                        else if (!duplicate) pso_life_unknown("read-memo-capacity");
-                    }
+                    int duplicate = (R.open && b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+                        ? pso_life_read_dup(image.image, image.incarnation, mip, layer, aspect, stage, b->binding) : 0;
                     if (duplicate) continue;
                     PL.reads++;
                     LOGV("[pso-life] kind=read frame=%llu sub=%llu pass=%llu image=%#llx incarnation=%llu mip=%u layer=%u aspect=%u "
@@ -6787,12 +6804,18 @@ static VkPipelineLayout g_clear_mask_layout;
 static VkShaderModule g_clear_mask_module[4];   /* vertex; fragment float, uint, int */
 static struct { VkFormat format; uint32_t mask; VkSampleCountFlagBits samples; VkPipeline pipeline; } g_clear_mask_pipe[32];
 static int g_clear_mask_npipe;
+static totk_clear_pipe_map_t g_clear_pipe_map;
 static uint64_t g_clear_region, g_clear_masked;   /* ClearTexture calls that needed the region/mask path (tests) */
 #include "vk_clear_mask_spv.h"
 static VkPipeline clear_mask_pipeline(VkFormat format, uint32_t mask, VkSampleCountFlagBits samples, int type) {
-    for (int i = 0; i < g_clear_mask_npipe; i++)
-        if (g_clear_mask_pipe[i].format == format && g_clear_mask_pipe[i].mask == mask && g_clear_mask_pipe[i].samples == samples)
-            return g_clear_mask_pipe[i].pipeline;
+    if (totk_vk_view_vfix_fast_on()) {
+        int hit = totk_clear_pipe_map_find(&g_clear_pipe_map, (uint32_t)format, mask, (uint32_t)samples);
+        if (hit >= 0 && hit < g_clear_mask_npipe) return g_clear_mask_pipe[hit].pipeline;
+    } else {
+        for (int i = 0; i < g_clear_mask_npipe; i++)
+            if (g_clear_mask_pipe[i].format == format && g_clear_mask_pipe[i].mask == mask && g_clear_mask_pipe[i].samples == samples)
+                return g_clear_mask_pipe[i].pipeline;
+    }
     if (g_clear_mask_npipe == (int)(sizeof g_clear_mask_pipe / sizeof *g_clear_mask_pipe)) return VK_NULL_HANDLE;
     if (!g_clear_mask_layout) {
         VkPushConstantRange range = {.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT, .size = 16};
@@ -6825,6 +6848,7 @@ static VkPipeline clear_mask_pipeline(VkFormat format, uint32_t mask, VkSampleCo
     VkPipeline pipeline = VK_NULL_HANDLE;
     if (vk_pcache_graphics(&ci, &pipeline)) return VK_NULL_HANDLE;
     g_clear_mask_pipe[g_clear_mask_npipe++] = (__typeof__(g_clear_mask_pipe[0])){format, mask, samples, pipeline};
+    totk_clear_pipe_map_put(&g_clear_pipe_map, (uint32_t)format, mask, (uint32_t)samples, (uint16_t)g_clear_mask_npipe);
     return pipeline;
 }
 /* One rendering pass per layer/slice over level lv, LOAD/STORE, clearing only the region (and channels). 0 when an

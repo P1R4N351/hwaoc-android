@@ -264,7 +264,7 @@ static VkSampler g_pres_sampler,g_pres_pixel_sampler;
 static VkDescriptorSetLayout g_pres_dsl;
 static VkPipelineLayout g_pres_layout,g_pres_rotated_layout;
 static VkPipeline g_pres_pipe[2],g_pres_rotated_pipe[2],g_bound_pipe;
-static int g_dyn_dirty;
+static int g_dyn_dirty,g_vb_state,g_cs_pipe;
 static VkDescriptorSet g_bound_set[1][2];
 enum { VK_PASS_END_PRESENT, VK_NUI_PRESENT_AHB };
 static unsigned legacy_shaders,rotated_shaders,layouts16,layouts32,pipelines,samplers,descriptors;
@@ -290,6 +290,8 @@ static void ignore(const void *first,...) { (void)first; }
 #define vkCmdEndRendering ignore
 #define vk_barrier_all ignore
 #define vk_native_gpu_end ignore
+#define totk_vb_invalidate ignore
+#define totk_cs_pipe_invalidate ignore
 static int vk_native_ui_enabled(void) { return 1; }
 static VkResult vkCreateSampler(VkDevice d,const VkSamplerCreateInfo *ci,const void *a,VkSampler *out) {
     (void)d;(void)ci;(void)a; *out=(VkSampler)(uintptr_t)(++samplers); return VK_SUCCESS;
