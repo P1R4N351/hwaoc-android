@@ -1,0 +1,11 @@
+blank_issues_enabled: true
+contact_links:
+  - name: AoC Native README
+    url: https://github.com/P1R4N351/hwaoc-android#readme
+    about: Requirements, setup, known limitations and support.
+  - name: AoC Native releases
+    url: https://github.com/P1R4N351/hwaoc-android/releases
+    about: The only place to download AoC Native builds.
+  - name: Shader list for the Mac/iOS apps (MacNativeGames)
+    url: https://github.com/ly05010419/MacNativeGames/blob/main/docs/shader-list.md
+    about: The Mac, iPhone and iPad apps' shared shader list. The Android app does not write shader-list-contribution.txt.
