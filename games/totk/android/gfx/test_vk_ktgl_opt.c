@@ -57,6 +57,7 @@
 #include "test_vk_ktgl_opt_w52.h"
 #include "test_vk_ktgl_opt_w53.h"
 #include "test_vk_ktgl_opt_w54.h"
+#include "test_vk_ktgl_opt_w55.h"
 #include "nvn_dirty.h"
 #include <assert.h>
 #include <stdint.h>
@@ -359,6 +360,7 @@ int main(void) {
     if (run_ktgl_w52_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w53_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w54_tests(g_fault_mode) != 0) g_fail++;
+    if (run_ktgl_w55_tests(g_fault_mode) != 0) g_fail++;
     printf("ktglopttest: fault_mode=%d failures=%d\n", g_fault_mode, g_fail);
     return g_fail != 0;
 }

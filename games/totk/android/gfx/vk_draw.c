@@ -5190,7 +5190,10 @@ static int record_stage_publish_miss(vk_shader *sh, int stage, uint32_t set, int
     if (R.open && count) g_record_draw->sets[set].update = vk_record_template(sh->dsl, input, count);
     if (R.open && cacheable) {
         if (last->cap < sh->nb) { last->cap = sh->nb; last->bindings = realloc(last->bindings, (size_t)last->cap * sizeof *last->bindings); }
-        for (int i = 0; i < sh->nb; i++) record_binding_of(&sh->b[i], stage, &last->bindings[i]);
+        if (totk_vk_ub_gw_fast_on() && totk_vk_bind_fast_on()) {
+            totk_bind_stage_ctx_t ctx = bind_stage_ctx(stage);
+            totk_bind_fill_fast(&ctx, (const totk_vk_bind_rec_t *)sh->b, sh->nb, (totk_rec_bind_val_t *)last->bindings);
+        } else for (int i = 0; i < sh->nb; i++) record_binding_of(&sh->b[i], stage, &last->bindings[i]);
         last->key = *key; last->set = g_record_draw->sets[set]; last->valid = 1;
         if (!stats && totk_vk_stage_fast_on() && sh->nb > 0 && sh->nb <= TOTK_STAGE_MAX_NB) record_stage_fast_put(sh, stage, key, last->bindings, &last->set);
     } else if (!cacheable) vk_record_memo_miss(0, 1u << VK_REC_M_DISABLED);
@@ -5280,7 +5283,9 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
     (void)feedback_cut_refresh();   /* a live TOTK_VK_FEEDBACK_CUT takes effect at this descriptor build */
     if (__builtin_expect(PL.enabled, 0)) pso_life_reads(sh, (unsigned)stage);
     if (g_record_draw) return R.open ? record_stage_impl(sh, stage, set_index, stats) : 0;
-    size_t total = 0; for (int i = 0; i < sh->nb; i++) total += sh->b[i].count;
+    size_t total = 0;
+    if (totk_vk_ub_gw_fast_on() && sh->bind_sum.ready) total = sh->bind_sum.desc_total_count;
+    else for (int i = 0; i < sh->nb; i++) total += sh->b[i].count;
     VkImageView replay_source = VK_NULL_HANDLE;
     static dinfo *info; static size_t capi;
     if (total > capi) { capi = total + 64; info = realloc(info, capi * sizeof *info); }
@@ -5720,10 +5725,13 @@ static void native_reads(vk_shader *const sh[6], unsigned first, unsigned end) {
         if (!(g_native_bound[st].tex[0]&sh[st]->native_tex_mask[0]) &&
             !(g_native_bound[st].tex[1]&sh[st]->native_tex_mask[1]) &&
             !(g_native_bound[st].img&sh[st]->native_img_mask)) continue;
-        for (int i=0;i<sh[st]->nb;i++) {
+        int fast_nr = totk_vk_ub_gw_fast_on() && sh[st]->ub_gw_sum.fast;
+        uint64_t nrm = fast_nr ? sh[st]->ub_gw_sum.img3_mask : 0u;
+        for (int i = 0; fast_nr ? (nrm != 0u) : (i < sh[st]->nb); ) {
+            if (fast_nr) { i = __builtin_ctzll(nrm); nrm &= nrm - 1u; }
             const vk_bind *b=&sh[st]->b[i];
-            if (b->dtype!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype!=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
-                b->dtype!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
+            if (!fast_nr && b->dtype!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype!=VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+                b->dtype!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) { i++; continue; }
             uint64_t handle=b->kind==RB_IMG ? (b->reg>=0 && b->reg<32 ? S.img[st][b->reg] : 0) :
                 (b->reg>=0 && b->reg<128 ? S.tex[st][b->reg] : 0);
             if (!handle || !vk_native_descriptor((int)(handle&0xfffff))) continue;
@@ -5736,8 +5744,33 @@ static void native_reads(vk_shader *const sh[6], unsigned first, unsigned end) {
                 }
             vk_tex_native_read(x);
             if (b->dtype==VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) vk_tex_native_written(x,0);
+            if (!fast_nr) i++;
         }
     }
+}
+static int canvas_transfer_scan(const vk_shader *fs, vk_tex *target, vk_canvas_image *tsrc, vk_canvas_image *twin) {
+    int transfer = 0, fast_c = totk_vk_ub_gw_fast_on() && fs->ub_gw_sum.fast;
+    uint64_t cm = fast_c ? fs->ub_gw_sum.cis_tex128_mask : 0u;
+    vk_end_rendering_at(VK_PASS_END_ATTACHMENTS, 0);
+    for (int i = 0; fast_c ? (cm != 0u) : (i < fs->nb); ) {
+        if (fast_c) { i = __builtin_ctzll(cm); cm &= cm - 1u; }
+        const vk_bind *b = &fs->b[i];
+        if (fast_c || (b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->reg >= 0 && b->reg < 128)) {
+            int want = b->target; vk_tex *source = NULL;
+            vk_tex_by_id((int)(S.tex[1][b->reg] & 0xfffff), &want, &source);
+            if (source && source != target && b->target == 1 && S.has_vp && !S.vp[0][0] && !S.vp[0][1] &&
+                S.vp[0][2] == vk_tex_width(source,0) && S.vp[0][3] == vk_tex_height(source,0) &&
+                vk_tex_width(source,0) <= vk_tex_width(target,0) && vk_tex_height(source,0) <= vk_tex_height(target,0) &&
+                vk_tex_width(source,0) >= 640 && vk_tex_levels(source) == 1 && vk_tex_layers(source) == 1 &&
+                !vk_tex_is3d(source) && vk_tex_samples(source) == 1 && vk_tex_aspect(source) == VK_IMAGE_ASPECT_COLOR_BIT) {
+                *tsrc = vk_tex_canvas_identity(source,0,0); *twin = vk_tex_canvas_identity(target,0,0);
+                vk_canvas_transfer(tsrc, twin, 0); transfer = 1;
+                if (vk_native_ui_enabled()) { vk_tex_native_promote(source); g_native_sample = source; vk_tex_native_transfer(target, vk_tex_width(source,0), vk_tex_height(source,0)); }
+            }
+        }
+        if (!fast_c) i++;
+    }
+    return transfer;
 }
 static int canvas_draw_prepare(vk_shader *const sh[6], vk_canvas_image *transfer_source, vk_canvas_image *transfer_window) {
     g_native_sample = NULL; int one = 0, transfer = 0;
@@ -5746,33 +5779,11 @@ static int canvas_draw_prepare(vk_shader *const sh[6], vk_canvas_image *transfer
         if (vk_native_ui_enabled()) native_reads(sh,0,2);
         return 0;
     }
-    vk_tex *target = S.has_rt && S.rt.n == 1 ?
-        (R.open ? R.ctex[0] : vk_tex_get(S.rt.color[0])) : NULL;
+    vk_tex *target = S.has_rt && S.rt.n == 1 ? (R.open ? R.ctex[0] : vk_tex_get(S.rt.color[0])) : NULL;
     unsigned target_level=target?view_level(&S.rt.cview[0],S.rt.has_cview[0]):0;
     unsigned target_layer=target && S.rt.has_cview[0] && S.rt.cview[0].set_layers?S.rt.cview[0].min_layer:0;
-    if (target && !S.rt.depth && !target_level && !target_layer && sh[1] && sh[1]->canvas_transfer && vk_tex_canvas_window(target)) {
-        vk_end_rendering_at(VK_PASS_END_ATTACHMENTS,0);
-        for (int i = 0; i < sh[1]->nb; i++) {
-            const vk_bind *b = &sh[1]->b[i];
-            if (b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b->reg < 0 || b->reg >= 128) continue;
-            int want = b->target; vk_tex *source = NULL;
-            vk_tex_by_id((int)(S.tex[1][b->reg] & 0xfffff), &want, &source);
-            if (source && source != target && b->target == 1 &&
-                S.has_vp && !S.vp[0][0] && !S.vp[0][1] &&
-                S.vp[0][2] == vk_tex_width(source,0) && S.vp[0][3] == vk_tex_height(source,0) &&
-                vk_tex_width(source,0) <= vk_tex_width(target,0) && vk_tex_height(source,0) <= vk_tex_height(target,0) &&
-                vk_tex_width(source,0) >= 640 && vk_tex_levels(source) == 1 && vk_tex_layers(source) == 1 &&
-                !vk_tex_is3d(source) && vk_tex_samples(source) == 1 && vk_tex_aspect(source) == VK_IMAGE_ASPECT_COLOR_BIT) {
-                *transfer_source=vk_tex_canvas_identity(source,0,0);
-                *transfer_window=vk_tex_canvas_identity(target,0,0);
-                vk_canvas_transfer(transfer_source,transfer_window,0); transfer=1;
-                if (vk_native_ui_enabled()) {
-                    vk_tex_native_promote(source); g_native_sample = source;
-                    vk_tex_native_transfer(target,vk_tex_width(source,0),vk_tex_height(source,0));
-                }
-            }
-        }
-    }
+    if (target && !S.rt.depth && !target_level && !target_layer && sh[1] && sh[1]->canvas_transfer && vk_tex_canvas_window(target))
+        transfer = canvas_transfer_scan(sh[1], target, transfer_source, transfer_window);
     if (target) {
         /* Keep composition and ALL pre-UI full-screen work at 1x. One linear
            upscale at the first UI draw is cheaper than rerunning post at 2.25x. */

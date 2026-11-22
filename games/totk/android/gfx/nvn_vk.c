@@ -1574,7 +1574,28 @@ static uint64_t lag_va_threshold(uint64_t addr, uint64_t physical, uint64_t edge
     uint64_t d = edge - physical;
     return d <= UINT64_MAX - addr ? addr + d : UINT64_MAX;
 }
+static totk_lag_iv_idx_t *g_lag_iv_idx;
+static int lag_iv_idx_sync_locked(uint64_t gen) {
+    if (g_nalias > (int)TOTK_LAG_IV_MAX_ALIAS || g_npool > (int)TOTK_LAG_IV_MAX_POOL) return 0;
+    if (!g_lag_iv_idx) g_lag_iv_idx = calloc(1, sizeof *g_lag_iv_idx);
+    if (!g_lag_iv_idx) return 0;
+    if (g_lag_iv_idx->ready && g_lag_iv_idx->gen == gen && g_lag_iv_idx->n_alias == (uint32_t)g_nalias && g_lag_iv_idx->n_pool_raw == (uint32_t)g_npool) return 1;
+    totk_lag_iv_begin(g_lag_iv_idx, gen, (uint32_t)g_npool);
+    for (int i = 0; i < g_nalias; i++) {
+        const alias_ent *al = &g_alias[i];
+        g_lag_iv_idx->aliases[g_lag_iv_idx->n_alias++] = (totk_lag_iv_alias_t){al->va, al->end, (uint64_t)al->owner->base + al->off};
+    }
+    for (int i = 0; i < g_npool; i++) {
+        const pool_ent *p = g_pools[i];
+        if ((p->kind == K_OWN || p->kind == K_VIEW) && p->hi > p->lo)
+            g_lag_iv_idx->pools[g_lag_iv_idx->n_pool++] = (totk_lag_iv_pool_t){p->lo, p->hi};
+    }
+    totk_lag_iv_finish(g_lag_iv_idx);
+    return g_lag_iv_idx->ready != 0u;
+}
 static void lag_iv_scan(uint64_t addr, uint64_t *iv_lo_out, uint64_t *iv_hi_out, uint64_t *end_va_out, uint8_t *bounded_out) {
+    uint64_t sgen = atomic_load_explicit(&g_span_gen, memory_order_relaxed);
+    if (totk_vk_ub_gw_fast_on() && lag_iv_idx_sync_locked(sgen)) { totk_lag_iv_query(g_lag_iv_idx, addr, iv_lo_out, iv_hi_out, end_va_out, bounded_out); return; }
     uint64_t iv_lo = 0, iv_hi = UINT64_MAX, physical = addr, end_va = UINT64_MAX;
     uint8_t bounded = 0;
     for (int i = 0; i < g_nalias; i++) {
@@ -3961,30 +3982,27 @@ static void ub_reindex(void) {
     ub_maxhi_from(0);
 }
 /* Revoke only bytes replaced by a real producer. A partial producer must not erase neighbouring private updates. */
+static int ub_forget_one(int i, uint64_t a, uint64_t n) {
+    ub_ent *e = &g_ub[i];
+    if (e->lo >= a + n || e->hi <= a) return 0;
+    if (a <= e->lo && e->hi <= a + n) { free(e->data); memmove(e, e + 1, (size_t)(g_nub - i - 1) * sizeof *e); g_nub--; }
+    else if (a <= e->lo) { uint64_t skip = a + n - e->lo; memmove(e->data, e->data + skip, (size_t)(e->hi - a - n)); e->lo = a + n; }
+    else if (e->hi <= a + n) e->hi = a;
+    else {
+        ub_ent right = *e; right.lo = a + n; right.data = VK_MALLOC((size_t)(right.hi - right.lo));
+        memcpy(right.data, e->data + right.lo - e->lo, (size_t)(right.hi - right.lo)); e->hi = a;
+        if (g_nub == g_capub) { g_capub = g_capub ? 2 * g_capub : 256; g_ub = VK_REALLOC(g_ub, (size_t)g_capub * sizeof *g_ub); g_ub_maxhi = VK_REALLOC(g_ub_maxhi, (size_t)g_capub * sizeof *g_ub_maxhi); }
+        g_ub[g_nub++] = right;
+    }
+    return 1;
+}
 static void ub_forget(uint64_t a, uint64_t n) {
     int changed = 0;
-    for (int i = 0; i < g_nub; i++) {
-        ub_ent *e = &g_ub[i];
-        if (e->lo >= a + n || e->hi <= a) continue;
-        changed = 1;
-        if (a <= e->lo && e->hi <= a + n) {
-            free(e->data); memmove(e, e + 1, (size_t)(g_nub - i - 1) * sizeof *e); g_nub--; i--;
-        } else if (a <= e->lo) {
-            uint64_t skip = a + n - e->lo;
-            memmove(e->data, e->data + skip, (size_t)(e->hi - a - n)); e->lo = a + n;
-        } else if (e->hi <= a + n) e->hi = a;
-        else {
-            ub_ent right = *e;
-            right.lo = a + n; right.data = VK_MALLOC((size_t)(right.hi - right.lo));
-            memcpy(right.data, e->data + right.lo - e->lo, (size_t)(right.hi - right.lo)); e->hi = a;
-            if (g_nub == g_capub) {
-                g_capub = g_capub ? 2 * g_capub : 256;
-                g_ub = VK_REALLOC(g_ub, (size_t)g_capub * sizeof *g_ub);
-                g_ub_maxhi = VK_REALLOC(g_ub_maxhi, (size_t)g_capub * sizeof *g_ub_maxhi);
-            }
-            g_ub[g_nub++] = right;
-        }
-    }
+    if (totk_vk_ub_gw_fast_on()) {
+        int first = 0, end = 0;
+        if (!totk_ub_forget_window(g_ub, sizeof *g_ub, offsetof(ub_ent, lo), g_ub_maxhi, g_nub, g_ub_lo, g_ub_hi, g_ub_maxlen, a, n, &first, &end)) return;
+        for (int i = end - 1; i >= first; i--) changed |= ub_forget_one(i, a, n);
+    } else for (int i = g_nub - 1; i >= 0; i--) changed |= ub_forget_one(i, a, n);
     if (changed) { qsort(g_ub, (size_t)g_nub, sizeof *g_ub, ub_entry_cmp); ub_reindex(); ub_changed(a, n); }
 }
 /* Protected lag already forces synchronous replay in hle_nvn.c. Publish CPU-known, UBO-only updates after ALL
@@ -4020,19 +4038,32 @@ static void ub_publish(void) {
     nvn_dirty_lag_thread_role(previous_role);
 }
 /* Materialize only updates a real consumer can observe. Chunk seals are not consumers of private UBO bytes. */
-static void ub_flush_inner(uint64_t lo, uint64_t hi) {
-    if (!g_ub_unflushed) return;
+static int ub_collect_flush_order(uint64_t lo, uint64_t hi, int **order_p, int *cap_p) {
+    if (totk_vk_ub_gw_fast_on()) {
+        int n = totk_ub_collect_unflushed(g_ub, sizeof *g_ub, offsetof(ub_ent, lo), offsetof(ub_ent, hi),
+                                          offsetof(ub_ent, flushed), g_ub_maxhi, g_nub, g_ub_lo, g_ub_hi, g_ub_maxlen, lo, hi, order_p, cap_p);
+        if (n > 1) totk_ub_sort_by_seq(*order_p, n, g_ub, sizeof *g_ub, offsetof(ub_ent, seq));
+        return n > 0 ? n : 0;
+    }
     int cnt = 0;
     for (int i = 0; i < g_nub; i++) cnt += !g_ub[i].flushed && g_ub[i].lo < hi && lo < g_ub[i].hi;
-    if (!cnt) return;
+    if (!cnt) return 0;
+    if (cnt > *cap_p) { *cap_p = cnt; *order_p = VK_REALLOC(*order_p, (size_t)*cap_p * sizeof **order_p); }
+    int n = 0;
+    for (int i = 0; i < g_nub; i++) if (!g_ub[i].flushed && g_ub[i].lo < hi && lo < g_ub[i].hi) (*order_p)[n++] = i;
+    for (int i = 1; i < n; i++) for (int j = i; j > 0 && g_ub[(*order_p)[j - 1]].seq > g_ub[(*order_p)[j]].seq; j--) {
+        int t = (*order_p)[j]; (*order_p)[j] = (*order_p)[j - 1]; (*order_p)[j - 1] = t;
+    }
+    return n;
+}
+static void ub_flush_inner(uint64_t lo, uint64_t hi) {
+    if (!g_ub_unflushed) return;
+    static int *order, cap;
+    int n = ub_collect_flush_order(lo, hi, &order, &cap);
+    if (!n) return;
     vk_end_rendering_at(VK_PASS_END_UNIFORM, 0);
     VkCommandBuffer cb = vk_cb();
     vk_barrier_all(cb);
-    static int *order, cap;
-    if (cnt > cap) { cap = cnt; order = VK_REALLOC(order, (size_t)cap * sizeof *order); }
-    int n = 0;
-    for (int i = 0; i < g_nub; i++) if (!g_ub[i].flushed && g_ub[i].lo < hi && lo < g_ub[i].hi) order[n++] = i;
-    for (int i = 1; i < n; i++) for (int j = i; j > 0 && g_ub[order[j - 1]].seq > g_ub[order[j]].seq; j--) { int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t; }
     uint64_t prev_lo = UINT64_MAX, prev_hi = 0;
     for (int k = 0; k < n; k++) {
         ub_ent *e = &g_ub[order[k]]; VkBuffer db; uint64_t dof;
@@ -4145,6 +4176,7 @@ static int snap_on(void) { return (ub_rename_on() && !vk_off("snap")) || ub_priv
 typedef struct { uint64_t lo, hi, fence; } gw_t;
 static gw_t *g_gw; static uint64_t *g_gw_maxhi; static int g_ngw, g_capgw; static pthread_mutex_t g_gw_mu = PTHREAD_MUTEX_INITIALIZER;
 static totk_gw_summary g_gw_sum;
+static totk_gw_unsealed_t g_gw_unsealed;
 static uint64_t g_stat_snap_skipped;
 static void gw_reindex_from(int i) {   /* caller holds g_gw_mu */
     uint64_t m = i ? g_gw_maxhi[i - 1] : 0;
@@ -4174,14 +4206,30 @@ static void gw_add(uint64_t lo, uint64_t hi) {
     memmove(g_gw + at + 1, g_gw + at, (size_t)(g_ngw - at) * sizeof *g_gw);
     g_gw[at] = (gw_t){lo, hi, 0}; g_ngw++;
     totk_gw_sum_add(&g_gw_sum, lo, hi);
+    totk_gw_unsealed_add(&g_gw_unsealed, lo);
     gw_reindex_from(at);
 }
-static void gw_seal(uint64_t fence) { pthread_mutex_lock(&g_gw_mu); for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence) g_gw[i].fence = fence; pthread_mutex_unlock(&g_gw_mu); }
+static void gw_seal(uint64_t fence) {
+    pthread_mutex_lock(&g_gw_mu);
+    if (totk_vk_ub_gw_fast_on()) {
+        if (g_ngw && totk_gw_unsealed_has(&g_gw_unsealed)) {
+            int i = gw_lower(g_gw_unsealed.min_lo); uint32_t rem = g_gw_unsealed.count;
+            for (; i < g_ngw && g_gw[i].lo <= g_gw_unsealed.max_lo && rem > 0u; i++) if (!g_gw[i].fence) { g_gw[i].fence = fence; rem--; }
+            totk_gw_unsealed_reset(&g_gw_unsealed);
+        } else if (!g_ngw) totk_gw_unsealed_reset(&g_gw_unsealed);
+    } else {
+        for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence) g_gw[i].fence = fence;
+        totk_gw_unsealed_reset(&g_gw_unsealed);
+    }
+    pthread_mutex_unlock(&g_gw_mu);
+}
 static void gw_prune(void) {
     uint64_t done = atomic_load(&g_done), mlo = 0, mhi = 0, blm = 0; int j = 0;
     pthread_mutex_lock(&g_gw_mu);
+    totk_gw_unsealed_reset(&g_gw_unsealed);
     for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence || g_gw[i].fence > done) {
         gw_t w = g_gw[i];
+        if (!w.fence) totk_gw_unsealed_add(&g_gw_unsealed, w.lo);
         if (!j || w.lo < mlo) mlo = w.lo;
         if (!j || w.hi > mhi) mhi = w.hi;
         blm |= totk_gw_bloom_mask(w.lo, w.hi); g_gw[j++] = w;
@@ -4301,7 +4349,7 @@ static unsigned lag_test_gw_index(unsigned *checks) {
     #undef GW_RAND
     /* Per-query cost at the route's size: ~100 pending writes, 1,308 capture ranges per submission. */
     for (int count = 32; count <= 512; count *= 4) {
-        pthread_mutex_lock(&g_gw_mu); g_ngw = 0; totk_gw_sum_clear(&g_gw_sum);
+        pthread_mutex_lock(&g_gw_mu); g_ngw = 0; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed);
         for (int i = 0; i < count; i++) gw_add(UINT64_C(0x360000000) + (uint64_t)i * 65536 * 3, UINT64_C(0x360000000) + (uint64_t)i * 65536 * 3 + 4096);
         pthread_mutex_unlock(&g_gw_mu);
         uint64_t ns[2]; unsigned hits[2] = {0};
@@ -4318,7 +4366,7 @@ static unsigned lag_test_gw_index(unsigned *checks) {
         printf("lag-query GPU writes %d pending: linear %.2f indexed %.2f ns/query; 6540 capture ranges/frame %.3f -> %.3f ms\n",
                count, ns[0] / 2e5, ns[1] / 2e5, ns[0] / 2e5 * 6540 / 1e6, ns[1] / 2e5 * 6540 / 1e6);
     }
-    pthread_mutex_lock(&g_gw_mu); g_ngw = 0; totk_gw_sum_clear(&g_gw_sum); pthread_mutex_unlock(&g_gw_mu);
+    pthread_mutex_lock(&g_gw_mu); g_ngw = 0; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed); pthread_mutex_unlock(&g_gw_mu);
     atomic_store(&g_done, 0);
     free(shadow);
     return errors;

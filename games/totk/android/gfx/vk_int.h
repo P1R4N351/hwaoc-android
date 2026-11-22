@@ -18,6 +18,7 @@
 #include "vk_bind_wb_fast.h"
 #include "vk_fg_wb_fast.h"
 #include "vk_touch_alias_fast.h"
+#include "vk_ub_gw_fast.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -582,6 +583,7 @@ typedef struct vk_shader {
     totk_sh_bind_sum_t bind_sum;
     totk_sh_fg_sum_t fg_sum;
     totk_sh_touch_sum_t touch_sum;
+    totk_sh_ub_gw_sum_t ub_gw_sum;
     uint8_t *c1; uint32_t c1_len;   /* the shader's own constant bank c1 (from its package) */
     uint32_t vin_mask;      /* vertex inputs read (location = NVN attribute) */
     uint8_t vin_class[32];  /* 0 float 1 uint 2 sint */

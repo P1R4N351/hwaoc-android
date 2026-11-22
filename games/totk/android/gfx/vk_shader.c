@@ -558,10 +558,13 @@ static void shader_add_touch_bind(vk_shader *sh, int i, const vk_bind *b, int pi
     totk_sh_touch_sum_add_stor(&sh->touch_sum, i, b->rw, is_sbuf, is_stbuf, b->reg);
     totk_sh_touch_sum_add_img(&sh->touch_sum, i, b->rw, pimg);
     totk_sh_touch_sum_add_pm_fb(&sh->touch_sum, i, pm_bad, pm_skip, pm_tex, fb_bad, fb_tex);
+    int is_cis = b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    totk_sh_ub_gw_sum_add(&sh->ub_gw_sum, i, pimg, is_cis && b->reg >= 0 && b->reg < 128);
 }
 static void shader_build_bind_sum(vk_shader *sh) {
     memset(&sh->fg_sum, 0, sizeof sh->fg_sum);
     memset(&sh->touch_sum, 0, sizeof sh->touch_sum);
+    memset(&sh->ub_gw_sum, 0, sizeof sh->ub_gw_sum);
     for (int i = 0; i < sh->nb; i++) {
         const vk_bind *b = &sh->b[i];
         int blk = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
@@ -576,6 +579,7 @@ static void shader_build_bind_sum(vk_shader *sh) {
     totk_sh_bind_sum_finish(&sh->bind_sum);
     totk_sh_fg_sum_finish(&sh->fg_sum, sh->nb);
     totk_sh_touch_sum_finish(&sh->touch_sum, sh->nb);
+    totk_sh_ub_gw_sum_finish(&sh->ub_gw_sum, sh->nb);
 }
 
 static vk_shader *shader_load(const char *variant, int early_tests) {
