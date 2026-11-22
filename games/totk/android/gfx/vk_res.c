@@ -1021,6 +1021,7 @@ static wb_lookup_ent *g_wb_lookup; static int g_wb_lookup_n, g_wb_lookup_cap;
 static _Atomic uint64_t g_wb_lookup_calls;
 static uint64_t g_wb_lookup_hits;
 static totk_wb_summary g_wb_sum, g_wb_tile_sum;
+static totk_wb_bucket_dir_t g_wb_dir;
 /* The rec-lock owner may detach records for synchronous landing, but consumers must still see them until it
    finishes. Borrow its EXISTING list: .t.mem/.t.L.size are immutable while published, no allocation/image ref.
    Writers hold g_tex_mu; readers hold only g_wb_lookup_mu. Publish before removing rows, clear before freeing. */
@@ -1030,7 +1031,12 @@ static void wb_landing_publish(const wb_ent *list, int n) {
     pthread_mutex_lock(&g_wb_lookup_mu);
     g_wb_landing = list; g_wb_landing_n = n;
     totk_wb_landing_begin(&g_wb_sum);
-    for (int i = 0; i < n; i++) totk_wb_landing_add(&g_wb_sum, (uintptr_t)list[i].t.mem, list[i].t.L.size);
+    totk_wb_dir_landing_reset(&g_wb_dir);
+    for (int i = 0; i < n; i++) {
+        uint64_t a = (uintptr_t)list[i].t.mem, sz = list[i].t.L.size;
+        totk_wb_landing_add(&g_wb_sum, a, sz);
+        totk_wb_dir_landing_add(&g_wb_dir, a, sz);
+    }
     totk_wb_landing_end(&g_wb_sum);
     pthread_mutex_unlock(&g_wb_lookup_mu);
 }
@@ -1152,6 +1158,7 @@ static void wb_lookup_set(int i, const wb_ent *e) {
     g_wb_lookup[i] = (wb_lookup_ent){new_a, new_s};
     if (i == g_wb_lookup_n) g_wb_lookup_n++;
     totk_wb_sum_replace(&g_wb_sum, old_a, old_s, new_a, new_s);
+    totk_wb_dir_set(&g_wb_dir, (uint32_t)i, new_a, new_s, (uint32_t)g_wb_lookup_n);
     pthread_mutex_unlock(&g_wb_lookup_mu);
 }
 static void wb_lookup_remove(int i) {
@@ -1160,23 +1167,45 @@ static void wb_lookup_remove(int i) {
     g_wb_lookup[i] = g_wb_lookup[--g_wb_lookup_n];
     if (!g_wb_lookup_n) { free(g_wb_lookup); g_wb_lookup = NULL; g_wb_lookup_cap = 0; }
     totk_wb_sum_delta(&g_wb_sum, old_a, old_s, -1);
+    totk_wb_dir_remove_swap(&g_wb_dir, (uint32_t)i, (uint32_t)g_wb_lookup_n);
+    if (g_wb_dir.overflow && g_wb_lookup_n > 0 && g_wb_lookup_n <= (int)TOTK_WB_DIR_MAX) {
+        g_wb_dir.overflow = 0u;
+        for (int j = 0; j < g_wb_lookup_n; j++) totk_wb_dir_set(&g_wb_dir, (uint32_t)j, g_wb_lookup[j].address, g_wb_lookup[j].size, (uint32_t)g_wb_lookup_n);
+    }
     pthread_mutex_unlock(&g_wb_lookup_mu);
+}
+static int wb_invalidate_scan_locked(uint64_t address, uint64_t n, uint64_t hi, int *inflight_out) {
+    uint64_t cmask[4] = {0};
+    int fast = totk_vk_fg_wb_fast_on(), found = 0;
+    if (fast && totk_wb_dir_query(&g_wb_dir, address, n, cmask)) {
+        for (int w = 0; w < 4 && !found; w++) {
+            uint64_t bits = cmask[w];
+            while (bits) {
+                int i = (w << 6) + __builtin_ctzll(bits); bits &= bits - 1u;
+                if (i >= g_wb_lookup_n) continue;
+                const wb_lookup_ent *e = &g_wb_lookup[i];
+                if (e->size && e->address < hi && address < e->address + e->size) { found = 1; break; }
+            }
+        }
+    } else for (int i = 0; i < g_wb_lookup_n; i++) {
+        const wb_lookup_ent *e = &g_wb_lookup[i];
+        if (e->size && e->address < hi && address < e->address + e->size) { found = 1; break; }
+    }
+    if (!found && (!fast || (g_wb_landing_n > 0 && address < g_wb_dir.landing_hi && hi > g_wb_dir.landing_lo))) {
+        for (int i = 0; i < g_wb_landing_n; i++) {
+            const tex_t *t = &g_wb_landing[i].t; uint64_t m = (uintptr_t)t->mem;
+            if (m < hi && address < m + t->L.size) { found = *inflight_out = 1; break; }
+        }
+    }
+    return found;
 }
 static int wb_invalidate_pending(uint64_t address, uint64_t n) {
     atomic_fetch_add_explicit(&g_wb_lookup_calls, 1u, memory_order_relaxed);
     if (totk_vk_reg_wb_fast_on() && !totk_wb_sum_may_overlap(&g_wb_sum, address, n)) return 0;
+    uint64_t hi = address + n; if (hi < address) hi = UINT64_MAX;
     int found = 0, inflight = 0;
     pthread_mutex_lock(&g_wb_lookup_mu);
-    for (int i = 0; i < g_wb_lookup_n; i++) {
-        const wb_lookup_ent *e = &g_wb_lookup[i];
-        if (e->size && e->address < address + n && address < e->address + e->size) {
-            found = 1; break;
-        }
-    }
-    if (!found) for (int i = 0; i < g_wb_landing_n; i++) {
-        const tex_t *t = &g_wb_landing[i].t; uint64_t m = (uintptr_t)t->mem;
-        if (m < address + n && address < m + t->L.size) { found = inflight = 1; break; }
-    }
+    found = wb_invalidate_scan_locked(address, n, hi, &inflight);
     if (found) g_wb_lookup_hits++;
     if (inflight) g_wb_inflight_hits++;
     pthread_mutex_unlock(&g_wb_lookup_mu);

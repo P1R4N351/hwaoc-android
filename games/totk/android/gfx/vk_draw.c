@@ -1863,6 +1863,29 @@ static struct {
     unsigned test_authority_inline;
 #endif
 } FGX;
+static totk_fgx_watch_idx_t g_fgx_watch_idx;
+static totk_fgx_scene_idx_t g_fgx_scene_idx;
+static void fgx_watch_sync(void) {
+    if (!g_fgx_watch_idx.dirty && g_fgx_watch_idx.synced_n == FGX.nwatch &&
+        (!FGX.nwatch || FGX.watch[0].key.backing == g_fgx_watch_idx.b0)) return;
+    totk_fgx_watch_begin(&g_fgx_watch_idx);
+    for (unsigned i = 0; i < FGX.nwatch; i++) {
+        const fg_extract_watch *w = &FGX.watch[i];
+        totk_fgx_watch_add_entry(&g_fgx_watch_idx, i, w->key.backing, w->key.mip,
+                                 w->key.layer, w->key.aspect, w->address, w->size);
+    }
+    g_fgx_watch_idx.synced_n = FGX.nwatch;
+}
+static void fgx_scene_sync(void) {
+    if (!g_fgx_scene_idx.dirty && g_fgx_scene_idx.synced_n == FGX.nscene &&
+        (!FGX.nscene || FGX.scene[0].depth_key.backing == g_fgx_scene_idx.b0)) return;
+    totk_fgx_scene_begin(&g_fgx_scene_idx);
+    for (unsigned i = 0; i < FGX.nscene; i++) {
+        totk_fgx_scene_add(&g_fgx_scene_idx, i, FGX.scene[i].depth_key.backing);
+    }
+    g_fgx_scene_idx.synced_n = FGX.nscene;
+}
+
 static int fg_extract_inline(void) {
 #ifdef TOTK_VK_TESTS
     if (FGX.test_authority_inline) return 1;
@@ -1942,34 +1965,42 @@ static void fg_extract_reject(unsigned result, const char *reason) {
 static int fg_extract_overlap(uint64_t a, uint64_t as, uint64_t b, uint64_t bs) {
     return a && b && as && bs && (a <= b ? b - a < as : a - b < bs);
 }
-static void fg_extract_revoke(fg_dep_key key, const char *reason, unsigned writer) {
-    for (unsigned i = 0; i < FGX.nscene; i++) if (fg_extract_same_key(key, FGX.scene[i].depth_key)) {
-        if (FGX.captured && FGX.selected == i) continue; /* immutable depth copy already retained */
-        fg_extract_scene *c=&FGX.scene[i];
-        if (FGX.diag && c->valid) {
-            c->diag.reason=reason; c->diag.writer=writer;
-            c->diag.revoke_pass=FGX.passes.physical_passes;
-            c->diag.version=fg_dep_read(&FGX.deps,key).version;
-            c->diag.vs=FGX.pass.vs; c->diag.fs=FGX.pass.fs;
-            c->diag.depth_func=S.ds.df; c->diag.ubo_size=S.ubo[0][1].size;
-            c->diag.camera_declared=FGX.pass.camera_declared;
-            c->diag.camera_check=FGX.pass.camera_check;
-            c->diag.unproven_vs=FGX.pass.unproven_vs;
-            c->diag.unproven_fs=FGX.pass.unproven_fs;
-            c->diag.unproven_check=FGX.pass.unproven_check;
-            c->diag.unproven_draws=FGX.pass.unproven_draws;
-            c->diag.unproven_depth_draws=FGX.pass.unproven_depth_draws;
-            c->diag.unproven_depth_func=FGX.pass.unproven_depth_func;
-            c->diag.unproven_camera_declared=FGX.pass.unproven_camera_declared;
-            memcpy(c->diag.viewport,S.vp[0],sizeof c->diag.viewport);
-            memcpy(c->diag.range,S.dr,sizeof c->diag.range);
-            c->diag.has_viewport=S.has_vp; c->diag.has_scissor=S.has_sc;
-            c->diag.scissor[0]=S.sc.x; c->diag.scissor[1]=S.sc.y;
-            c->diag.scissor[2]=S.sc.w; c->diag.scissor[3]=S.sc.h;
-        }
-        FGX.scene[i].valid = 0;
-        fg_dep_candidate_invalidate(&FGX.deps, UINT64_C(1) << i);
+static void fg_extract_revoke_one(unsigned i, fg_dep_key key, const char *reason, unsigned writer) {
+    if (!fg_extract_same_key(key, FGX.scene[i].depth_key)) return;
+    if (FGX.captured && FGX.selected == i) return;
+    fg_extract_scene *c = &FGX.scene[i];
+    if (FGX.diag && c->valid) {
+        c->diag.reason=reason; c->diag.writer=writer;
+        c->diag.revoke_pass=FGX.passes.physical_passes;
+        c->diag.version=fg_dep_read(&FGX.deps,key).version;
+        c->diag.vs=FGX.pass.vs; c->diag.fs=FGX.pass.fs;
+        c->diag.depth_func=S.ds.df; c->diag.ubo_size=S.ubo[0][1].size;
+        c->diag.camera_declared=FGX.pass.camera_declared;
+        c->diag.camera_check=FGX.pass.camera_check;
+        c->diag.unproven_vs=FGX.pass.unproven_vs;
+        c->diag.unproven_fs=FGX.pass.unproven_fs;
+        c->diag.unproven_check=FGX.pass.unproven_check;
+        c->diag.unproven_draws=FGX.pass.unproven_draws;
+        c->diag.unproven_depth_draws=FGX.pass.unproven_depth_draws;
+        c->diag.unproven_depth_func=FGX.pass.unproven_depth_func;
+        c->diag.unproven_camera_declared=FGX.pass.unproven_camera_declared;
+        memcpy(c->diag.viewport,S.vp[0],sizeof c->diag.viewport);
+        memcpy(c->diag.range,S.dr,sizeof c->diag.range);
+        c->diag.has_viewport=S.has_vp; c->diag.has_scissor=S.has_sc;
+        c->diag.scissor[0]=S.sc.x; c->diag.scissor[1]=S.sc.y;
+        c->diag.scissor[2]=S.sc.w; c->diag.scissor[3]=S.sc.h;
     }
+    FGX.scene[i].valid = 0;
+    fg_dep_candidate_invalidate(&FGX.deps, UINT64_C(1) << i);
+}
+static void fg_extract_revoke(fg_dep_key key, const char *reason, unsigned writer) {
+    if (totk_vk_fg_wb_fast_on() && FGX.nscene <= TOTK_FGS_MAX) {
+        fgx_scene_sync();
+        for (int si = totk_fgx_scene_head(&g_fgx_scene_idx, key.backing); si >= 0; si = g_fgx_scene_idx.next[si])
+            fg_extract_revoke_one((unsigned)si, key, reason, writer);
+        return;
+    }
+    for (unsigned i = 0; i < FGX.nscene; i++) fg_extract_revoke_one(i, key, reason, writer);
 }
 static void fg_extract_invalidate(fg_dep_key key, unsigned writer,
                                   const vk_canvas_image *image, const char *kind) {
@@ -2079,13 +2110,24 @@ static void fg_extract_publish(fg_dep_key key, const tex_t *t, const fg_dep_sour
     uint64_t address = (uint64_t)(uintptr_t)t->mem;
     fg_dep_value value = fg_dep_write(&FGX.deps, key, sources, writer, seed, 0, 0, 0);
     if (!value.origins) return;
-    unsigned i = 0;
-    while (i < FGX.nwatch && !fg_extract_same_key(FGX.watch[i].key, key)) i++;
+    unsigned i = FGX.nwatch; int fast = totk_vk_fg_wb_fast_on();
+    if (fast) {
+        fgx_watch_sync();
+        int hi = totk_fgx_watch_find_key(&g_fgx_watch_idx, key.backing, key.mip, key.layer, key.aspect);
+        if (hi >= 0) i = (unsigned)hi;
+    } else {
+        i = 0;
+        while (i < FGX.nwatch && !fg_extract_same_key(FGX.watch[i].key, key)) i++;
+    }
     if (i == FGX.nwatch) {
         if (i == FGX_WATCHES) { fg_dep_fail(&FGX.deps); return; }
+        FGX.watch[i] = (fg_extract_watch){key, address, t->L.size};
         FGX.nwatch++;
+        if (fast) { totk_fgx_watch_add_entry(&g_fgx_watch_idx, i, key.backing, key.mip, key.layer, key.aspect, address, t->L.size); g_fgx_watch_idx.synced_n = FGX.nwatch; }
+    } else {
+        FGX.watch[i] = (fg_extract_watch){key, address, t->L.size};
+        if (fast) totk_fgx_watch_range_add(&g_fgx_watch_idx, address, t->L.size);
     }
-    FGX.watch[i] = (fg_extract_watch){key, address, t->L.size};
     if (FGX.diag) FGX.watch_image[i]=vk_tex_canvas_identity(vk_tex_get(t),key.mip,key.layer);
 }
 void vk_fg_extract_memory_write(uint64_t address, uint64_t size) {
@@ -2100,6 +2142,10 @@ void vk_fg_extract_memory_write(uint64_t address, uint64_t size) {
         (FGX.pass.camera_fragment_addr &&
         fg_extract_overlap(address,size,FGX.pass.camera_fragment_addr,84*sizeof(float))))) {
         fg_pass_guard_invalidate(&FGX.guard);
+    }
+    if (totk_vk_fg_wb_fast_on()) {
+        fgx_watch_sync();
+        if (!totk_fgx_watch_may_overlap(&g_fgx_watch_idx, address, size)) return;
     }
     for (unsigned i = 0; i < FGX.nwatch; i++) {
         const fg_extract_watch *w = &FGX.watch[i];
@@ -2234,7 +2280,9 @@ static void fg_extract_pass_end(void) {
     fg_pass_end(&FGX.passes, FGX.pass.group, g_stat_draws - R.draws0, FGX.pass.depth_draws);
 }
 static int fg_extract_reads_camera(const vk_shader *sh) {
-    for (int i = 0; sh && i < sh->nb; i++) {
+    if (!sh) return 0;
+    if (totk_vk_fg_wb_fast_on() && sh->fg_sum.cam_valid) return totk_sh_fg_reads_cam(&sh->fg_sum);
+    for (int i = 0; i < sh->nb; i++) {
         const vk_bind *b = &sh->b[i];
         if (b->reg == 1 && (b->kind == RB_CBUF || b->kind == RB_UBO_PTR) &&
             (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)) return 1;
@@ -2431,44 +2479,64 @@ static void fg_extract_sample(fg_dep_sources *sources, const vk_treg *r, int tar
     (void)fg_dep_sample_view(&FGX.deps,sources,fg_extract_image_key(x,mip,layer,aspect).backing,
         mip,levels,layer,layers,aspect);
 }
+static void fg_extract_rw_watch_hit(unsigned w, uint64_t backing, fg_dep_sources *sources) {
+    if (FGX.watch[w].key.backing != backing) return;
+    fg_extract_invalidate(FGX.watch[w].key, FG_PASS_WRITER_OPERATION | ++FGX.operation,
+                          &FGX.watch_image[w], "graphics-storage-image-write");
+    fg_extract_revoke(FGX.watch[w].key, "graphics-storage-image-write", FG_PASS_WRITER_OPERATION | FGX.operation);
+    sources->value.tainted |= FG_DEP_TAINT_STORAGE;
+    FGX.diag_window.image_writes++; FGX.diag_window.storage++;
+    if (FGX.captured && (backing == FGX.canvas_key.backing || backing == FGX.ui_depth_key.backing))
+        fg_extract_reject(VK_FG_STRUCTURE_CHANGED, "graphics storage image modifies captured canvas/depth");
+}
+static void fg_extract_rw_img_write(const vk_bind *b, unsigned stage, fg_dep_sources *sources) {
+    if (stage == 5) return;
+    uint64_t handle = b->reg < 0 ? 0 : b->kind == RB_IMG ?
+        (b->reg < 32 ? S.img[stage][b->reg] : 0) : (b->reg < 128 ? S.tex[stage][b->reg] : 0);
+    vk_treg r;
+    if (!handle || !vk_treg_get((int)(handle & 0xfffff), &r)) return;
+    vk_tex *x = vk_tex_get(&r.t);
+    if (!x) return;
+    uint64_t backing = fg_extract_image_key(x, 0, 0, vk_tex_aspect(x)).backing;
+    if (totk_vk_fg_wb_fast_on()) {
+        fgx_watch_sync();
+        for (int wi = totk_fgx_watch_head(&g_fgx_watch_idx, backing); wi >= 0; wi = g_fgx_watch_idx.next[wi])
+            fg_extract_rw_watch_hit((unsigned)wi, backing, sources);
+        return;
+    }
+    for (unsigned w = 0; w < FGX.nwatch; w++) fg_extract_rw_watch_hit(w, backing, sources);
+}
+static void fg_extract_rw_buf_write(const vk_bind *b, unsigned stage, fg_dep_sources *sources) {
+    uint64_t address = 0, size = 0;
+    if (b->reg < 0 || b->reg >= 16) { fg_dep_fail(&FGX.deps); return; }
+    if (b->kind == RB_SBUF) { address = S.ssbo[stage][b->reg].addr; size = S.ssbo[stage][b->reg].size; }
+    else if (b->kind == RB_CBUF || b->kind == RB_UBO_PTR) { address = S.ubo[stage][b->reg].addr; size = S.ubo[stage][b->reg].size; }
+    else if (b->kind == RB_SBUF_UBO) {
+        const p_bind_buf *u = &S.ubo[stage][b->reg];
+        if (u->addr && u->size >= (uint64_t)b->off + 8) vk_ub_read(u->addr + b->off, &address, 8);
+        else fg_dep_fail(&FGX.deps);
+    } else fg_dep_fail(&FGX.deps);
+    unsigned before = FGX.operation;
+    vk_fg_extract_memory_write(address, size);
+    if (FGX.operation != before) { sources->value.tainted |= FG_DEP_TAINT_STORAGE; FGX.diag_window.storage++; }
+}
 static void fg_extract_storage_buffers(const vk_shader *shader, unsigned stage, fg_dep_sources *sources) {
     if (!FGX.nscene || !shader || !shader->has_storage_writes) return;
+    if (totk_vk_fg_wb_fast_on() && shader->fg_sum.mask_valid) {
+        uint64_t m = totk_sh_fg_rw_mask(&shader->fg_sum, stage);
+        while (m) {
+            unsigned i = (unsigned)__builtin_ctzll(m); m &= m - 1u;
+            const vk_bind *b = &shader->b[i];
+            if (b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) fg_extract_rw_img_write(b, stage, sources);
+            else if (b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) fg_extract_rw_buf_write(b, stage, sources);
+        }
+        return;
+    }
     for (int i = 0; i < shader->nb; i++) {
         const vk_bind *b = &shader->b[i];
         if (!b->rw) continue;
-        if (b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) {
-            if (stage == 5) continue; /* compute outputs are versioned by fg_extract_compute */
-            uint64_t handle = b->reg < 0 ? 0 : b->kind == RB_IMG ?
-                (b->reg < 32 ? S.img[stage][b->reg] : 0) : (b->reg < 128 ? S.tex[stage][b->reg] : 0);
-            vk_treg r;
-            if (!handle || !vk_treg_get((int)(handle & 0xfffff),&r)) continue; /* actual dummy */
-            vk_tex *x=vk_tex_get(&r.t);
-            if (!x) continue;
-            uint64_t backing=fg_extract_image_key(x,0,0,vk_tex_aspect(x)).backing;
-            for (unsigned w=0;w<FGX.nwatch;w++) if (FGX.watch[w].key.backing == backing) {
-                fg_extract_invalidate(FGX.watch[w].key,FG_PASS_WRITER_OPERATION | ++FGX.operation,
-                    &FGX.watch_image[w],"graphics-storage-image-write");
-                fg_extract_revoke(FGX.watch[w].key,"graphics-storage-image-write",FG_PASS_WRITER_OPERATION|FGX.operation);
-                sources->value.tainted |= FG_DEP_TAINT_STORAGE;
-                FGX.diag_window.image_writes++; FGX.diag_window.storage++;
-                if (FGX.captured && (backing == FGX.canvas_key.backing || backing == FGX.ui_depth_key.backing))
-                    fg_extract_reject(VK_FG_STRUCTURE_CHANGED,"graphics storage image modifies captured canvas/depth");
-            }
-            continue;
-        }
-        if (b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) continue;
-        uint64_t address = 0, size = 0;
-        if (b->reg < 0 || b->reg >= 16) { fg_dep_fail(&FGX.deps); continue; }
-        if (b->kind == RB_SBUF) { address=S.ssbo[stage][b->reg].addr; size=S.ssbo[stage][b->reg].size; }
-        else if (b->kind == RB_CBUF || b->kind == RB_UBO_PTR) { address=S.ubo[stage][b->reg].addr; size=S.ubo[stage][b->reg].size; }
-        else if (b->kind == RB_SBUF_UBO) {
-            const p_bind_buf *u=&S.ubo[stage][b->reg];
-            if (u->addr && u->size >= (uint64_t)b->off+8) vk_ub_read(u->addr+b->off,&address,8);
-            else fg_dep_fail(&FGX.deps);
-        } else fg_dep_fail(&FGX.deps);
-        unsigned before=FGX.operation;
-        vk_fg_extract_memory_write(address,size);
-        if (FGX.operation != before) { sources->value.tainted |= FG_DEP_TAINT_STORAGE; FGX.diag_window.storage++; }
+        if (b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) fg_extract_rw_img_write(b, stage, sources);
+        else if (b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) fg_extract_rw_buf_write(b, stage, sources);
     }
 }
 static void fg_extract_reads(vk_shader *const sh[6], unsigned first, unsigned end, fg_dep_sources *sources) {
@@ -2619,6 +2687,7 @@ int vk_fg_test_canvas_programs(prog_t *ui,prog_t *terminal) {
 void vk_fg_test_alias_lineage(const tex_t *root, const tex_t *other, unsigned results[3]) {
     fg_extract_refresh(0);
     fg_dep_reset(&FGX.deps); FGX.nwatch = FGX.nscene = 0;
+    totk_fgx_watch_dirty(&g_fgx_watch_idx); totk_fgx_scene_dirty(&g_fgx_scene_idx);
     FGX.nunknown=FGX.unknown_overflow=0;
     fg_dep_key a=fg_extract_image_key(vk_tex_get(root),0,0,VK_IMAGE_ASPECT_COLOR_BIT);
     fg_dep_key b=fg_extract_image_key(vk_tex_get(other),0,0,VK_IMAGE_ASPECT_COLOR_BIT);
@@ -2629,7 +2698,7 @@ void vk_fg_test_alias_lineage(const tex_t *root, const tex_t *other, unsigned re
     vk_fg_extract_memory_write((uint64_t)(uintptr_t)root->mem,root->L.size);
     results[2]=fg_dep_select(&FGX.deps,fg_dep_read(&FGX.deps,a),NULL);
     if (FGX.diag) fg_extract_refusal_resources(vk_tex_get(root),0,0,fg_dep_read(&FGX.deps,a));
-    FGX.nwatch=0; fg_dep_reset(&FGX.deps);
+    FGX.nwatch=0; totk_fgx_watch_dirty(&g_fgx_watch_idx); fg_dep_reset(&FGX.deps);
 }
 unsigned vk_fg_test_nominate_canvas(vk_tex *canvas) {
     fg_extract_boundary(canvas,0,0);
@@ -2640,6 +2709,7 @@ void vk_fg_test_scene_begin(const tex_t *scene, const tex_t *depth, const float 
     vk_end_rendering();
     fg_dep_reset(&FGX.deps); fg_pass_reset(&FGX.passes);
     FGX.nscene=FGX.nwatch=FGX.operation=FGX.nunknown=FGX.unknown_overflow=0;
+    totk_fgx_watch_dirty(&g_fgx_watch_idx); totk_fgx_scene_dirty(&g_fgx_scene_idx);
     FGX.invalid=FGX.captured=FGX.snapshot_ok=FGX.eligible=0; FGX.probe.wait=0;
     FGX.authority_ready=FGX.authority_gpu_ready=0; FGX.authority_key=(fg_dep_key){0};
     fg_extract_refresh(0);
@@ -2754,7 +2824,15 @@ static int fg_extract_authority_before_draw(vk_shader *const sh[6]) {
         !vk_fg_interpolating()) return 1;
     fg_dep_key key=FGX.pass.key[8];
     int root=-1;
-    for (unsigned i=0;i<FGX.nscene;i++) if (FGX.scene[i].valid &&
+    if (totk_vk_fg_wb_fast_on() && FGX.nscene <= TOTK_FGS_MAX) {
+        fgx_scene_sync();
+        for (int si = totk_fgx_scene_head(&g_fgx_scene_idx, key.backing); si >= 0; si = g_fgx_scene_idx.next[si]) {
+            if (FGX.scene[si].valid && fg_extract_same_key(FGX.scene[si].depth_key, key)) {
+                if (root >= 0) return 1;
+                root = si;
+            }
+        }
+    } else for (unsigned i=0;i<FGX.nscene;i++) if (FGX.scene[i].valid &&
         fg_extract_same_key(FGX.scene[i].depth_key,key)) {
         if (root>=0) return 1; /* ambiguous camera authority: old refusal applies */
         root=(int)i;
@@ -3182,9 +3260,13 @@ static void fg_extract_compute(vk_shader *const sh[6]) {
     fg_extract_storage_buffers(sh[5],5,&sources);
     unsigned writer = FG_PASS_WRITER_OPERATION | ++FGX.operation;
     const vk_shader *shader = sh[5];
-    for (int i = 0; i < shader->nb; i++) {
-        const vk_bind *b = &shader->b[i];
-        if (!b->rw || b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) continue;
+    uint64_t cm = (totk_vk_fg_wb_fast_on() && shader->fg_sum.mask_valid) ? shader->fg_sum.rw_simg_mask : 0u;
+    int use_cm = totk_vk_fg_wb_fast_on() && shader->fg_sum.mask_valid;
+    for (int i = 0; use_cm ? (cm != 0u) : (i < shader->nb); ) {
+        int bi = use_cm ? (int)__builtin_ctzll(cm) : i++;
+        if (use_cm) cm &= cm - 1u;
+        const vk_bind *b = &shader->b[bi];
+        if (!use_cm && (!b->rw || b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)) continue;
         uint64_t handle = b->reg < 0 ? 0 : b->kind == RB_IMG ?
             (b->reg < 32 ? S.img[5][b->reg] : 0) : (b->reg < 128 ? S.tex[5][b->reg] : 0);
         vk_treg r;
@@ -3409,6 +3491,7 @@ void vk_fg_extract_end(void) {
         FGX.diag_window.canvas=last; FGX.diag_window.result=FG_DEP_NO_ORIGIN;
     }
     FGX.nscene = FGX.nwatch = FGX.operation = 0;
+    totk_fgx_watch_dirty(&g_fgx_watch_idx); totk_fgx_scene_dirty(&g_fgx_scene_idx);
     FGX.nunknown = FGX.unknown_overflow = 0;
     FGX.captured = FGX.invalid = FGX.ui_seen = FGX.transfer = FGX.eligible = FGX.nreplay = FGX.snapshot_ok = FGX.probe_started = 0;
     FGX.authority_ready=FGX.authority_gpu_ready=0; FGX.authority_key=(fg_dep_key){0};

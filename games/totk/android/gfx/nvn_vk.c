@@ -1658,7 +1658,7 @@ typedef struct occl_node { struct occl_node *prev; uint64_t total; unsigned refs
 typedef struct occl_page { struct occl_page *next; VkQueryPool qp; uint32_t used; occl_node *node[OQ]; } occl_page;
 typedef struct { int kind; volatile uint32_t *val; uint32_t mode, v; uint64_t addr, type, cval; uint32_t tsq1; occl_node *occl; uint64_t report_ticks, report_origin; } post_op;   /* 1 event, 2 counter; cval fixed at recording, tsq1: timestamp query + 1; report provenance staged until g_mu publication */
 typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *ptr; VkDeviceSize size, used; } chunk_t;
-typedef struct { chunk_t *chunks; int nchunk, capchunk; VkDeviceSize min, reserve; } arena_t;   /* host-visible bump allocator; min: chunk size (0: 8 MiB), reserve: compacted high-water */
+typedef struct { chunk_t *chunks; int nchunk, capchunk; VkDeviceSize min, reserve; totk_arena_buf_map_t bmap; } arena_t;   /* host-visible bump allocator; min: chunk size (0: 8 MiB), reserve: compacted high-water */
 static uint64_t arena_compact_ns[2], arena_compacts[2]; /* walking only: slot / snapshot */
 #define RING 8
 typedef struct {
@@ -1689,6 +1689,7 @@ static void chunk_release(chunk_t *c, vk_memory_purpose purpose) {
 static void arena_release(arena_t *a) {
     for (int i = 0; i < a->nchunk; i++) chunk_release(&a->chunks[i], a->min ? VK_MEMORY_SNAPSHOT : VK_MEMORY_SLOT);
     a->nchunk = 0; a->reserve = 0;
+    totk_arena_bmap_clear(&a->bmap);
 }
 /* Only called after the arena's last GPU fence AND CPU recording ownership
    have retired. Retain byte capacity, but collapse fragmented BO high-water
@@ -1738,6 +1739,8 @@ static void arena_retain_cap(arena_t *a) {   /* a slot arena just reset: no chun
     }
     a->nchunk = n;
     if (trimmed) {
+        totk_arena_bmap_clear(&a->bmap);
+        for (int i = 0; i < a->nchunk; i++) totk_arena_bmap_put(&a->bmap, (uint64_t)(uintptr_t)a->chunks[i].buf, i);
         atomic_fetch_add_explicit(&g_staging_trims, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&g_staging_trimmed, trimmed, memory_order_relaxed);
     }
@@ -2748,7 +2751,11 @@ static void *arena_alloc(arena_t *a, size_t size, size_t align, VkBuffer *buf, V
         /* a free chunk (all are reset when the arena is) is used before a new one is made */
         int found = -1;
         for (int i = 0; i < a->nchunk - 1 && found < 0; i++) if (!a->chunks[i].used && a->chunks[i].size >= size) found = i;
-        if (found >= 0) { chunk_t tmp = a->chunks[found]; a->chunks[found] = a->chunks[a->nchunk - 1]; a->chunks[a->nchunk - 1] = tmp; c = &a->chunks[a->nchunk - 1]; at = 0; }
+        if (found >= 0) {
+            int last = a->nchunk - 1; chunk_t tmp = a->chunks[found]; a->chunks[found] = a->chunks[last]; a->chunks[last] = tmp;
+            totk_arena_bmap_swap(&a->bmap, (uint64_t)(uintptr_t)a->chunks[found].buf, found, (uint64_t)(uintptr_t)a->chunks[last].buf, last);
+            c = &a->chunks[last]; at = 0;
+        }
         else {
             uint64_t compact_start = a->reserve ? host_now_ns() : 0;
             if (a->nchunk == a->capchunk) { a->capchunk = a->capchunk ? 2 * a->capchunk : 8; a->chunks = VK_REALLOC(a->chunks, (size_t)a->capchunk * sizeof *a->chunks); }
@@ -2771,6 +2778,7 @@ static void *arena_alloc(arena_t *a, size_t size, size_t align, VkBuffer *buf, V
             if (result) DIE("arena vkMapMemory failed: %d; allocation %llu bytes, memory type %d, %s arena",
                 result, (unsigned long long)req.size, t, a->min ? "snapshot" : "slot");
             at = 0;
+            totk_arena_bmap_put(&a->bmap, (uint64_t)(uintptr_t)c->buf, a->nchunk - 1);
             if (compact_start) arena_compact_ns[a->min != 0] += host_now_ns() - compact_start;
         }
     }
@@ -4782,6 +4790,17 @@ static unsigned snapshot_replay_mask(void) {
 }
 static int arena_frozen_copy(arena_t *arena,VkBuffer buffer,VkDeviceSize offset,
         VkDeviceSize bytes,void *destination) {
+    if (totk_vk_fg_wb_fast_on() && arena->nchunk) {
+        int ov = 0;
+        int ci = totk_arena_bmap_find(&arena->bmap, (uint64_t)(uintptr_t)buffer, &ov);
+        if (!ov) {
+            if (ci < 0 || ci >= arena->nchunk) return 0;
+            const chunk_t *chunk = &arena->chunks[ci];
+            if (chunk->buf != buffer || offset > chunk->used || bytes > chunk->used - offset) return 0;
+            memcpy(destination, chunk->ptr + offset, (size_t)bytes);
+            return 1;
+        }
+    }
     for (int i=0;i<arena->nchunk;i++) {
         const chunk_t *chunk=&arena->chunks[i];
         if (chunk->buf!=buffer || offset>chunk->used || bytes>chunk->used-offset) continue;

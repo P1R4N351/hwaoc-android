@@ -548,14 +548,19 @@ static vk_shader *shader_fail_cleanup(char *spv, vk_shader *sh) {
 }
 
 static void shader_build_bind_sum(vk_shader *sh) {
+    memset(&sh->fg_sum, 0, sizeof sh->fg_sum);
     for (int i = 0; i < sh->nb; i++) {
         const vk_bind *b = &sh->b[i];
         int blk = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
         int ucb = b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && (b->kind == RB_CBUF || b->kind == RB_UBO_PTR);
         int pimg = b->dtype == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        int is_sbuf = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, is_simg = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        int is_cam = (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || is_sbuf) && (b->kind == RB_CBUF || b->kind == RB_UBO_PTR);
         totk_sh_bind_sum_add(&sh->bind_sum, b->count, b->rw, blk, ucb, b->reg, pimg);
+        totk_sh_fg_sum_add(&sh->fg_sum, i, b->rw, is_simg, is_sbuf, is_cam, b->reg);
     }
     totk_sh_bind_sum_finish(&sh->bind_sum);
+    totk_sh_fg_sum_finish(&sh->fg_sum, sh->nb);
 }
 
 static vk_shader *shader_load(const char *variant, int early_tests) {
