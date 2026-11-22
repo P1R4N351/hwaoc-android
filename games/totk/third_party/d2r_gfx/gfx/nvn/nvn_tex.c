@@ -18,6 +18,7 @@
 typedef struct { uint8_t bpb, bw, bh; } fmt_t;   // 每块字节、块宽、块高（非压缩格式块宽高 = 1） | Bytes per block, block width, block height (for uncompressed formats block width and height = 1)
 
 static fmt_t fmt_of(int f) {
+    if (totk_tex_layout_fast_on()) { totk_fmt_fast_t t = totk_nvn_fmt_lookup(f); return (fmt_t){t.bpb, t.bw, t.bh}; }
     static const uint8_t astc[14][2] = {{4,4},{5,4},{5,5},{6,5},{6,6},{8,5},{8,6},{8,8},{10,5},{10,6},{10,8},{10,10},{12,10},{12,12}};
     if (f >= 0x79 && f <= 0x94) { int k = (f - 0x79) % 14; return (fmt_t){16, astc[k][0], astc[k][1]}; }
     if (f >= 0x41 && f <= 0x50) {                         // DXT / RGTC / BPTC：4×4 块 | DXT / RGTC / BPTC: 4×4 blocks
@@ -40,9 +41,10 @@ static fmt_t fmt_of(int f) {
 int nvn_fmt_bpb(int f, int *bw, int *bh) { fmt_t t = fmt_of(f); if (bw) *bw = t.bw; if (bh) *bh = t.bh; return t.bpb; }
 
 static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
-static uint32_t blk(uint32_t s, uint32_t b) { return (s + b - 1) / b; }
-static unsigned pick_tile(uint32_t gobs) { return gobs >= 16 ? 4 : gobs >= 8 ? 3 : gobs >= 4 ? 2 : gobs >= 2 ? 1 : 0; }
+static uint32_t blk(uint32_t s, uint32_t b) { return totk_tex_layout_fast_on() ? totk_blk_fast(s, b) : (s + b - 1) / b; }
+static unsigned pick_tile(uint32_t gobs) { return totk_tex_layout_fast_on() ? totk_pick_tile_fast(gobs) : (gobs >= 16 ? 4 : gobs >= 8 ? 3 : gobs >= 4 ? 2 : gobs >= 2 ? 1 : 0); }
 static unsigned adj_tile(unsigned shift, uint32_t unit, uint32_t dim) {
+    if (totk_tex_layout_fast_on()) return totk_adj_tile_fast(shift, unit, dim);
     if (!shift) return 0;
     uint32_t x = unit << (shift - 1);
     if (x >= dim) while (--shift) { x >>= 1; if (x < dim) break; }
@@ -80,7 +82,9 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
         uint32_t ld = dpl >= 3 ? mip(z, i) : 1;
         uint32_t lwb = lw * t.bpb;
         unsigned th = adj_tile(tileH, 8, lh), td = adj_tile(tileD, 1, ld);
-        uint32_t wg = (lwb + 63) / 64, hg = (lh + 7) / 8;
+        int fast = totk_tex_layout_fast_on();
+        uint32_t wg = fast ? (lwb + 63u) >> 6 : (lwb + 63) / 64;
+        uint32_t hg = fast ? (lh + 7u) >> 3 : (lh + 7) / 8;
         uint32_t wt = wg, ht = (hg + (1u << th) - 1) >> th, dt = (ld + (1u << td) - 1) >> td;
         off += (uint64_t)wt * ht * dt << (9 + th + td);
     }
@@ -93,8 +97,8 @@ static uint64_t level_offset(const nvn_texdesc *d, unsigned level, unsigned dpl,
    resources: the startup-only knob is a negative control for fresh sessions. */
 static int minimal_layout_on(void) {
     static _Atomic int enabled = -1;
-    int value = atomic_load(&enabled);
-    if (value < 0) { const char *e = getenv("TOTK_MINIMAL_LAYOUT"); value = !(e && !strcmp(e, "0")); atomic_store(&enabled, value); }
+    int value = atomic_load_explicit(&enabled, memory_order_acquire);
+    if (value < 0) { const char *e = getenv("TOTK_MINIMAL_LAYOUT"); value = !(e && !strcmp(e, "0")); atomic_store_explicit(&enabled, value, memory_order_release); }
     return value;
 }
 static uint64_t layer_bytes(const nvn_texdesc *d, unsigned dpl, int layered,
@@ -102,8 +106,8 @@ static uint64_t layer_bytes(const nvn_texdesc *d, unsigned dpl, int layered,
     uint64_t ls = level_offset(d, d->levels ? d->levels : 1, dpl, w, h, z, tileH, tileD, t);
     if (layered) {
         uint32_t hh = blk(h, t.bh); unsigned th = tileH, td = tileD;
-        while (th && hh <= (8u << (th - 1))) th--;
-        while (td && z <= (1u << (td - 1))) td--;
+        if (totk_tex_layout_fast_on()) { th = totk_adj_tile_fast(tileH, 8u, hh); td = totk_adj_tile_fast(tileD, 1u, z); }
+        else { while (th && hh <= (8u << (th - 1))) th--; while (td && z <= (1u << (td - 1))) td--; }
         uint64_t align = 1ull << (th + td + 9);
         ls = (ls + align - 1) & ~(align - 1);
     }
@@ -148,23 +152,38 @@ void nvn_tex_layout(const nvn_texdesc *d, nvn_texlayout *o) {
     o->align = 512;
 }
 
+static void totk_tile_hd_fast(const nvn_texdesc *d, unsigned dpl, int layered, uint32_t w, uint32_t h, uint32_t z, fmt_t t, unsigned *oh, unsigned *od) {
+    uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
+    unsigned tileH = 0, tileD = 0;
+    if (d->pkg_block_h) { unsigned pl = (unsigned)(d->pkg_block_h - 1) & 0xFFu; if (dpl >= 2) tileH = pl & 0xFu; if (dpl == 3) tileD = pl >> 4; }
+    else if (dpl == 2) { uint32_t ah = blk(h * sy, t.bh); tileH = pick_tile((ah + (ah >> 1)) >> 3); }
+    else if (dpl == 3) { tileD = pick_tile(z + (z >> 1)); }
+    if ((d->flags & 0x200) && !d->pkg_block_h && (tileH || tileD) && minimal_layout_on()) {
+        if (layer_bytes(d, dpl, layered, w, h, z, 0, 0, t) != layer_bytes(d, dpl, layered, w, h, z, tileH, tileD, t)) { tileH = 0; tileD = 0; }
+    }
+    *oh = tileH; *od = tileD;
+}
+
 uint64_t nvn_tex_level_offset(const nvn_texdesc *d, unsigned level) {
     fmt_t t = fmt_of(d->format);
-    unsigned dpl; int layered; uint32_t w, h, z;
+    unsigned dpl, tileH, tileD; int layered; uint32_t w, h, z;
     shape(d, &dpl, &layered, &w, &h, &z);
     if (!t.bpb || nvn_tex_is_linear(d) || d->target == 10) return 0;
-    nvn_texlayout L; nvn_tex_layout(d, &L);
-    return level_offset(d, level, dpl, w, h, z, L.tileH, L.tileD, t);
+    if (totk_tex_layout_fast_on()) totk_tile_hd_fast(d, dpl, layered, w, h, z, t, &tileH, &tileD);
+    else { nvn_texlayout L; nvn_tex_layout(d, &L); tileH = L.tileH; tileD = L.tileD; }
+    return level_offset(d, level, dpl, w, h, z, tileH, tileD, t);
 }
 
 void nvn_tex_level_tiles(const nvn_texdesc *d, unsigned level, unsigned *tileH, unsigned *tileD) {
     fmt_t t = fmt_of(d->format);
-    unsigned dpl; int layered; uint32_t w, h, z;
+    unsigned dpl, lth, ltd; int layered; uint32_t w, h, z;
     shape(d, &dpl, &layered, &w, &h, &z);
+    if (totk_tex_layout_fast_on() && (!t.bpb || nvn_tex_is_linear(d) || d->target == 10)) { *tileH = 0; *tileD = 0; return; }
     uint32_t sx, sy; samples_xy(d->samples, &sx, &sy);
-    nvn_texlayout L; nvn_tex_layout(d, &L);
+    if (totk_tex_layout_fast_on()) totk_tile_hd_fast(d, dpl, layered, w, h, z, t, &lth, &ltd);
+    else { nvn_texlayout L; nvn_tex_layout(d, &L); lth = L.tileH; ltd = L.tileD; }
     uint32_t lh = dpl >= 2 ? blk(mip(h * sy, level), t.bh) : 1;
     uint32_t ld = dpl >= 3 ? mip(z, level) : 1;
-    *tileH = adj_tile(L.tileH, 8, lh);
-    *tileD = adj_tile(L.tileD, 1, ld);
+    *tileH = adj_tile(lth, 8, lh);
+    *tileD = adj_tile(ltd, 1, ld);
 }

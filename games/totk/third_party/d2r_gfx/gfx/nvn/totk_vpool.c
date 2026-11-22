@@ -8,6 +8,7 @@
 // memory here, and the guest's own memory is too (runtime/services.c reserve_fixed). A backend that keeps pools in
 // memory of its own (the Vulkan backend's dma-bufs) maps the pages itself (mtl_pool_alias).
 #include "totk_vpool.h"
+#include "totk_tex_layout_fast.h"
 #include "nvn_mtl.h"
 #include "nvn_dirty.h"
 #include "../../host/hle.h"
@@ -30,7 +31,12 @@
 
 static pthread_mutex_t g_map_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static uint64_t host_page(void) { return (uint64_t)getpagesize(); }
+static uint64_t host_page(void) {
+    static _Atomic uint64_t g_pg = 0u;
+    uint64_t v = atomic_load_explicit(&g_pg, memory_order_acquire);
+    if (!v) { v = (uint64_t)getpagesize(); atomic_store_explicit(&g_pg, v, memory_order_release); }
+    return v;
+}
 static uint64_t round_up(uint64_t v, uint64_t a) { return (v + a - 1) & ~(a - 1); }
 
 #if !defined(__APPLE__)
@@ -54,7 +60,8 @@ int totk_vpool_init(pool_t *o) {
     int phys = (o->flags & F_PHYSICAL) != 0, virt = (o->flags & F_VIRTUAL) != 0;
     o->game_mem = o->mem; o->host = NULL; o->span = 0;
     if (phys == virt) { LOG("【红】vpool: pool flags %#x must be exactly one of PHYSICAL/VIRTUAL", o->flags); return 0; }
-    if (!o->size || o->size % TOTK_VPOOL_PAGE) { LOG("【红】vpool: pool size %#llx not a multiple of 64 KiB", o->size); return 0; }
+    uint64_t bad_sz = totk_tex_layout_fast_on() ? (o->size & (TOTK_VPOOL_PAGE - 1u)) : (o->size % TOTK_VPOOL_PAGE);
+    if (!o->size || bad_sz) { LOG("【红】vpool: pool size %#llx not a multiple of 64 KiB", o->size); return 0; }
     if (virt && o->mem) { LOG("【红】vpool: virtual pool given storage %p", (void *)o->mem); return 0; }
     if (phys && !o->mem) { LOG("【红】vpool: physical pool without storage"); return 0; }
     if (phys && !(o->flags & F_CPU_NO_ACCESS)) {
@@ -78,7 +85,9 @@ int totk_vpool_fini(pool_t *o) {
 static int check_request(const pool_t *v, const totk_mapping_request *r, int i) {
     uint64_t end = (uint64_t)r->virtual_offset + r->size;
     if (r->virtual_offset < 0 || r->physical_offset < 0 || !r->size) { LOG("【红】vpool: request %d negative/empty range", i); return 0; }
-    if ((r->virtual_offset | r->physical_offset | r->size) % TOTK_VPOOL_PAGE) { LOG("【红】vpool: request %d not 64 KiB aligned (v=%#llx p=%#llx n=%#llx)", i, r->virtual_offset, r->physical_offset, r->size); return 0; }
+    uint64_t uoff = (uint64_t)r->virtual_offset | (uint64_t)r->physical_offset | r->size;
+    uint64_t bad_u = totk_tex_layout_fast_on() ? (uoff & (TOTK_VPOOL_PAGE - 1u)) : (uoff % TOTK_VPOOL_PAGE);
+    if (bad_u) { LOG("【红】vpool: request %d not 64 KiB aligned (v=%#llx p=%#llx n=%#llx)", i, r->virtual_offset, r->physical_offset, r->size); return 0; }
     if (end < r->size || end > v->size) { LOG("【红】vpool: request %d exceeds virtual pool (%#llx > %#llx)", i, end, v->size); return 0; }
     if (!r->physical_pool) return 1;   // unmap
     const pool_t *p = (const pool_t *)(const void *)r->physical_pool;
@@ -92,11 +101,14 @@ static int check_request(const pool_t *v, const totk_mapping_request *r, int i) 
 // address can protect the pages the CPU actually touches (the game reads/writes physical pools through their own view).
 typedef struct { uintptr_t va, cpu; uint64_t size; } vmap_ent;
 static vmap_ent g_vmap[512]; static int g_nvmap;
+static totk_vmap_fast_t g_vmap_fast;
 static void vmap_note(uintptr_t va, uint64_t size, uintptr_t cpu) {
+    (void)totk_vmap_fast_note(&g_vmap_fast, va, size, cpu);
     for (int i = 0; i < g_nvmap; i++) if (g_vmap[i].va == va) { g_vmap[i] = (vmap_ent){va, cpu, size}; return; }
     if (g_nvmap < 512) g_vmap[g_nvmap++] = (vmap_ent){va, cpu, size};
 }
 int totk_vpool_backing(uintptr_t va, uint64_t len, uintptr_t *cpu) {
+    if (totk_tex_layout_fast_on()) { int fr = totk_vmap_fast_lookup(&g_vmap_fast, va, len, cpu); if (fr >= 0) return fr; }
     pthread_mutex_lock(&g_map_mu); int r = 0;
     for (int i = 0; i < g_nvmap; i++) { const vmap_ent *e = &g_vmap[i]; if (e->cpu && va >= e->va && va + len <= e->va + e->size) { *cpu = e->cpu + (va - e->va); r = 1; break; } }
     pthread_mutex_unlock(&g_map_mu); return r;
