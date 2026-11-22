@@ -31,6 +31,10 @@
 #include "vk_cs_fast.h"
 #include "vk_img_fast.h"
 #include "vk_bind_fast.h"
+#include "vk_pso_key_fast.h"
+_Static_assert(VK_PRIMITIVE_TOPOLOGY_POINT_LIST == 0 && VK_PRIMITIVE_TOPOLOGY_LINE_LIST == 1 && VK_PRIMITIVE_TOPOLOGY_LINE_STRIP == 2 && VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST == 3 && VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP == 4 && VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN == 5, "topology");
+_Static_assert(sizeof(VkDynamicState) == sizeof(uint32_t), "VkDynamicState size");
+_Static_assert(TOTK_DYN_VIEWPORT == VK_DYNAMIC_STATE_VIEWPORT && TOTK_DYN_SCISSOR == VK_DYNAMIC_STATE_SCISSOR && TOTK_DYN_LINE_WIDTH == VK_DYNAMIC_STATE_LINE_WIDTH && TOTK_DYN_DEPTH_BIAS == VK_DYNAMIC_STATE_DEPTH_BIAS && TOTK_DYN_BLEND_CONSTANTS == VK_DYNAMIC_STATE_BLEND_CONSTANTS && TOTK_DYN_STENCIL_COMPARE_MASK == VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK && TOTK_DYN_STENCIL_WRITE_MASK == VK_DYNAMIC_STATE_STENCIL_WRITE_MASK && TOTK_DYN_STENCIL_REFERENCE == VK_DYNAMIC_STATE_STENCIL_REFERENCE && TOTK_DYN_CULL_MODE == VK_DYNAMIC_STATE_CULL_MODE && TOTK_DYN_FRONT_FACE == VK_DYNAMIC_STATE_FRONT_FACE && TOTK_DYN_PRIMITIVE_TOPOLOGY == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY && TOTK_DYN_VERTEX_INPUT_BINDING_STRIDE == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE && TOTK_DYN_DEPTH_TEST_ENABLE == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE && TOTK_DYN_DEPTH_WRITE_ENABLE == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE && TOTK_DYN_DEPTH_COMPARE_OP == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP && TOTK_DYN_STENCIL_TEST_ENABLE == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE && TOTK_DYN_STENCIL_OP == VK_DYNAMIC_STATE_STENCIL_OP && TOTK_DYN_DEPTH_BIAS_ENABLE == VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE && TOTK_DYN_PRIMITIVE_RESTART_ENABLE == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, "totk dynamic states");
 _Static_assert(sizeof(p_bind_buf) == sizeof(totk_bind_buf_slot_t), "p_bind_buf size");
 _Static_assert(offsetof(p_bind_buf, addr) == offsetof(totk_bind_buf_slot_t, addr), "p_bind_buf addr");
 _Static_assert(sizeof(vk_bind) == sizeof(totk_vk_bind_rec_t), "vk_bind size");
@@ -3806,6 +3810,7 @@ static uint32_t pipe_write_mask(const pipe_key *k) {   /* the key's channel mask
     if (!unwritten_mask_live()) return k->chmask;
     const vk_shader *fs = k->fs;
     uint32_t outputs = fs ? fs->fout_mask | fs->fout_span : 0, mask = k->chmask;
+    if (totk_vk_pso_key_fast_on()) return totk_pipe_write_mask_fast(mask, outputs);
     for (unsigned i = 0; i < 8; i++) if (!(outputs >> i & 1)) mask &= ~(0xfu << (4 * i));
     return mask;
 }
@@ -3836,17 +3841,19 @@ static int pipe_sync_all(void) {
         LOGV("TOTK_VK_PIPE_SYNC=%d: draws %s for a pipeline that is still compiling", on, on ? "wait" : "are skipped"); }
     return on;
 }
-static int topo_class(int prim) { return prim == 0 ? 0 : prim == 1 || prim == 2 || prim == 3 ? 1 : 2; }
+static int topo_class(int prim) { return totk_vk_pso_key_fast_on() ? totk_topo_class_fast(prim) : (prim == 0 ? 0 : prim == 1 || prim == 2 || prim == 3 ? 1 : 2); }
 static VkPrimitiveTopology topology(int prim) {
+    if (totk_vk_pso_key_fast_on()) return (VkPrimitiveTopology)totk_topology_fast(prim);
     switch (prim) {
         case 0: return VK_PRIMITIVE_TOPOLOGY_POINT_LIST; case 1: return VK_PRIMITIVE_TOPOLOGY_LINE_LIST; case 3: return VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
         case 5: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; case 6: return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN;
     }
-    return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;   /* triangles, quads (drawn as indexed triangles) */
+    return VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 }
 /* No blending into integer targets; inactive targets must not distinguish pipelines (SavageWindRecomp's finding). */
 static uint32_t pipeline_blend_enable_for(const vk_state *state) {
     uint32_t be = state->color.blend_en;
+    if (totk_vk_pso_key_fast_on()) return totk_blend_en_fast(be, R.dclass, R.ncolor);
     for (uint32_t i = 0; i < R.ncolor && i < 8; i++) if (R.dclass[i]) be &= ~(1u << i);
     return be & (R.ncolor >= 8 ? 0xffu : (1u << R.ncolor) - 1);
 }
@@ -3858,6 +3865,18 @@ static void pipe_key_fill(pipe_key *k, const vk_state *state, vk_shader *vs, vk_
     k->blend_en = pipeline_blend_enable_for(state); k->chmask = state->chmask.mask; k->a2c = state->ms.a2c; k->poly_mode = (uint8_t)state->poly.mode; k->topo_class = (uint8_t)topo_class(prim);
     k->depth_clamp = (uint8_t)state->depth_clamp; k->logic_op = (uint8_t)state->color.logic_op;
     if (k->ncolor < 8) k->chmask &= (1u << (4 * k->ncolor)) - 1;
+    if (totk_vk_pso_key_fast_on()) {
+        uint32_t be = k->blend_en;
+        while (be) { unsigned i = (unsigned)__builtin_ctz(be); be &= be - 1u; k->blend[i] = state->blend[i]; }
+        uint32_t vm = vs->vin_mask & (state->nattr < 16 ? ((1u << (state->nattr > 0 ? state->nattr : 0)) - 1u) : 0xffffu);
+        while (vm) {
+            int a = __builtin_ctz(vm); vm &= vm - 1u;
+            if (!state->attr[a].fmt) continue;
+            k->attr[a].fmt = state->attr[a].fmt; k->attr[a].offset = state->attr[a].offset; k->attr[a].stream = state->attr[a].stream;
+            int st = state->attr[a].stream; if (st < 16) { k->stream[st].divisor = state->stream[st].divisor; k->stream[st].instanced = state->stream[st].divisor != 0 && state->stream[st].stride != 0; }
+        }
+        return;
+    }
     for (uint32_t i = 0; i < k->ncolor && i < 8; i++) if (k->blend_en >> i & 1) k->blend[i] = state->blend[i];
     for (int a = 0; a < 16; a++) if (vs->vin_mask >> a & 1) {
         if (a < state->nattr && state->attr[a].fmt) {
@@ -3868,34 +3887,34 @@ static void pipe_key_fill(pipe_key *k, const vk_state *state, vk_shader *vs, vk_
 }
 #define ZERO_BINDING 16   /* a zero vertex buffer for attributes the shader reads but the game left unset */
 /* the pipeline of a key; flags VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT asks the pipeline cache alone */
-static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipeline *out, uint64_t frame, int synchronous, int part) {
-    vk_shader *vs = k->vs, *fs = k->fs; VkPipeline p = VK_NULL_HANDLE;
-    VkPipelineShaderStageCreateInfo st[2] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vk_vs_module_for(vs, fs), .pName = "main"},
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs ? fs->mod : VK_NULL_HANDLE, .pName = "main"}};
-    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup[2] = {
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = vs->required_subgroup_size},
-        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = fs ? fs->required_subgroup_size : 0}};
-    if (vs->required_subgroup_size) st[0].pNext = &subgroup[0];
-    if (fs && fs->required_subgroup_size) st[1].pNext = &subgroup[1];
-    /* depth the fragment shader writes gets the same DEPTH16 nudge as rasterized depth (see d16tie_on) */
-    float d16spec = D16_NUDGE_UNITS / 65535.0f; VkSpecializationMapEntry sme = {D16_SPEC_ID, 0, 4}; VkSpecializationInfo spi = {1, &sme, 4, &d16spec};
-    if (fs && fs->depth_spec && k->dfmt == VK_FORMAT_D16_UNORM && d16tie_on()) st[1].pSpecializationInfo = &spi;
-    VkVertexInputBindingDescription bd[17]; VkVertexInputAttributeDescription ad[32]; VkVertexInputBindingDivisorDescriptionEXT dd[16];
-    uint32_t nb = 0, na = 0, nd = 0, used_streams = 0; int zero_used = 0;
-    for (int a = 0; a < 32; a++) if (vs->vin_mask >> a & 1) {
-        VkFormat vf = a < 16 && k->attr[a].fmt ? vk_vertex_fmt((int)k->attr[a].fmt) : VK_FORMAT_UNDEFINED;
-        if (a < 16 && k->attr[a].fmt && !vf) RED(8, "vertex attribute format %#x has no Vulkan format", k->attr[a].fmt);
-        if (!vf) {
-            int cls = vs->vin_class[a];
-            ad[na++] = (VkVertexInputAttributeDescription){(uint32_t)a, ZERO_BINDING, cls == 1 ? VK_FORMAT_R32G32B32A32_UINT : cls == 2 ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT, 0};
-            zero_used = 1; continue;
-        }
-        uint32_t s = k->attr[a].stream & 15;
-        ad[na++] = (VkVertexInputAttributeDescription){(uint32_t)a, s, vf, k->attr[a].offset};
-        used_streams |= 1u << s;
+static inline void pipe_vin_emit_attr(const pipe_key *k, const vk_shader *vs, int a,
+                                      VkVertexInputAttributeDescription *ad, uint32_t *na,
+                                      uint32_t *used_streams, int *zero_used) {
+    VkFormat vf = a < 16 && k->attr[a].fmt ? vk_vertex_fmt((int)k->attr[a].fmt) : VK_FORMAT_UNDEFINED;
+    if (a < 16 && k->attr[a].fmt && !vf) RED(8, "vertex attribute format %#x has no Vulkan format", k->attr[a].fmt);
+    if (!vf) {
+        int cls = vs->vin_class[a];
+        ad[(*na)++] = (VkVertexInputAttributeDescription){(uint32_t)a, ZERO_BINDING, cls == 1 ? VK_FORMAT_R32G32B32A32_UINT : cls == 2 ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT, 0};
+        *zero_used = 1; return;
     }
-    for (uint32_t s = 0; s < 16; s++) if (used_streams >> s & 1) {
+    uint32_t s = k->attr[a].stream & 15;
+    ad[(*na)++] = (VkVertexInputAttributeDescription){(uint32_t)a, s, vf, k->attr[a].offset};
+    *used_streams |= 1u << s;
+}
+static void pipe_create_vin(const pipe_key *k, const vk_shader *vs,
+                            VkVertexInputBindingDescription bd[17], VkVertexInputAttributeDescription ad[32],
+                            VkVertexInputBindingDivisorDescriptionEXT dd[16],
+                            VkPipelineVertexInputDivisorStateCreateInfoEXT *dsi, VkPipelineVertexInputStateCreateInfo *vi) {
+    uint32_t nb = 0, na = 0, nd = 0, used_streams = 0; int zero_used = 0;
+    if (totk_vk_pso_key_fast_on()) {
+        uint32_t vm = vs->vin_mask;
+        while (vm) { int a = __builtin_ctz(vm); vm &= vm - 1u; pipe_vin_emit_attr(k, vs, a, ad, &na, &used_streams, &zero_used); }
+    } else {
+        for (int a = 0; a < 32; a++) if (vs->vin_mask >> a & 1) pipe_vin_emit_attr(k, vs, a, ad, &na, &used_streams, &zero_used);
+    }
+    uint32_t us = used_streams;
+    while (us) {
+        uint32_t s = (uint32_t)__builtin_ctz(us); us &= us - 1u;
         bd[nb++] = (VkVertexInputBindingDescription){s, 0, k->stream[s].instanced ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
         if (k->stream[s].instanced && k->stream[s].divisor > 1) {
             if (V.has_divisor) dd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){s, k->stream[s].divisor};
@@ -3903,16 +3922,10 @@ static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkP
         }
     }
     if (zero_used) bd[nb++] = (VkVertexInputBindingDescription){ZERO_BINDING, 0, VK_VERTEX_INPUT_RATE_VERTEX};
-    VkPipelineVertexInputDivisorStateCreateInfoEXT dsi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT, .vertexBindingDivisorCount = nd, .pVertexBindingDivisors = dd};
-    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, nd ? &dsi : NULL, 0, nb, bd, na, ad};
-    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-        .topology = k->topo_class == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : k->topo_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
-    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
-    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
-        .depthClampEnable = k->depth_clamp && V.props.limits.maxViewports, .polygonMode = k->poly_mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : k->poly_mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_FILL, .lineWidth = 1};
-    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = k->samples ? (VkSampleCountFlagBits)k->samples : VK_SAMPLE_COUNT_1_BIT, .alphaToCoverageEnable = k->a2c & 1};
-    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
-    VkPipelineColorBlendAttachmentState cba[8];
+    *dsi = (VkPipelineVertexInputDivisorStateCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT, .vertexBindingDivisorCount = nd, .pVertexBindingDivisors = dd};
+    *vi = (VkPipelineVertexInputStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, nd ? dsi : NULL, 0, nb, bd, na, ad};
+}
+static uint32_t pipe_create_blend(const pipe_key *k, VkPipelineColorBlendAttachmentState cba[8]) {
     uint32_t chmask = pipe_write_mask(k), unwritten = 0;
     for (uint32_t i = 0; i < k->ncolor && i < 8; i++) {
         uint32_t m = chmask >> (4 * i) & 0xf;
@@ -3925,86 +3938,79 @@ static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkP
         }
         if (!k->cfmt[i]) cba[i].colorWriteMask = 0;
     }
+    return unwritten;
+}
+static void pipe_create_subset(int part, VkGraphicsPipelineCreateInfo *ci, VkPipelineRenderingCreateInfo *pr,
+                               VkPipelineDynamicStateCreateInfo *dy, VkGraphicsPipelineLibraryCreateInfoEXT *subset,
+                               const VkPipelineShaderStageCreateInfo st[2], const VkDynamicState *dyn, uint32_t ndyn, VkDynamicState *subset_dyn) {
+    _Static_assert(PL_VERTEX_INPUT == 0 && PL_PRE_RASTER == 1 && PL_FRAGMENT == 2 && PL_OUTPUT == 3, "PL_* slice ids");
+    static const VkGraphicsPipelineLibraryFlagBitsEXT bits[PL_COUNT] = {
+        VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
+        VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
+    int has_fs = ci->stageCount > 1;
+    subset->flags = bits[part]; subset->pNext = pr; ci->pNext = subset;
+    ci->flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
+    ci->stageCount = part == PL_PRE_RASTER ? 1 : part == PL_FRAGMENT && has_fs ? 1 : 0;
+    ci->pStages = part == PL_PRE_RASTER ? st : part == PL_FRAGMENT && has_fs ? st + 1 : NULL;
+    if (part != PL_VERTEX_INPUT) { ci->pVertexInputState = NULL; ci->pInputAssemblyState = NULL; }
+    if (part != PL_PRE_RASTER) { ci->pViewportState = NULL; ci->pRasterizationState = NULL; }
+    if (part != PL_FRAGMENT && part != PL_OUTPUT) ci->pMultisampleState = NULL;
+    if (part != PL_FRAGMENT) ci->pDepthStencilState = NULL;
+    if (part != PL_OUTPUT) { ci->pColorBlendState = NULL; pr->colorAttachmentCount = 0; pr->pColorAttachmentFormats = NULL; }
+    if (part != PL_FRAGMENT && part != PL_OUTPUT) { pr->depthAttachmentFormat = VK_FORMAT_UNDEFINED; pr->stencilAttachmentFormat = VK_FORMAT_UNDEFINED; }
+    if (part != PL_PRE_RASTER && part != PL_FRAGMENT) ci->layout = VK_NULL_HANDLE;
+    dy->dynamicStateCount = 0; dy->pDynamicStates = subset_dyn;
+    if (totk_vk_pso_key_fast_on()) {
+        uint32_t dn = 0; const uint32_t *sl = totk_gpl_dyn_slice_fast(part, &dn);
+        if (dn && sl) memcpy(subset_dyn, sl, (size_t)dn * sizeof *subset_dyn);
+        dy->dynamicStateCount = dn; return;
+    }
+    for (unsigned i = 0; i < ndyn; i++) {
+        VkDynamicState d = dyn[i];
+        int owner = d == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY || d == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE || d == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE ? PL_VERTEX_INPUT
+            : d == VK_DYNAMIC_STATE_BLEND_CONSTANTS ? PL_OUTPUT
+            : d == VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK || d == VK_DYNAMIC_STATE_STENCIL_WRITE_MASK || d == VK_DYNAMIC_STATE_STENCIL_REFERENCE || d == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE || d == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE || d == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP || d == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE || d == VK_DYNAMIC_STATE_STENCIL_OP ? PL_FRAGMENT : PL_PRE_RASTER;
+        if (owner == part) subset_dyn[dy->dynamicStateCount++] = d;
+    }
+}
+static VkResult pipe_create_kind(const pipe_key *k, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipeline *out, uint64_t frame, int synchronous, int part) {
+    vk_shader *vs = k->vs, *fs = k->fs; VkPipeline p = VK_NULL_HANDLE;
+    VkPipelineShaderStageCreateInfo st[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vk_vs_module_for(vs, fs), .pName = "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, .stage = VK_SHADER_STAGE_FRAGMENT_BIT, .module = fs ? fs->mod : VK_NULL_HANDLE, .pName = "main"}};
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup[2] = {{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = vs->required_subgroup_size},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO, .requiredSubgroupSize = fs ? fs->required_subgroup_size : 0}};
+    if (vs->required_subgroup_size) st[0].pNext = &subgroup[0];
+    if (fs && fs->required_subgroup_size) st[1].pNext = &subgroup[1];
+    float d16spec = D16_NUDGE_UNITS / 65535.0f; VkSpecializationMapEntry sme = {D16_SPEC_ID, 0, 4}; VkSpecializationInfo spi = {1, &sme, 4, &d16spec};
+    if (fs && fs->depth_spec && k->dfmt == VK_FORMAT_D16_UNORM && d16tie_on()) st[1].pSpecializationInfo = &spi;
+    VkVertexInputBindingDescription bd[17]; VkVertexInputAttributeDescription ad[32]; VkVertexInputBindingDivisorDescriptionEXT dd[16];
+    VkPipelineVertexInputDivisorStateCreateInfoEXT dsi; VkPipelineVertexInputStateCreateInfo vi;
+    pipe_create_vin(k, vs, bd, ad, dd, &dsi, &vi);
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, .topology = k->topo_class == 0 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : k->topo_class == 1 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, .viewportCount = 1, .scissorCount = 1};
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, .depthClampEnable = k->depth_clamp && V.props.limits.maxViewports,
+        .polygonMode = k->poly_mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : k->poly_mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : VK_POLYGON_MODE_FILL, .lineWidth = 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, .rasterizationSamples = k->samples ? (VkSampleCountFlagBits)k->samples : VK_SAMPLE_COUNT_1_BIT, .alphaToCoverageEnable = k->a2c & 1};
+    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState cba[8]; uint32_t unwritten = pipe_create_blend(k, cba);
     VkPipelineColorBlendStateCreateInfo cb = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, .attachmentCount = k->ncolor, .pAttachments = cba};
     if (k->logic_op != NVN_LOGIC_OP_COPY && k->logic_op && V.has_logic_op) { cb.logicOpEnable = VK_TRUE; cb.logicOp = (VkLogicOp)(k->logic_op - 1 > 15 ? 3 : k->logic_op - 1); }
-    static const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS,
-        VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE,
-        VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,
-        VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE,
-        VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_LINE_WIDTH};
+    static const VkDynamicState dyn[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS, VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE, VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE, VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE, VK_DYNAMIC_STATE_LINE_WIDTH};
     VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, .dynamicStateCount = sizeof dyn / sizeof *dyn, .pDynamicStates = dyn};
-    VkPipelineRenderingCreateInfo pr = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor, .pColorAttachmentFormats = k->cfmt,
-        .depthAttachmentFormat = k->dfmt, .stencilAttachmentFormat = k->sfmt};
-    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &pr, .flags = flags, .stageCount = fs ? 2 : 1, .pStages = st, .pVertexInputState = &vi,
-        .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb,
-        .pDynamicState = &dy, .layout = layout};
-    VkGraphicsPipelineLibraryCreateInfoEXT subset = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT};
-    VkDynamicState subset_dyn[sizeof dyn / sizeof *dyn];
-    if (part >= 0) {
-        static const VkGraphicsPipelineLibraryFlagBitsEXT bits[PL_COUNT] = {
-            VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
-            VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
-            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT,
-            VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
-        subset.flags = bits[part]; subset.pNext = &pr; ci.pNext = &subset;
-        ci.flags |= VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT;
-        ci.stageCount = part == PL_PRE_RASTER ? 1 : part == PL_FRAGMENT && fs ? 1 : 0;
-        ci.pStages = part == PL_PRE_RASTER ? st : part == PL_FRAGMENT && fs ? st + 1 : NULL;
-        ci.pVertexInputState = part == PL_VERTEX_INPUT ? &vi : NULL;
-        ci.pInputAssemblyState = part == PL_VERTEX_INPUT ? &ia : NULL;
-        ci.pViewportState = part == PL_PRE_RASTER ? &vp : NULL;
-        ci.pRasterizationState = part == PL_PRE_RASTER ? &rs : NULL;
-        ci.pMultisampleState = part == PL_FRAGMENT || part == PL_OUTPUT ? &ms : NULL;
-        ci.pDepthStencilState = part == PL_FRAGMENT ? &ds : NULL;
-        ci.pColorBlendState = part == PL_OUTPUT ? &cb : NULL;
-        ci.layout = part == PL_PRE_RASTER || part == PL_FRAGMENT ? layout : VK_NULL_HANDLE;
-        if (part != PL_OUTPUT) { pr.colorAttachmentCount = 0; pr.pColorAttachmentFormats = NULL; }
-        if (part != PL_FRAGMENT && part != PL_OUTPUT) {
-            pr.depthAttachmentFormat = VK_FORMAT_UNDEFINED; pr.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
-        }
-        dy.dynamicStateCount = 0; dy.pDynamicStates = subset_dyn;
-        for (unsigned i = 0; i < sizeof dyn / sizeof *dyn; i++) {
-            VkDynamicState d = dyn[i];
-            int owner = d == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY || d == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE ||
-                        d == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE ? PL_VERTEX_INPUT :
-                        d == VK_DYNAMIC_STATE_BLEND_CONSTANTS ? PL_OUTPUT :
-                        d == VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK || d == VK_DYNAMIC_STATE_STENCIL_WRITE_MASK ||
-                        d == VK_DYNAMIC_STATE_STENCIL_REFERENCE || d == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE ||
-                        d == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE || d == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP ||
-                        d == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE || d == VK_DYNAMIC_STATE_STENCIL_OP ? PL_FRAGMENT : PL_PRE_RASTER;
-            if (owner == part) subset_dyn[dy.dynamicStateCount++] = d;
-        }
-    }
-    uint64_t t0 = g_hitch_on ? host_now_ns() : 0;
-    /* flags=0 cache: Vulkan internally synchronizes creation and concurrent snapshot extraction.
-       Do not add a coarse backend lock across compiles. Opt-in pcache overlap telemetry measures interference. */
-    int diag = synchronous && dm_wait_stats_enabled();
-    int credit = synchronous && pipe_predict_on() && pipe_predict_adapt();
-    int probe = (flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) != 0;
-    int trace = synchronous && !probe && pso_trace_on();
-    int measure = !probe && (diag || credit || trace);
-    uint64_t build_start = measure ? host_now_ns() : 0;
-    VkResult r = vk_pcache_graphics(&ci, &p);
-    if (measure) {
-        uint64_t elapsed = host_now_ns() - build_start;
-        if (diag && !probe) pipe_diag_add(&g_pp_build_ns, elapsed);
-        if (credit && !probe) nvn_scan_budget_build(&g_pp_budget, g_pp_frame, elapsed);
-    }
+    VkPipelineRenderingCreateInfo pr = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, .colorAttachmentCount = k->ncolor, .pColorAttachmentFormats = k->cfmt, .depthAttachmentFormat = k->dfmt, .stencilAttachmentFormat = k->sfmt};
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &pr, .flags = flags, .stageCount = fs ? 2 : 1, .pStages = st, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vp, .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds, .pColorBlendState = &cb, .pDynamicState = &dy, .layout = layout};
+    VkGraphicsPipelineLibraryCreateInfoEXT subset = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT}; VkDynamicState subset_dyn[sizeof dyn / sizeof *dyn];
+    if (part >= 0) pipe_create_subset(part, &ci, &pr, &dy, &subset, st, dyn, (uint32_t)(sizeof dyn / sizeof *dyn), subset_dyn);
+    uint64_t t0 = g_hitch_on ? host_now_ns() : 0; int diag = synchronous && dm_wait_stats_enabled(), credit = synchronous && pipe_predict_on() && pipe_predict_adapt(), probe = (flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) != 0, trace = synchronous && !probe && pso_trace_on(), measure = !probe && (diag || credit || trace);
+    uint64_t build_start = measure ? host_now_ns() : 0; VkResult r = vk_pcache_graphics(&ci, &p);
+    if (measure) { uint64_t elapsed = host_now_ns() - build_start; if (diag && !probe) pipe_diag_add(&g_pp_build_ns, elapsed); if (credit && !probe) nvn_scan_budget_build(&g_pp_budget, g_pp_frame, elapsed); }
     if (trace) pso_trace_target_log(k, "sync-build", frame, r, host_now_ns() - build_start);
-    if (!r && (runtime_android_fps_auto_active() || runtime_fps_adaptive_selected()))
-        runtime_android_fps_auto_pipeline(host_now_ns());
-    if (!r && frame) {
-        if (frame == totk_ft_work_frame()) totk_ft_count(FT_COUNT_PIPE_CREATES, 1);
-        else totk_ft_count_frame(frame, FT_COUNT_PIPE_CREATES, 1);
-    }
+    if (!r && (runtime_android_fps_auto_active() || runtime_fps_adaptive_selected())) runtime_android_fps_auto_pipeline(host_now_ns());
+    if (!r && frame) { if (frame == totk_ft_work_frame()) totk_ft_count(FT_COUNT_PIPE_CREATES, 1); else totk_ft_count_frame(frame, FT_COUNT_PIPE_CREATES, 1); }
     if (r != VK_PIPELINE_COMPILE_REQUIRED) { HK_ADD(pipes, 1); HK_ADD(pipe_ns, host_now_ns() - t0); }
     if (part >= 0 && r && p) vkDestroyPipeline(V.dev, p, NULL);
-    if (!r && part < 0 && unwritten) {
-        atomic_fetch_add_explicit(&g_unwritten_pipes, 1, memory_order_relaxed);
-        atomic_fetch_add_explicit(&g_unwritten_attachments, unwritten, memory_order_relaxed);
-    }
-    *out = r ? VK_NULL_HANDLE : p;
-    return r;
+    if (!r && part < 0 && unwritten) { atomic_fetch_add_explicit(&g_unwritten_pipes, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_unwritten_attachments, unwritten, memory_order_relaxed); }
+    *out = r ? VK_NULL_HANDLE : p; return r;
 }
 static VkResult pipe_create(const pipe_key *k, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipeline *out, uint64_t frame, int synchronous) {
     return pipe_create_kind(k, layout, flags, out, frame, synchronous, -1);
@@ -4433,136 +4439,88 @@ void vk_pipeline_prewarm(void) {
     atomic_store_explicit(&g_pso_ready, g_pso_collect || g_pw_total, memory_order_release);
     pthread_cond_broadcast(&g_pq_cv); pthread_mutex_unlock(&g_pq_mu);
 }
+_Static_assert(offsetof(pipe_key, blend) == 64 && offsetof(pipe_key, blend_en) == 128 && offsetof(pipe_key, attr) == 144 && sizeof(pipe_key) == 464, "pipe_key offsets");
+static inline int pipe_key_eq_now(const pipe_key *a, const pipe_key *b) {
+    return totk_vk_pso_key_fast_on() ? totk_pipe_key_eq_fast(a, b, sizeof *a) : !memcmp(a, b, sizeof *a);
+}
+static pipe_ent *pipe_get_lookup(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLayout layout,
+                                 pipe_ent *e, pipe_ent *memo[64], vk_pipe_memo *ktgl_pipe, pipe_key *k_out) {
+    if (!g_pipe_dirty && e && e->layout == layout && e->k.vs == vs && e->k.fs == fs && e->k.topo_class == topo_class(prim)) return e;
+    pipe_key_fill(k_out, &S, vs, fs, prim); g_pipe_dirty = 0;
+    if (e && e->layout == layout && pipe_key_eq_now(&e->k, k_out)) return e;
+    if (ktglmemo_draw_on()) {
+        uint64_t lay64 = (uint64_t)(uintptr_t)layout;
+        const vk_pipe_set_t *ps = vk_pipe_memo_set(ktgl_pipe, vs, fs, (uint32_t)k_out->topo_class, lay64);
+        e = NULL;
+        for (int w = 0; w < VK_KTGL_PIPE_WAYS; w++) {
+            pipe_ent *cand = (pipe_ent *)ps->ways[w]; if (!cand) break;
+            if (cand->layout == layout && cand->k.vs == vs && cand->k.fs == fs && pipe_key_eq_now(&cand->k, k_out)) { e = cand; break; }
+        }
+        if (!e) { e = nvn_hm_get(&g_pipes, k_out); if (e) vk_pipe_memo_put(ktgl_pipe, vs, fs, (uint32_t)k_out->topo_class, lay64, e); }
+        return e;
+    }
+    unsigned h = (unsigned)(((uintptr_t)vs >> 4) ^ ((uintptr_t)fs >> 8) ^ k_out->topo_class) & 63u;
+    pipe_ent *cand = memo[h];
+    e = (cand && cand->layout == layout && pipe_key_eq_now(&cand->k, k_out)) ? cand : nvn_hm_get(&g_pipes, k_out);
+    if (e) memo[h] = e;
+    return e;
+}
+static VkPipeline pipe_get_existing(pipe_ent *e, int capture, pipe_ent **last_p) {
+    pso_demand(e, capture); *last_p = e;
+    int s = atomic_load_explicit(&e->state, memory_order_acquire);
+    if (s == PE_READY) return pipe_ready_get(e);
+    VkPipeline fast = !e->predicted && !capture ? pipe_fast_get(e) : VK_NULL_HANDLE;
+    if (fast && pipe_pending(s)) return fast;
+    uint64_t sub = vk_game_submit_serial(); unsigned bound = pipe_wait_max(); int sync_all = pipe_sync_all();
+    if (pipe_pending(s) && (e->predicted || capture || sync_all || (bound && e->wait_sub != sub && e->skipped >= bound))) {
+        uint64_t t0 = host_now_ns();
+        if (!capture && !e->predicted && !sync_all) { HK_ADD(pipe_bounds, 1); LOGV("pipeline key %p reached %u skipped submissions: build/join synchronously", (void *)e, e->skipped); }
+        pipe_predict_maybe(vk_exec_draw_next()); s = pipe_build_now(e);
+        uint64_t dt = host_now_ns() - t0; g_win_prewarm_wait++; g_win_prewarm_wait_ns += dt; g_cum_pipe_ns += dt;
+    }
+    if (s == PE_FAILED) {
+        if (e->seen_failure != e->failures) {
+            e->seen_failure = e->failures; unsigned shift = e->failures > 5 ? 4 : e->failures > 1 ? e->failures - 2 : 0;
+            unsigned delay = e->failures == 1 ? 1 : 30u << shift; e->retry_at = sub + (delay > 300 ? 300 : delay);
+        }
+        if (sub >= e->retry_at) { pipe_predict_maybe(vk_exec_draw_next()); HK_ADD(pipe_retries, 1); uint64_t t0 = host_now_ns(); s = pipe_build_now(e); g_cum_pipe_ns += host_now_ns() - t0; }
+    }
+    if (s != PE_READY && fast) return fast;
+    if (pipe_pending(s)) { if (e->wait_sub != sub) { e->wait_sub = sub; e->skipped++; } HK_ADD(pipe_skips, 1); if (V.has_pipeline_library) atomic_fetch_add(&g_library_stats.library_skips, 1); }
+    if (s == PE_FAILED && V.has_pipeline_library) atomic_fetch_add(&g_library_stats.library_skips, 1);
+    return s == PE_READY ? pipe_ready_get(e) : s == PE_FAILED ? PIPE_FAILED : VK_NULL_HANDLE;
+}
 static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLayout layout) {
-    static pipe_ent *last;   /* entries never move or die; only the recording thread reads this memo */
-    static pipe_ent *memo[64];
-    static vk_pipe_memo g_ktgl_pipe;   /* 256x4 zero-write front cache when ktglmemo is active */
-    pipe_ent *e = last; pipe_key k;
-    g_draw_fast = 0;
-    int screen_aspect = pipe_screen_class() != 0;
-    int capture = !screen_aspect && R.ncolor;
-    if (g_pipe_dirty || !e || e->layout != layout || e->k.vs != vs || e->k.fs != fs || e->k.topo_class != topo_class(prim)) {
-        pipe_key_fill(&k, &S, vs, fs, prim); g_pipe_dirty = 0;
-        if (!e || e->layout != layout || memcmp(&e->k, &k, sizeof k)) {
-            if (ktglmemo_draw_on()) {
-                uint64_t lay64 = (uint64_t)(uintptr_t)layout;
-                const vk_pipe_set_t *ps = vk_pipe_memo_set(&g_ktgl_pipe, vs, fs, (uint32_t)k.topo_class, lay64);
-                e = NULL;
-                for (int w = 0; w < VK_KTGL_PIPE_WAYS; w++) {
-                    pipe_ent *cand = (pipe_ent *)ps->ways[w];
-                    if (!cand) break;
-                    if (cand->layout == layout && cand->k.vs == vs && cand->k.fs == fs && !memcmp(&cand->k, &k, sizeof k)) { e = cand; break; }
-                }
-                if (!e) { e = nvn_hm_get(&g_pipes, &k); if (e) vk_pipe_memo_put(&g_ktgl_pipe, vs, fs, (uint32_t)k.topo_class, lay64, e); }
-            } else {
-                unsigned h = (unsigned)(((uintptr_t)vs >> 4) ^ ((uintptr_t)fs >> 8) ^ k.topo_class) & 63u;
-                pipe_ent *candidate = memo[h];
-                e = candidate && candidate->layout == layout && !memcmp(&candidate->k, &k, sizeof k) ?
-                    candidate : nvn_hm_get(&g_pipes, &k);
-                if (e) memo[h] = e;
-            }
-        }
-    }
-    /* A memo hit still observes a worker's publication, including queued and failed entries. */
-    if (e) {
-        pso_demand(e, capture);
-        last = e; int s = atomic_load_explicit(&e->state, memory_order_acquire);
-        if (s == PE_READY) {
-            return pipe_ready_get(e);
-        }
-        VkPipeline fast = !e->predicted && !capture ? pipe_fast_get(e) : VK_NULL_HANDLE;
-        if (fast && pipe_pending(s)) return fast;
-        uint64_t sub = vk_game_submit_serial();
-        unsigned bound = pipe_wait_max();
-        /* Only opt-in prediction-origin entries join at their first demand (upstream pso_pend_take).
-           Skipping one could hide a draw that the original cache-only probe would have satisfied.
-           Ordinary screen misses retain async/skipped-submission bounds; captures always join/build. */
-        int sync_all = pipe_sync_all();
-        if (pipe_pending(s) && (e->predicted || capture || sync_all || (bound && e->wait_sub != sub && e->skipped >= bound))) {
-            uint64_t t0 = host_now_ns();
-            if (!capture && !e->predicted && !sync_all) { HK_ADD(pipe_bounds, 1); LOGV("pipeline key %p reached %u skipped submissions: build/join synchronously", (void *)e, e->skipped); }
-            pipe_predict_maybe(vk_exec_draw_next());
-            s = pipe_build_now(e);
-            uint64_t dt = host_now_ns() - t0; g_win_prewarm_wait++; g_win_prewarm_wait_ns += dt; g_cum_pipe_ns += dt;
-        }
-        if (s == PE_FAILED) {
-            if (e->seen_failure != e->failures) {
-                e->seen_failure = e->failures;
-                unsigned shift = e->failures > 5 ? 4 : e->failures > 1 ? e->failures - 2 : 0;
-                unsigned delay = e->failures == 1 ? 1 : 30u << shift;
-                e->retry_at = sub + (delay > 300 ? 300 : delay);
-            }
-            if (sub >= e->retry_at) {
-                pipe_predict_maybe(vk_exec_draw_next());
-                HK_ADD(pipe_retries, 1); uint64_t t0 = host_now_ns();
-                s = pipe_build_now(e);   /* one retry per backoff, not per draw; never cache a permanent failure */
-                g_cum_pipe_ns += host_now_ns() - t0;
-            }
-        }
-        if (s != PE_READY && fast) return fast;
-        if (pipe_pending(s)) {
-            if (e->wait_sub != sub) { e->wait_sub = sub; e->skipped++; }
-            HK_ADD(pipe_skips, 1);
-            if (V.has_pipeline_library) atomic_fetch_add(&g_library_stats.library_skips, 1);
-        }
-        if (s == PE_FAILED && V.has_pipeline_library) atomic_fetch_add(&g_library_stats.library_skips, 1);
-        return s == PE_READY ? pipe_ready_get(e) : s == PE_FAILED ? PIPE_FAILED : VK_NULL_HANDLE;
-    }
-    e = calloc(1, sizeof *e); e->k = k; e->layout = layout; e->frame = totk_ft_work_frame(); last = e;
-    e->capture = capture;
-    nvn_hm_put(&g_pipes, &k, e);
-    unsigned h = (unsigned)(((uintptr_t)vs >> 4) ^ ((uintptr_t)fs >> 8) ^ k.topo_class) & 63u;
-    memo[h] = e;
-    g_stat_pipes++;
-    /* Non-screen colour targets retain the Gerudo capture guard: skipping 64x64 B10G11R11 + depth
-       draws permanently changed plaza lighting (09a79bca6). Recognize aligned scene extents before this
-       guard: e.g. requested960x540 renders960x536 and must not be mistaken for a persistent probe.
-       Depth-only shadow maps retain the existing worker policy; no capture replay/deferral is added. */
+    static pipe_ent *last; static pipe_ent *memo[64]; static vk_pipe_memo g_ktgl_pipe;
+    pipe_key k; g_draw_fast = 0; int screen_aspect = pipe_screen_class() != 0, capture = !screen_aspect && R.ncolor;
+    pipe_ent *e = pipe_get_lookup(vs, fs, prim, layout, last, memo, &g_ktgl_pipe, &k);
+    if (e) return pipe_get_existing(e, capture, &last);
+    e = calloc(1, sizeof *e); e->k = k; e->layout = layout; e->frame = totk_ft_work_frame(); last = e; e->capture = capture;
+    nvn_hm_put(&g_pipes, &k, e); memo[(unsigned)(((uintptr_t)vs >> 4) ^ ((uintptr_t)fs >> 8) ^ k.topo_class) & 63u] = e; g_stat_pipes++;
     int async = compile_threads() > 0 && (screen_aspect || !R.ncolor);
     pso_trace_target_log(&e->k, "demand", e->frame, VK_SUCCESS, 0);
-    uint64_t t0 = host_now_ns(); VkPipeline p;
-    int cache_probe = V.has_cache_control;
-    uint64_t probe_started = pso_trace_on() ? host_now_ns() : 0;
-    VkResult r = pipe_create(&e->k, layout, cache_probe ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0,
-                             &p, e->frame, !V.has_cache_control);
-    if (probe_started) pso_trace_log(&e->k, cache_probe ? "probe" : "build",
-                                     cache_probe ? "cache-probe" : "workers-disabled-sync", e->frame,
-                                     r, host_now_ns() - probe_started,
-                                     cache_probe ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0, -1);
+    uint64_t t0 = host_now_ns(), probe_started = pso_trace_on() ? host_now_ns() : 0; VkPipeline p; int cache_probe = V.has_cache_control;
+    VkResult r = pipe_create(&e->k, layout, cache_probe ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0, &p, e->frame, !V.has_cache_control);
+    if (probe_started) pso_trace_log(&e->k, cache_probe ? "probe" : "build", cache_probe ? "cache-probe" : "workers-disabled-sync", e->frame, r, host_now_ns() - probe_started, cache_probe ? VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT : 0, -1);
     if (r == VK_PIPELINE_COMPILE_REQUIRED) {
         VkPipeline fast = async ? pipe_fast_get(e) : VK_NULL_HANDLE;
-        /* Queue the actual draw before speculative jobs; a synchronous miss can overlap their builds. */
         if (async) { e->wait_sub = vk_game_submit_serial(); e->skipped = fast ? 0 : 1; pipe_enqueue(e); }
         pipe_predict_maybe(vk_exec_draw_next());
-        if (fast) {
-            uint64_t dt = host_now_ns() - t0;
-            g_win_pipes++; g_win_pipe_ns += dt; g_cum_pipe_ns += dt;
-            if (dt > g_win_pipe_max_ns) g_win_pipe_max_ns = dt;
-            return fast;
-        }
+        if (fast) { uint64_t dt = host_now_ns() - t0; g_win_pipes++; g_win_pipe_ns += dt; g_cum_pipe_ns += dt; if (dt > g_win_pipe_max_ns) g_win_pipe_max_ns = dt; return fast; }
     }
     if (!async && (r == VK_PIPELINE_COMPILE_REQUIRED || !V.has_cache_control)) {
-        uint64_t c0 = host_now_ns();
-        int warming = pso_sync_begin();
+        uint64_t c0 = host_now_ns(); int warming = pso_sync_begin();
         if (r == VK_PIPELINE_COMPILE_REQUIRED) {
             uint64_t build_started = pso_trace_on() ? host_now_ns() : 0;
             r = pipe_create(&e->k, layout, 0, &p, e->frame, 1);
-            if (build_started) pso_trace_log(&e->k, "build", capture ? "capture-sync" : "workers-disabled-sync",
-                                            e->frame, r, host_now_ns() - build_started, 0, -1);
+            if (build_started) pso_trace_log(&e->k, "build", capture ? "capture-sync" : "workers-disabled-sync", e->frame, r, host_now_ns() - build_started, 0, -1);
         }
-        pso_sync_end(warming);
-        HK_ADD(pipes_sync, 1);
+        pso_sync_end(warming); HK_ADD(pipes_sync, 1);
         uint64_t ended = host_now_ns(), elapsed = ended - (V.has_cache_control ? c0 : t0);
-        g_win_sync++; g_win_sync_ns += elapsed;
-        vk_overlay_note_compile(ended, elapsed);
+        g_win_sync++; g_win_sync_ns += elapsed; vk_overlay_note_compile(ended, elapsed);
     }
-    uint64_t dt = host_now_ns() - t0;
-    g_win_pipes++; g_win_pipe_ns += dt; g_cum_pipe_ns += dt; if (dt > g_win_pipe_max_ns) g_win_pipe_max_ns = dt;
-    if (r == VK_PIPELINE_COMPILE_REQUIRED) {
-        HK_ADD(pipe_skips, 1);
-        if (V.has_pipeline_library) atomic_fetch_add(&g_library_stats.library_skips, 1);
-        return VK_NULL_HANDLE;
-    }
+    uint64_t dt = host_now_ns() - t0; g_win_pipes++; g_win_pipe_ns += dt; g_cum_pipe_ns += dt; if (dt > g_win_pipe_max_ns) g_win_pipe_max_ns = dt;
+    if (r == VK_PIPELINE_COMPILE_REQUIRED) { HK_ADD(pipe_skips, 1); if (V.has_pipeline_library) atomic_fetch_add(&g_library_stats.library_skips, 1); return VK_NULL_HANDLE; }
     pipe_publish(e, r, p, dt);
     if (r && V.has_pipeline_library) atomic_fetch_add(&g_library_stats.library_skips, 1);
     return r ? PIPE_FAILED : p;

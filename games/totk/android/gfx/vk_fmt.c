@@ -5,6 +5,12 @@
 #include "vk_fmt.h"
 #include "../../third_party/d2r_gfx/gfx/nvn/totk_tex_layout_fast.h"
 #include "../../third_party/d2r_gfx/gfx/nvn/include/nvn.h"
+#include "vk_pso_key_fast.h"
+_Static_assert(VK_BLEND_OP_ADD == 0 && VK_BLEND_OP_SUBTRACT == 1 && VK_BLEND_OP_REVERSE_SUBTRACT == 2 && VK_BLEND_OP_MIN == 3 && VK_BLEND_OP_MAX == 4, "blend op");
+_Static_assert(VK_STENCIL_OP_KEEP == 0 && VK_STENCIL_OP_ZERO == 1 && VK_STENCIL_OP_DECREMENT_AND_WRAP == 7, "stencil op");
+_Static_assert(VK_SAMPLER_ADDRESS_MODE_REPEAT == 0 && VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT == 1 && VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE == 2 && VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER == 3 && VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE == 4, "wrap mode");
+_Static_assert(VK_COMPONENT_SWIZZLE_IDENTITY == 0 && VK_COMPONENT_SWIZZLE_ZERO == 1 && VK_COMPONENT_SWIZZLE_A == 6, "swizzle");
+_Static_assert(VK_IMAGE_ASPECT_COLOR_BIT == 1 && VK_IMAGE_ASPECT_DEPTH_BIT == 2 && VK_IMAGE_ASPECT_STENCIL_BIT == 4, "aspect bits");
 
 typedef struct { uint16_t vk; uint8_t kind, noalpha, rb; } ent;   /* kind 1 exact, 2 substitute; noalpha: a reads 1; rb: swap r / b */
 #define E(f) {f, 1, 0, 0}
@@ -83,6 +89,7 @@ int vk_fmt_is_depth(int f) { return f >= 0x32 && f <= 0x36; }
 int vk_fmt_has_stencil(int f) { return f == 0x31 || f == 0x35 || f == 0x36; }
 int vk_fmt_has_depth(int f) { return f >= 0x32 && f <= 0x36; }
 VkImageAspectFlags vk_fmt_aspect(int f) {
+    if (totk_vk_pso_key_fast_on()) return (VkImageAspectFlags)totk_fmt_aspect_fast(f);
     if (f == 0x31) return VK_IMAGE_ASPECT_STENCIL_BIT;
     if (f == 0x35 || f == 0x36) return VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
     if (f >= 0x32 && f <= 0x34) return VK_IMAGE_ASPECT_DEPTH_BIT;
@@ -180,12 +187,14 @@ VkBlendFactor vk_blend_factor(int f) {
     return VK_BLEND_FACTOR_ONE;
 }
 VkBlendOp vk_blend_op(int e) {
+    if (totk_vk_pso_key_fast_on()) return (VkBlendOp)totk_blend_op_fast(e);
     switch (e) { case 2: return VK_BLEND_OP_SUBTRACT; case 3: return VK_BLEND_OP_REVERSE_SUBTRACT; case 4: return VK_BLEND_OP_MIN; case 5: return VK_BLEND_OP_MAX; }
     return VK_BLEND_OP_ADD;
 }
 /* NVN depth / stencil / sampler compare functions are 1..8 = NEVER..ALWAYS, Vulkan's are 0..7 in the same order */
 VkCompareOp vk_compare(int f) { return f >= 1 && f <= 8 ? (VkCompareOp)(f - 1) : VK_COMPARE_OP_ALWAYS; }
 VkStencilOp vk_stencil_op(int o) {
+    if (totk_vk_pso_key_fast_on()) return (VkStencilOp)totk_stencil_op_fast(o);
     switch (o) {
         case 2: return VK_STENCIL_OP_ZERO; case 3: return VK_STENCIL_OP_REPLACE; case 4: return VK_STENCIL_OP_INCREMENT_AND_CLAMP; case 5: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
         case 6: return VK_STENCIL_OP_INVERT; case 7: return VK_STENCIL_OP_INCREMENT_AND_WRAP; case 8: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
@@ -193,6 +202,7 @@ VkStencilOp vk_stencil_op(int o) {
     return VK_STENCIL_OP_KEEP;
 }
 VkSamplerAddressMode vk_wrap(int w) {
+    if (totk_vk_pso_key_fast_on()) return (VkSamplerAddressMode)totk_wrap_fast(w);
     switch (w) {
         case 0: case 7: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE; case 1: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
         case 2: case 3: return VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE; case 4: case 5: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
@@ -201,6 +211,7 @@ VkSamplerAddressMode vk_wrap(int w) {
     return VK_SAMPLER_ADDRESS_MODE_REPEAT;
 }
 VkComponentSwizzle vk_swizzle_sel(int s) {
+    if (totk_vk_pso_key_fast_on()) return (VkComponentSwizzle)totk_swizzle_sel_fast(s);
     switch (s) { case 0: return VK_COMPONENT_SWIZZLE_ZERO; case 1: return VK_COMPONENT_SWIZZLE_ONE; case 2: return VK_COMPONENT_SWIZZLE_R;
                  case 3: return VK_COMPONENT_SWIZZLE_G; case 4: return VK_COMPONENT_SWIZZLE_B; case 5: return VK_COMPONENT_SWIZZLE_A; }
     return VK_COMPONENT_SWIZZLE_IDENTITY;
