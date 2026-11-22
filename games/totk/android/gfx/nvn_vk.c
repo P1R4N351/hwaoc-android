@@ -24,6 +24,8 @@
 #include "vk_img_fast.h"
 #include "vk_imgmem_fast.h"
 #include "vk_post_fast.h"
+#include "vk_subcap_fast.h"
+static int subcap_fast_nvn_on(void) { static int off = -1; if (off < 0) off = vk_off("subcapfast"); return !off && totk_vk_subcap_fast_on(); }
 static int img_fast_nvn_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 #include "vk_record.h"
@@ -1345,11 +1347,8 @@ void vk_lookup_stats(uint64_t frame) {
          (unsigned long long)frame, (double)c[0] / frames, (double)c[1] / frames, (double)c[2] / frames, (double)c[3] / frames,
          tests ? 100.0 * hit / tests : 0, (unsigned long long)hit, (unsigned long long)tests);
 }
-static int resolve_local(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off, uint64_t *avail, int kind) {
-    uintptr_t a = (uintptr_t)addr, b = a + len;
-    if (b < a) return 0;
-    if (span_linear()) { if (g_lookup_stats) lookup_count(kind, NULL, a, 0, 0); pthread_mutex_lock(&g_pool_mu); int ok = resolve_span(addr, len, buf, off, avail); pthread_mutex_unlock(&g_pool_mu); return ok; }
-    span_cache_t *t = &T_span;   /* one dynamic TLS resolution per lookup */
+static span_cache_t *span_cache_ready(void) {
+    span_cache_t *t = &T_span;
     if (t->gen != atomic_load_explicit(&g_span_gen, memory_order_acquire)) {
         pthread_mutex_lock(&g_pool_mu);
         if (g_span_dirty) span_rebuild();
@@ -1358,6 +1357,13 @@ static int resolve_local(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *o
         t->nseg = g_nseg; memset(t->hint, 0, sizeof t->hint); t->gen = atomic_load_explicit(&g_span_gen, memory_order_relaxed);
         pthread_mutex_unlock(&g_pool_mu);
     }
+    return t;
+}
+static int resolve_local(uint64_t addr, uint64_t len, VkBuffer *buf, uint64_t *off, uint64_t *avail, int kind) {
+    uintptr_t a = (uintptr_t)addr, b = a + len;
+    if (b < a) return 0;
+    if (span_linear()) { if (g_lookup_stats) lookup_count(kind, NULL, a, 0, 0); pthread_mutex_lock(&g_pool_mu); int ok = resolve_span(addr, len, buf, off, avail); pthread_mutex_unlock(&g_pool_mu); return ok; }
+    span_cache_t *t = span_cache_ready();
     const span_t *best;
     if (ktglmemo_nvn_on()) {
         int was_hit = 0;
@@ -2058,34 +2064,64 @@ enum { CPEND_N = 4096 };
 static struct cpend_ent { uint64_t addr, val; int known; } *g_cpend;
 static unsigned g_cpend_cap, g_cpend_head, g_cpend_tail;
 static pthread_mutex_t g_cpend_mu = PTHREAD_MUTEX_INITIALIZER;
+static totk_cpend_fast_t g_cpend_fast;
 static void cpend_push(uint64_t addr, uint64_t val, int known) {
     pthread_mutex_lock(&g_cpend_mu);
-    if (g_cpend_head - g_cpend_tail == g_cpend_cap) {   /* never discard an unknown report and accidentally read stale memory */
+    if (g_cpend_head - g_cpend_tail == g_cpend_cap) {
         unsigned cap = g_cpend_cap ? 2 * g_cpend_cap : CPEND_N;
         struct cpend_ent *p = malloc((size_t)cap * sizeof *p); if (!p) DIE("pending counter allocation");
         for (unsigned i = g_cpend_tail; i != g_cpend_head; i++) p[i % cap] = g_cpend[i % g_cpend_cap];
         free(g_cpend); g_cpend = p; g_cpend_cap = cap;
     }
     g_cpend[g_cpend_head++ % g_cpend_cap] = (struct cpend_ent){addr, val, known};
+    totk_cpend_fast_push(&g_cpend_fast, addr, val, known);
     pthread_mutex_unlock(&g_cpend_mu);
 }
-static void cpend_pop(uint64_t addr) {   /* the oldest pending report is now in memory */
+static void cpend_pop(uint64_t addr) {
     pthread_mutex_lock(&g_cpend_mu);
-    if (g_cpend_tail != g_cpend_head && g_cpend[g_cpend_tail % g_cpend_cap].addr == addr) g_cpend_tail++;
+    if (g_cpend_tail != g_cpend_head && g_cpend[g_cpend_tail % g_cpend_cap].addr == addr) {
+        g_cpend_tail++;
+        totk_cpend_fast_pop(&g_cpend_fast, g_cpend_tail == g_cpend_head);
+    }
     pthread_mutex_unlock(&g_cpend_mu);
 }
-int vk_counter_value(uint64_t addr, uint64_t *value) {   /* 0: pending real samples, whose GPU value is not known yet */
-    static int ordered = -1; if (ordered < 0) ordered = !vk_off("condorder");
-    if (!ordered) { memcpy(value, (const void *)(uintptr_t)addr, 8); return 1; }
+static int cpend_ordered(void) { static int o = -1; if (o < 0) o = !vk_off("condorder"); return o; }
+static int cpend_lookup_locked(uint64_t addr, uint64_t *value) {
     int found = 0, known = 1; *value = 0;
-    pthread_mutex_lock(&g_cpend_mu);
     for (unsigned i = g_cpend_head; i != g_cpend_tail && !found; i--) if (g_cpend[(i - 1) % g_cpend_cap].addr == addr) {
         const struct cpend_ent *p = &g_cpend[(i - 1) % g_cpend_cap]; *value = p->val; known = p->known; found = 1;
     }
     if (!found) memcpy(value, (const void *)(uintptr_t)addr, 8);
-    pthread_mutex_unlock(&g_cpend_mu);
+    return known;
+}
+int vk_counter_value(uint64_t addr, uint64_t *value) {
+    if (!cpend_ordered()) { memcpy(value, (const void *)(uintptr_t)addr, 8); return 1; }
+    if (subcap_fast_nvn_on()) {
+        int f = 0, kn = 1; uint64_t v = 0u;
+        if (totk_cpend_fast_lookup(&g_cpend_fast, addr, &f, &v, &kn) == 0) {
+            if (f) *value = v; else memcpy(value, (const void *)(uintptr_t)addr, 8);
+            if (!kn) g_occl_unknown++;
+            return kn;
+        }
+    }
+    pthread_mutex_lock(&g_cpend_mu); int known = cpend_lookup_locked(addr, value); pthread_mutex_unlock(&g_cpend_mu);
     if (!known) g_occl_unknown++;
     return known;
+}
+int vk_counter_pair(uint64_t addr0, uint64_t addr1, uint64_t *v0, uint64_t *v1) {
+    if (!cpend_ordered()) { memcpy(v0, (const void *)(uintptr_t)addr0, 8); memcpy(v1, (const void *)(uintptr_t)addr1, 8); return 1; }
+    if (subcap_fast_nvn_on()) {
+        int f[2], kn[2]; uint64_t pv[2];
+        if (totk_cpend_fast_pair(&g_cpend_fast, addr0, addr1, f, pv, kn) == 0) {
+            if (f[0]) *v0 = pv[0]; else memcpy(v0, (const void *)(uintptr_t)addr0, 8);
+            if (f[1]) *v1 = pv[1]; else memcpy(v1, (const void *)(uintptr_t)addr1, 8);
+            g_occl_unknown += (uint64_t)(!kn[0]) + (uint64_t)(!kn[1]);
+            return kn[0] & kn[1];
+        }
+    }
+    pthread_mutex_lock(&g_cpend_mu); int k0 = cpend_lookup_locked(addr0, v0), k1 = cpend_lookup_locked(addr1, v1); pthread_mutex_unlock(&g_cpend_mu);
+    g_occl_unknown += (uint64_t)(!k0) + (uint64_t)(!k1);
+    return k0 & k1;
 }
 static void apply_posts(slot_t *owner, const vk_gpu_time_slot *last_slot, int last_valid) {
     post_op *p = owner->post; int n = owner->npost;
@@ -3976,7 +4012,9 @@ void vk_record_touch_buffer(uint64_t address, uint64_t size) {
    updates of earlier submissions that were not in memory at the capture are laid over the copies; this submission's own
    updates go through renaming on top of them. A GPU copy into a range drops its snapshot (later bindings read memory on
    the GPU timeline). Ordinary snapshots require opt-in renaming; protected rename-OFF UBO captures are mandatory. */
-typedef struct { uint64_t done; int n; uint64_t *lo, *hi; size_t *off; uint8_t *bytes; } ucap_t;
+typedef struct { size_t slab_cap; uint64_t done; int n; uint64_t *lo, *hi; size_t *off; uint8_t *bytes; } ucap_t;
+static totk_ucap_pool_t g_ucap_pool;
+__attribute__((destructor)) static void ucap_pool_fini(void) { totk_ucap_pool_drain(&g_ucap_pool); }
 typedef struct { uint64_t lo, hi; VkBuffer buf; VkDeviceSize off; uint8_t *cpu; int dead, updated; uint64_t upd_lo, upd_hi, upd_bloom; } snap_t;
 static snap_t *g_snap; static int g_nsnap, g_capsnap;
 static uint64_t g_snap_seq, g_snap_generation;   /* overlay watermark and immutable game-submission base identity */
@@ -4354,27 +4392,12 @@ static int rng_cmp(const void *x, const void *y) { const rng_t *a = x, *b = y; r
    Distinct lo come out in qsort's order; equal lo keep input order, which the capture merge does not depend on.
    Scratch is per call: asynchronous capture can run on a game thread while the walker captures. */
 static void rng_sort(rng_t *r, int n) {
-    if (n < 2) return;
-    if (n <= 32) {
-        for (int i = 1; i < n; i++) { rng_t x = r[i]; int j = i; for (; j > 0 && r[j - 1].lo > x.lo; j--) r[j] = r[j - 1]; r[j] = x; }
+    if (subcap_fast_nvn_on()) {
+        static _Thread_local totk_rng_pair t_sort_inl[4096];
+        totk_radix_sort_rng((totk_rng_pair *)r, n, t_sort_inl, 4096);
         return;
     }
-    uint64_t any = 0, all = UINT64_MAX;
-    for (int i = 0; i < n; i++) { any |= r[i].lo; all &= r[i].lo; }
-    uint64_t vary = any ^ all;
-    rng_t *tmp = VK_MALLOC((size_t)n * sizeof *tmp), *src = r, *dst = tmp;
-    unsigned count[2048];
-    for (unsigned shift = 0; shift < 64; shift += 11) {
-        if (!((vary >> shift) & 2047)) continue;
-        memset(count, 0, sizeof count);
-        for (int i = 0; i < n; i++) count[(src[i].lo >> shift) & 2047]++;
-        unsigned sum = 0;
-        for (unsigned b = 0; b < 2048; b++) { unsigned c = count[b]; count[b] = sum; sum += c; }
-        for (int i = 0; i < n; i++) dst[count[(src[i].lo >> shift) & 2047]++] = src[i];
-        rng_t *swap = src; src = dst; dst = swap;
-    }
-    if (src != r) memcpy(r, src, (size_t)n * sizeof *r);
-    free(tmp);
+    totk_radix_sort_rng((totk_rng_pair *)r, n, NULL, 0);
 }
 #ifdef TOTK_VK_TESTS
 /* rng_sort against qsort: identical key order, and a permutation of the input (hi travels with its lo). */
@@ -4406,25 +4429,44 @@ static unsigned lag_test_rng_sort(unsigned *checks) {
     return errors;
 }
 #endif
-static void collect_ubos(rng_t **r, int *n, int *cap, const uint8_t *p, int depth, rng_t seen[UBO_SEEN], totk_sub_seen4 *call_seen) {
+_Static_assert(sizeof(totk_rng_pair) == sizeof(rng_t) && __builtin_offsetof(totk_rng_pair, lo) == __builtin_offsetof(rng_t, lo) &&
+               __builtin_offsetof(totk_rng_pair, hi) == __builtin_offsetof(rng_t, hi), "totk_rng_pair layout");
+static int ucap_append_rng(rng_t **r, int *n, int *cap, rng_t *inl, uint64_t a, uint64_t hi) {
+    if (*n == *cap) {
+        int ncap = *cap ? 2 * *cap : 4096;
+        if (*r == inl) { rng_t *nb = VK_MALLOC((size_t)ncap * sizeof *nb); memcpy(nb, inl, (size_t)*n * sizeof *nb); *r = nb; }
+        else { *r = VK_REALLOC(*r, (size_t)ncap * sizeof **r); }
+        *cap = ncap;
+    }
+    (*r)[(*n)++] = (rng_t){a, hi};
+    return 1;
+}
+static void collect_ubos(rng_t **r, int *n, int *cap, rng_t *inl, const uint8_t *p,
+                         rng_t seen[UBO_SEEN], totk_ubo_seen_tls *seen_tls, totk_sub_seen4 *call_seen) {
     if (call_seen && !totk_sub_seen4_first(call_seen, (uint64_t)(uintptr_t)p)) return;
+    const uint8_t *ret_stk[16]; int sp = 0;
     for (int guard = 0; guard < 1000000; guard++) {
         op_hdr h; memcpy(&h, p, sizeof h);
-        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) return;
-        if (h.op == OP_END) return;
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) { if (!sp) return; p = ret_stk[--sp]; continue; }
+        if (h.op == OP_END) { if (!sp) return; p = ret_stk[--sp]; continue; }
         if (h.op == OP_JUMP) { memcpy(&p, p + 8, 8); continue; }
-        if (h.op == OP_CALL) { const uint8_t *t; memcpy(&t, p + 8, 8); if (depth < 16) collect_ubos(r, n, cap, t, depth + 1, seen, call_seen); }
-        else if (h.op == OP_BIND_UBO) {
+        if (h.op == OP_CALL) {
+            const uint8_t *t; memcpy(&t, p + 8, 8);
+            if (sp < 16 && (!call_seen || totk_sub_seen4_first(call_seen, (uint64_t)(uintptr_t)t))) {
+                ret_stk[sp++] = p + h.size; p = t; continue;
+            }
+        } else if (h.op == OP_BIND_UBO) {
             const p_bind_buf *b = (const p_bind_buf *)(p + 8);
             if (b->addr && b->size && b->size <= 65536) {
                 uint64_t address = ub_address(b->addr, b->size);
                 unsigned slot = lag_hash(address, b->size, 0) % UBO_SEEN;
                 if (vk_rec_profile_on && T_rec.active) g_rec.snapshot_bindings++;
-                if (seen[slot].lo == address && seen[slot].hi == address + b->size) { p += h.size; continue; }
-                seen[slot] = (rng_t){address, address + b->size};
+                int hit = seen_tls ? totk_ubo_seen_hit(seen_tls, slot, address, address + b->size)
+                                   : (seen[slot].lo == address && seen[slot].hi == address + b->size);
+                if (hit) { p += h.size; continue; }
+                if (!seen_tls) seen[slot] = (rng_t){address, address + b->size};
                 if (vk_rec_profile_on && T_rec.active) g_rec.snapshot_unique++;
-                if (*n == *cap) { *cap = *cap ? 2 * *cap : 4096; *r = VK_REALLOC(*r, (size_t)*cap * sizeof **r); }
-                (*r)[(*n)++] = (rng_t){address, address + b->size};
+                ucap_append_rng(r, n, cap, inl, address, address + b->size);
             }
         }
         p += h.size;
@@ -4446,7 +4488,7 @@ static int lag_test_collect_bench(void) {
         int n = 0; uint64_t start = host_now_ns();
         for (unsigned repeat = 0; repeat < REPEATS; repeat++) {
             n = 0; memset(seen, 0, (mode ? UBO_SEEN : 64) * sizeof *seen);
-            if (mode) collect_ubos(&r, &n, &capacity, (const uint8_t *)stream, 0, seen, NULL);
+            if (mode) collect_ubos(&r, &n, &capacity, NULL, (const uint8_t *)stream, seen, NULL, NULL);
             else for (int i = 0; i < BINDS; i++) {
                 uint64_t a = ub_address(stream[i].b.addr, stream[i].b.size);
                 unsigned slot = (unsigned)((a >> 8) ^ (a >> 20) ^ stream[i].b.size) & 63;
@@ -4476,59 +4518,109 @@ static int lag_test_collect_bench(void) {
     free(r); free(stream); return errors != 0;
 }
 #endif
-static ucap_t *ucap_build(const uint64_t *h, int n, int copy_bytes) {
-    ucap_t *c = VK_CALLOC(1, sizeof *c);
-    c->done = atomic_load(&g_done);   /* before the bytes: a write completing meanwhile only makes this conservative */
-    rng_t *r = NULL, seen[UBO_SEEN] = {0}; int nr = 0, cap = 0;
-    static __thread totk_sub_seen4 t_call_seen;
-    totk_sub_seen4 *csp = (totk_nvn_sub_fast_on() && !(vk_rec_profile_on && T_rec.active)) ? &t_call_seen : NULL;
-    if (csp) totk_sub_seen4_reset(csp);
-    for (int i = 0; i < n; i++) collect_ubos(&r, &nr, &cap, (const uint8_t *)(uintptr_t)h[i], 0, seen, csp);
-    if (nr) {
-        rng_sort(r, nr);
-        int k = -1;   /* merge overlapping / touching ranges inside one pool; drop ranges outside every pool */
-        for (int i = 0; i < nr; i++) {
-            VkBuffer b; uint64_t o;
-            if (k >= 0 && r[i].lo <= r[k].hi) { if (r[i].hi <= r[k].hi) continue; if (vk_resolve(r[k].lo, r[i].hi - r[k].lo, &b, &o)) { r[k].hi = r[i].hi; continue; } }
-            if (!vk_resolve(r[i].lo, r[i].hi - r[i].lo, &b, &o)) continue;
-            if (k >= 0 && r[i].lo < r[k].hi) r[i].lo = r[k].hi;   /* keep the copies disjoint */
-            r[++k] = r[i];
+static int ucap_merge_ranges_fast(rng_t *r, int nr) {
+    const span_cache_t *sc = span_cache_ready();
+    totk_span_win_t kw = {.seg_idx = -1}, iw = {.seg_idx = -1};
+    const size_t sps = sizeof(span_t), sgs = sizeof(span_seg_t);
+    const size_t oe = __builtin_offsetof(span_t, end), ol = __builtin_offsetof(span_seg_t, lo), ob = __builtin_offsetof(span_seg_t, best);
+    int k = -1;
+    for (int i = 0; i < nr; i++) {
+        if (r[i].hi < r[i].lo) continue;
+        if (k >= 0 && r[i].lo <= r[k].hi) {
+            if (r[i].hi <= r[k].hi) continue;
+            if (totk_span_win_contains(&kw, (uintptr_t)r[i].hi)) { r[k].hi = r[i].hi; continue; }
         }
-        /* ranges a GPU write still in flight overlaps are left to memory (the GPU timeline) */
-        if (k >= 0 && (!totk_gw_fast_on() || totk_gw_may_overlap(&g_gw_sum, r[0].lo, r[k].hi))) {
-            pthread_mutex_lock(&g_gw_mu);
-            int m = 0; for (int i = 0; i <= k; i++) {
-                if ((g_ngw && gw_pending(r[i].lo, r[i].hi, c->done)) ||
-                    (ub_private_on() && ub_original_pending(r[i].lo, r[i].hi - r[i].lo))) {
-                    g_stat_snap_skipped++; continue;
-                }
-                r[m++] = r[i];
-            }
-            pthread_mutex_unlock(&g_gw_mu);
-            k = m - 1;
-        } else if (k >= 0 && ub_private_on()) {
-            int m = 0; for (int i = 0; i <= k; i++) {
-                if (ub_original_pending(r[i].lo, r[i].hi - r[i].lo)) { g_stat_snap_skipped++; continue; }
-                r[m++] = r[i];
-            }
-            k = m - 1;
-        }
-        c->n = k + 1;
-        c->lo = VK_MALLOC(sizeof *c->lo * (size_t)(c->n + 1)); c->hi = VK_MALLOC(sizeof *c->hi * (size_t)(c->n + 1));
-        if (copy_bytes) c->off = VK_MALLOC(sizeof *c->off * (size_t)(c->n + 1));
-        size_t total = 0; for (int i = 0; i < c->n; i++) {
-            c->lo[i] = r[i].lo; c->hi[i] = r[i].hi;
-            if (copy_bytes) { c->off[i] = total; total += (size_t)(r[i].hi - r[i].lo); }
-        }
-        if (copy_bytes) {
-            c->bytes = VK_MALLOC(total ? total : 1);
-            for (int i = 0; i < c->n; i++) memcpy(c->bytes + c->off[i], (const void *)(uintptr_t)c->lo[i], (size_t)(c->hi[i] - c->lo[i]));
-        }
+        totk_span_win_seek(&iw, sc->s, sps, oe, sc->seg, sgs, ol, ob, sc->nseg, (uintptr_t)r[i].lo);
+        if (!totk_span_win_contains(&iw, (uintptr_t)r[i].hi)) continue;
+        int trimmed = (k >= 0 && r[i].lo < r[k].hi);
+        if (trimmed) r[i].lo = r[k].hi;
+        r[++k] = r[i];
+        if (!trimmed) kw = iw;
+        else totk_span_win_seek(&kw, sc->s, sps, oe, sc->seg, sgs, ol, ob, sc->nseg, (uintptr_t)r[k].lo);
     }
-    free(r);
+    return k;
+}
+static int ucap_merge_ranges(rng_t *r, int nr) {
+    if (subcap_fast_nvn_on() && !span_linear() && !g_lookup_stats && !(vk_rec_profile_on && T_rec.active))
+        return ucap_merge_ranges_fast(r, nr);
+    int k = -1;
+    for (int i = 0; i < nr; i++) {
+        VkBuffer b; uint64_t o;
+        if (k >= 0 && r[i].lo <= r[k].hi) { if (r[i].hi <= r[k].hi) continue; if (vk_resolve(r[k].lo, r[i].hi - r[k].lo, &b, &o)) { r[k].hi = r[i].hi; continue; } }
+        if (!vk_resolve(r[i].lo, r[i].hi - r[i].lo, &b, &o)) continue;
+        if (k >= 0 && r[i].lo < r[k].hi) r[i].lo = r[k].hi;
+        r[++k] = r[i];
+    }
+    return k;
+}
+static int ucap_filter_pending(rng_t *r, int k, uint64_t done) {
+    if (k < 0) return -1;
+    if (!totk_gw_fast_on() || totk_gw_may_overlap(&g_gw_sum, r[0].lo, r[k].hi)) {
+        pthread_mutex_lock(&g_gw_mu);
+        int m = 0; for (int i = 0; i <= k; i++) {
+            if ((g_ngw && gw_pending(r[i].lo, r[i].hi, done)) || (ub_private_on() && ub_original_pending(r[i].lo, r[i].hi - r[i].lo))) {
+                g_stat_snap_skipped++; continue;
+            }
+            r[m++] = r[i];
+        }
+        pthread_mutex_unlock(&g_gw_mu);
+        return m - 1;
+    }
+    if (!ub_private_on()) return k;
+    int m = 0; for (int i = 0; i <= k; i++) {
+        if (ub_original_pending(r[i].lo, r[i].hi - r[i].lo)) { g_stat_snap_skipped++; continue; }
+        r[m++] = r[i];
+    }
+    return m - 1;
+}
+static ucap_t *ucap_pack_result(const rng_t *r, int cnt, uint64_t done, int copy_bytes) {
+    size_t total = 0u;
+    if (copy_bytes) for (int i = 0; i < cnt; i++) total += (size_t)(r[i].hi - r[i].lo);
+    ucap_t *c = NULL;
+    if (subcap_fast_nvn_on()) {
+        size_t need = totk_ucap_slab_need(sizeof *c, cnt, copy_bytes, total), got = 0u;
+        c = (ucap_t *)totk_ucap_pool_acquire(&g_ucap_pool, need, &got);
+        if (!c) DIE("ucap slab");
+        memset(c, 0, sizeof *c);
+        c->slab_cap = got; c->done = done; c->n = cnt;
+        totk_ucap_slice(c, sizeof *c, cnt, copy_bytes, &c->lo, &c->hi, &c->off, &c->bytes);
+    } else {
+        c = VK_CALLOC(1, sizeof *c); c->done = done; c->n = cnt;
+        c->lo = VK_MALLOC(sizeof *c->lo * (size_t)(cnt + 1)); c->hi = VK_MALLOC(sizeof *c->hi * (size_t)(cnt + 1));
+        if (copy_bytes) { c->off = VK_MALLOC(sizeof *c->off * (size_t)(cnt + 1)); c->bytes = VK_MALLOC(total ? total : 1u); }
+    }
+    size_t off = 0u;
+    for (int i = 0; i < cnt; i++) {
+        c->lo[i] = r[i].lo; c->hi[i] = r[i].hi;
+        if (copy_bytes) { size_t sz = (size_t)(r[i].hi - r[i].lo); c->off[i] = off; memcpy(c->bytes + off, (const void *)(uintptr_t)r[i].lo, sz); off += sz; }
+    }
     return c;
 }
-static void ucap_free(ucap_t *c) { if (c) { free(c->lo); free(c->hi); free(c->off); free(c->bytes); free(c); } }
+static ucap_t *ucap_build(const uint64_t *h, int n, int copy_bytes) {
+    uint64_t done = atomic_load(&g_done);
+    int fast = subcap_fast_nvn_on();
+    static _Thread_local rng_t t_r_inl[4096], t_seen_leg[UBO_SEEN];
+    static _Thread_local totk_ubo_seen_tls t_seen_tls;
+    static _Thread_local totk_sub_seen4 t_call_seen;
+    rng_t *r = fast ? t_r_inl : NULL; int nr = 0, cap = fast ? 4096 : 0;
+    if (fast) totk_ubo_seen_reset(&t_seen_tls); else memset(t_seen_leg, 0, sizeof t_seen_leg);
+    totk_sub_seen4 *csp = (totk_nvn_sub_fast_on() && !(vk_rec_profile_on && T_rec.active)) ? &t_call_seen : NULL;
+    if (csp) totk_sub_seen4_reset(csp);
+    for (int i = 0; i < n; i++) collect_ubos(&r, &nr, &cap, t_r_inl, (const uint8_t *)(uintptr_t)h[i], t_seen_leg, fast ? &t_seen_tls : NULL, csp);
+    int k = -1;
+    if (nr) {
+        rng_sort(r, nr);
+        k = ucap_filter_pending(r, ucap_merge_ranges(r, nr), done);
+    }
+    ucap_t *c = ucap_pack_result(r, k + 1, done, copy_bytes);
+    if (r != t_r_inl) free(r);
+    return c;
+}
+static void ucap_free(ucap_t *c) {
+    if (!c) return;
+    if (c->slab_cap) { totk_ucap_pool_release(&g_ucap_pool, c, c->slab_cap); return; }
+    free(c->lo); free(c->hi); free(c->off); free(c->bytes); free(c);
+}
 void *mtl_sub_capture_ubos(const uint64_t *h, int n) { return snap_on() ? ucap_build(h, n, 1) : NULL; } /* async: eagerly own the bytes */
 static int snap_first(uint64_t a) { int lo = 0, hi = g_nsnap; while (lo < hi) { int m = (lo + hi) >> 1; if (g_snap[m].hi <= a) lo = m + 1; else hi = m; } return lo; }
 static const snap_t *snap_find(uint64_t a, uint64_t n) {   /* the live copy holding all of [a, a+n) */

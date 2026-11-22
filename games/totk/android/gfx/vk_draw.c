@@ -6940,6 +6940,12 @@ static void clear_tex(const p_clear_tex *c) {   /* clear a texture region with a
 
 /* ---------- the walker's other ops ---------- */
 
+static void exec_render_cond(const p_render_cond *c) {
+    uint64_t x = 0, y = 0; int known = c->addr ? vk_counter_pair(c->addr, c->addr + 16, &x, &y) : 1;
+    S.render_disabled = known && (c->mode == 0 ? x != y : x == y);
+    g_pops.cond++; if (S.render_disabled) g_pops.cond_off++;
+    if (PD.active) { char l[200]; pd_note(l, snprintf(l, sizeof l, "  render cond %#llx mode %d: %llu vs %llu -> %s%s\n", (unsigned long long)c->addr, c->mode, (unsigned long long)x, (unsigned long long)y, S.render_disabled ? "off" : "on", known ? "" : " (pending samples: visible)")); }
+}
 void vk_draw_exec(uint32_t op, const void *a) {
     state_init();
     if (R.open && (op==OP_CLEAR_COLOR || op==OP_CLEAR_DS)) R.feedback_written|=0x3ffu;
@@ -7128,14 +7134,7 @@ void vk_draw_exec(uint32_t op, const void *a) {
         case OP_RENDER_ENABLE: S.render_disabled = !((const p_flag *)a)->value;
             if (PD.active) { char l[64]; pd_note(l, snprintf(l, sizeof l, "  render enable %d\n", !S.render_disabled)); }
             break;
-        case OP_RENDER_COND: {   /* render if the counters at addr / addr + 16 are equal (mode 0) or not (1), with reports still pending counted (nvn_vk.c) */
-            const p_render_cond *c = a; uint64_t x = 0, y = 0; int known = 1;
-            if (c->addr) { known = vk_counter_value(c->addr, &x); known &= vk_counter_value(c->addr + 16, &y); }
-            S.render_disabled = known && (c->mode == 0 ? x != y : x == y);   /* pending real samples: visible, as Metal's cond_eval */
-            g_pops.cond++; if (S.render_disabled) g_pops.cond_off++;
-            if (PD.active) { char l[200]; pd_note(l, snprintf(l, sizeof l, "  render cond %#llx mode %d: %llu vs %llu -> %s%s\n", (unsigned long long)c->addr, c->mode, (unsigned long long)x, (unsigned long long)y, S.render_disabled ? "off" : "on", known ? "" : " (pending samples: visible)")); }
-            break;
-        }
+        case OP_RENDER_COND: exec_render_cond(a); break;
         case OP_RASTER_DISCARD: S.raster_discard = ((const p_flag *)a)->value; break;
         case OP_REPORT_COUNTER:
             if (PD.active) { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); char l[96]; pd_note(l, snprintf(l, sizeof l, "  report counter type %llu at %#llx\n", (unsigned long long)t, (unsigned long long)ad)); }

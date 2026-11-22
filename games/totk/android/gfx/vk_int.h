@@ -264,6 +264,7 @@ long vk_frame_chunk_limit(void); /* walking/startup only; explicit limit or effe
 int vk_in_pass(void);            /* a render pass is open on the recording thread (vk_draw.c) */
 void vk_pd_write_note(const char *what, uint64_t dst, uint64_t n, const void *data);   /* TOTK_VK_PASS_DUMP: a buffer write in index.txt (vk_draw.c) */
 int vk_counter_value(uint64_t addr, uint64_t *value);   /* newest pending report, else memory; 0 if real samples are still unknown */
+int vk_counter_pair(uint64_t addr0, uint64_t addr1, uint64_t *v0, uint64_t *v1);
 void vk_rec_unlock(void);
 /* Synchronous host readback handed to the current owner, never a blocking recording-lock acquisition.
    A chunk service may defer until its producer's slot seals; boundary=1 is a completed slot/ownership boundary.
