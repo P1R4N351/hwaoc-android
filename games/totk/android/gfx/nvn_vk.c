@@ -25,6 +25,8 @@
 #include "vk_imgmem_fast.h"
 #include "vk_post_fast.h"
 #include "vk_subcap_fast.h"
+#include "vk_res_samp_fast.h"
+_Static_assert(OP_COUNT_ == 47 && OP_DRAW_IDX == 26, "OP_* enum layout");
 static int subcap_fast_nvn_on(void) { static int off = -1; if (off < 0) off = vk_off("subcapfast"); return !off && totk_vk_subcap_fast_on(); }
 static int img_fast_nvn_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
@@ -164,10 +166,15 @@ static void xlate_deferred_bind(unsigned op, const uint8_t *a) {
     const p_bind_handles *b = (const void *)a;
     if ((unsigned)b->stage >= 6 || b->n < 0 || b->n > 32) return;
     unsigned kind = op == OP_BIND_TEX ? 0 : op == OP_BIND_IMG ? 1 : 2;
+    if (totk_vk_res_samp_fast_on()) {
+        totk_xlate_deferred_bind_fast(g_xlate->deferred[b->stage][kind], kind == 1 ? 32u : 128u, b->first, b->n, b->src != 0);
+        return;
+    }
     for (int i = 0; i < b->n; i++)
         if ((unsigned)b->first + (unsigned)i < (kind == 1 ? 32u : 128u)) g_xlate->deferred[b->stage][kind][b->first + i] = b->src != 0;
 }
 static void xlate_hash_bytes(xlate_hash *h, const void *bytes, size_t n) {
+    if (totk_vk_res_samp_fast_on()) { totk_xlate_hash_bytes_fast(h->h, bytes, n); return; }
     const uint8_t *p = bytes;
     for (size_t i = 0; i < n; i++) {
         h->h[0] = (h->h[0] ^ p[i]) * UINT64_C(1099511628211);
@@ -176,81 +183,140 @@ static void xlate_hash_bytes(xlate_hash *h, const void *bytes, size_t n) {
     }
 }
 typedef struct { size_t offset, size; } xlate_address_field;
-/* Raw records have no named payload type in nvn_obj.h; these layouts follow their memcpy writers in hle_nvn.c.
-   All other offsets/sizes come directly from the shared schema, including variable arrays (never address masks). */
+_Static_assert(sizeof(xlate_address_field) == sizeof(totk_xlate_field_t), "xlate field size");
 typedef struct { uint64_t address; uint32_t mode, value; } xlate_signal;
 typedef struct { uint64_t type, address; } xlate_counter;
 typedef struct { uint64_t source, destination, size; } xlate_copy;
 typedef struct { uint64_t destination, size; } xlate_update;
-static int xlate_address_fields(unsigned op, const uint8_t *a, size_t size, xlate_address_field fields[17]) {
+static const totk_xlate_op_spec_t k_xlate_specs[OP_COUNT_] = {
+    [OP_END] = {0, 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_JUMP] = {(uint16_t)sizeof(uint64_t), 0, TOTK_XL_FIXED1, 0, 1, 0, 0, 8, 0, 0},
+    [OP_BEGIN] = {0, 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_CALL] = {(uint16_t)sizeof(uint64_t), 0, TOTK_XL_FIXED1, 0, 1, 0, 0, 8, 0, 0},
+    [OP_SIGNAL_EVENT] = {(uint16_t)sizeof(xlate_signal), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(xlate_signal, address), 8, 0, 0},
+    [OP_REPORT_COUNTER] = {(uint16_t)sizeof(xlate_counter), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(xlate_counter, address), 8, 0, 0},
+    [OP_COPY_B2B] = {(uint16_t)sizeof(xlate_copy), 0, TOTK_XL_FIXED2, 0, 1, 0, (uint16_t)offsetof(xlate_copy, source), 8, (uint16_t)offsetof(xlate_copy, destination), 8},
+    [OP_UPDATE_UB] = {(uint16_t)sizeof(xlate_update), 0, TOTK_XL_UPDATE_UB, 0, 1, (uint8_t)offsetof(xlate_update, size), (uint16_t)offsetof(xlate_update, destination), 8, 0, 0},
+    [OP_SET_RT] = {(uint16_t)sizeof(p_set_rt), (uint16_t)sizeof(((p_set_rt *)0)->color[0]), TOTK_XL_SET_RT, 0, 1, 0, (uint16_t)offsetof(p_set_rt, color), (uint8_t)sizeof(((p_set_rt *)0)->color[0]), (uint16_t)offsetof(p_set_rt, depth), (uint8_t)sizeof(((p_set_rt *)0)->depth)},
+    [OP_CLEAR_COLOR] = {(uint16_t)sizeof(p_clear_color), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_CLEAR_DS] = {(uint16_t)sizeof(p_clear_ds), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_VIEWPORTS] = {(uint16_t)offsetof(p_viewports, v), (uint16_t)sizeof(((p_viewports *)0)->v[0]), TOTK_XL_ARR_CHECK, 16, 1, (uint8_t)offsetof(p_viewports, n), 0, 0, 0, 0},
+    [OP_SCISSOR] = {(uint16_t)sizeof(p_scissor), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_DEPTH_RANGE] = {(uint16_t)sizeof(p_depth_range), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_BIND_PROGRAM] = {(uint16_t)sizeof(p_bind_program), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_bind_program, prog), (uint8_t)sizeof(((p_bind_program *)0)->prog), 0, 0},
+    [OP_BIND_STATE] = {(uint16_t)sizeof(p_bind_state), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_BIND_VATTR] = {(uint16_t)offsetof(p_bind_vattr, st), (uint16_t)sizeof(((p_bind_vattr *)0)->st[0]), TOTK_XL_ARR_CHECK, 16, 1, (uint8_t)offsetof(p_bind_vattr, n), 0, 0, 0, 0},
+    [OP_BIND_VSTREAM] = {(uint16_t)offsetof(p_bind_vstream, st), (uint16_t)sizeof(((p_bind_vstream *)0)->st[0]), TOTK_XL_ARR_CHECK, 16, 1, (uint8_t)offsetof(p_bind_vstream, n), 0, 0, 0, 0},
+    [OP_BIND_VBUF] = {(uint16_t)offsetof(p_bind_vbuf, r), (uint16_t)sizeof(((p_bind_vbuf *)0)->r[0]), TOTK_XL_BIND_VBUF, 16, 1, (uint8_t)offsetof(p_bind_vbuf, n), 0, 0, (uint16_t)(offsetof(p_bind_vbuf, r) + offsetof(NVNbufferRange, address)), (uint8_t)sizeof(((NVNbufferRange *)0)->address)},
+    [OP_BIND_UBO] = {(uint16_t)sizeof(p_bind_buf), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_bind_buf, addr), 8, 0, 0},
+    [OP_BIND_SSBO] = {(uint16_t)sizeof(p_bind_buf), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_bind_buf, addr), 8, 0, 0},
+    [OP_BIND_TEX] = {(uint16_t)offsetof(p_bind_handles, h), (uint16_t)sizeof(uint64_t), TOTK_XL_ARR_CHECK, 32, 1, (uint8_t)offsetof(p_bind_handles, n), (uint16_t)offsetof(p_bind_handles, src), 8, 0, 0},
+    [OP_BIND_SAMP] = {(uint16_t)offsetof(p_bind_handles, h), (uint16_t)sizeof(uint64_t), TOTK_XL_ARR_CHECK, 32, 1, (uint8_t)offsetof(p_bind_handles, n), (uint16_t)offsetof(p_bind_handles, src), 8, 0, 0},
+    [OP_STENCIL] = {(uint16_t)sizeof(p_stencil), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_POLY_OFFSET] = {(uint16_t)sizeof(p_poly_offset), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_DRAW] = {(uint16_t)sizeof(p_draw), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_DRAW_IDX] = {(uint16_t)sizeof(p_draw_idx), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_draw_idx, ibuf), 8, 0, 0},
+    [OP_DISPATCH] = {(uint16_t)sizeof(p_dispatch), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_dispatch, caller), 8, 0, 0},
+    [OP_BARRIER] = {(uint16_t)sizeof(int32_t), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_SET_TEX_POOL] = {(uint16_t)sizeof(p_set_pool), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_set_pool, pool), (uint8_t)sizeof(((p_set_pool *)0)->pool), 0, 0},
+    [OP_SET_SAMP_POOL] = {(uint16_t)sizeof(p_set_pool), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_set_pool, pool), (uint8_t)sizeof(((p_set_pool *)0)->pool), 0, 0},
+    [OP_COPY_B2T] = {(uint16_t)sizeof(p_copy_b2t), 0, TOTK_XL_FIXED2, 0, 1, 0, (uint16_t)offsetof(p_copy_b2t, src), 8, (uint16_t)offsetof(p_copy_b2t, tex), (uint8_t)sizeof(((p_copy_b2t *)0)->tex)},
+    [OP_COPY_STRIDE] = {(uint16_t)sizeof(p_copy_stride), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_COPY_IMAGE_STRIDE] = {(uint16_t)sizeof(p_copy_stride), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_BLEND_COLOR] = {(uint16_t)sizeof(p_blend_color), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_COPY_T2B] = {(uint16_t)sizeof(p_copy_b2t), 0, TOTK_XL_FIXED2, 0, 1, 0, (uint16_t)offsetof(p_copy_b2t, src), 8, (uint16_t)offsetof(p_copy_b2t, tex), (uint8_t)sizeof(((p_copy_b2t *)0)->tex)},
+    [OP_BIND_IMG] = {(uint16_t)offsetof(p_bind_handles, h), (uint16_t)sizeof(uint64_t), TOTK_XL_ARR_CHECK, 32, 1, (uint8_t)offsetof(p_bind_handles, n), (uint16_t)offsetof(p_bind_handles, src), 8, 0, 0},
+    [OP_COPY_T2T] = {(uint16_t)sizeof(p_copy_t2t), 0, TOTK_XL_FIXED2, 0, 1, 0, (uint16_t)offsetof(p_copy_t2t, src), (uint8_t)sizeof(((p_copy_t2t *)0)->src), (uint16_t)offsetof(p_copy_t2t, dst), (uint8_t)sizeof(((p_copy_t2t *)0)->dst)},
+    [OP_RESET_COUNTER] = {(uint16_t)sizeof(uint64_t), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_CLEAR_TEX] = {(uint16_t)sizeof(p_clear_tex), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_clear_tex, tex), (uint8_t)sizeof(((p_clear_tex *)0)->tex), 0, 0},
+    [OP_DEPTH_CLAMP] = {(uint16_t)sizeof(p_flag), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_RENDER_ENABLE] = {(uint16_t)sizeof(p_flag), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_RASTER_DISCARD] = {(uint16_t)sizeof(p_flag), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_RENDER_COND] = {(uint16_t)sizeof(p_render_cond), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_render_cond, addr), 8, 0, 0},
+    [OP_ALPHA_REF] = {(uint16_t)sizeof(p_alpha_ref), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
+    [OP_DRAW_INDIRECT] = {(uint16_t)sizeof(p_draw_indirect), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_draw_indirect, buf), 8, 0, 0},
+    [OP_DRAW_IDX_INDIRECT] = {(uint16_t)sizeof(p_draw_idx_indirect), 0, TOTK_XL_FIXED2, 0, 1, 0, (uint16_t)offsetof(p_draw_idx_indirect, ibuf), 8, (uint16_t)offsetof(p_draw_idx_indirect, buf), 8}
+};
+static int xlate_address_fields_slow_misc(unsigned op, size_t size) {
+    switch (op) {
+        case OP_END: case OP_BEGIN: return 0;
+        case OP_CLEAR_COLOR: return size < sizeof(p_clear_color) ? -1 : 0;
+        case OP_CLEAR_DS: return size < sizeof(p_clear_ds) ? -1 : 0;
+        case OP_ALPHA_REF: return size < sizeof(p_alpha_ref) ? -1 : 0;
+        case OP_SCISSOR: return size < sizeof(p_scissor) ? -1 : 0;
+        case OP_DEPTH_RANGE: return size < sizeof(p_depth_range) ? -1 : 0;
+        case OP_BIND_STATE: return size < sizeof(p_bind_state) ? -1 : 0;
+        case OP_STENCIL: return size < sizeof(p_stencil) ? -1 : 0;
+        case OP_POLY_OFFSET: return size < sizeof(p_poly_offset) ? -1 : 0;
+        case OP_DRAW: return size < sizeof(p_draw) ? -1 : 0;
+        case OP_BARRIER: return size < sizeof(int32_t) ? -1 : 0;
+        case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE: return size < sizeof(p_copy_stride) ? -1 : 0;
+        case OP_BLEND_COLOR: return size < sizeof(p_blend_color) ? -1 : 0;
+        case OP_RESET_COUNTER: return size < sizeof(uint64_t) ? -1 : 0;
+        case OP_DEPTH_CLAMP: case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: return size < sizeof(p_flag) ? -1 : 0;
+        default: return -2;
+    }
+}
+static int xlate_address_fields_slow_arr(unsigned op, const uint8_t *a, size_t size, xlate_address_field fields[17]) {
+    if (op == OP_SET_RT) {
+        if (size < sizeof(p_set_rt)) return -1;
+        for (unsigned i = 0; i < 8; i++) fields[i] = (xlate_address_field){offsetof(p_set_rt, color) + i * sizeof(((p_set_rt *)0)->color[0]), sizeof(((p_set_rt *)0)->color[0])};
+        fields[8] = (xlate_address_field){offsetof(p_set_rt, depth), sizeof(((p_set_rt *)0)->depth)};
+        return 9;
+    }
+    if (op == OP_BIND_VBUF) {
+        if (size < offsetof(p_bind_vbuf, r)) return -1;
+        const p_bind_vbuf *b = (const void *)a;
+        if (b->n < 0 || b->n > 16 || (size_t)b->n > (size - offsetof(p_bind_vbuf, r)) / sizeof b->r[0]) return -1;
+        for (int i = 0; i < b->n; i++) fields[i] = (xlate_address_field){offsetof(p_bind_vbuf, r) + (size_t)i * sizeof b->r[0] + offsetof(NVNbufferRange, address), sizeof b->r[0].address};
+        return b->n;
+    }
+    if (op == OP_BIND_TEX || op == OP_BIND_IMG || op == OP_BIND_SAMP) {
+        if (size < offsetof(p_bind_handles, h)) return -1;
+        const p_bind_handles *b = (const void *)a;
+        if (b->n < 0 || b->n > 32 || (size_t)b->n > (size - offsetof(p_bind_handles, h)) / sizeof b->h[0]) return -1;
+        fields[0] = (xlate_address_field){offsetof(p_bind_handles, src), sizeof b->src};
+        return 1;
+    }
+    if (op == OP_VIEWPORTS) { const p_viewports *b = (const void *)a; return (size >= offsetof(p_viewports, v) && b->n >= 0 && b->n <= 16 && (size_t)b->n <= (size - offsetof(p_viewports, v)) / sizeof b->v[0]) ? 0 : -1; }
+    if (op == OP_BIND_VATTR) { const p_bind_vattr *b = (const void *)a; return (size >= offsetof(p_bind_vattr, st) && b->n >= 0 && b->n <= 16 && (size_t)b->n <= (size - offsetof(p_bind_vattr, st)) / sizeof b->st[0]) ? 0 : -1; }
+    if (op == OP_BIND_VSTREAM) { const p_bind_vstream *b = (const void *)a; return (size >= offsetof(p_bind_vstream, st) && b->n >= 0 && b->n <= 16 && (size_t)b->n <= (size - offsetof(p_bind_vstream, st)) / sizeof b->st[0]) ? 0 : -1; }
+    return -2;
+}
+static int xlate_address_fields_slow(unsigned op, const uint8_t *a, size_t size, xlate_address_field fields[17]) {
+    int r = xlate_address_fields_slow_misc(op, size);
+    if (r != -2) return r;
+    r = xlate_address_fields_slow_arr(op, a, size, fields);
+    if (r != -2) return r;
     unsigned n = 0;
 #define XLATE_NEED(type) do { if (size < sizeof(type)) return -1; } while (0)
 #define XLATE_FIELD(type, member) do { fields[n++] = (xlate_address_field){offsetof(type, member), sizeof(((type *)0)->member)}; } while (0)
-#define XLATE_ARRAY(type, member, maximum) do { \
-    if (size < offsetof(type, member)) return -1; \
-    const type *b = (const void *)a; \
-    if (b->n < 0 || b->n > (maximum) || (size_t)b->n > (size - offsetof(type, member)) / sizeof b->member[0]) return -1; \
-} while (0)
     switch (op) {
-        case OP_END: case OP_BEGIN: break;
-        case OP_JUMP: case OP_CALL:
-            XLATE_NEED(uint64_t); fields[n++] = (xlate_address_field){0, sizeof(uint64_t)}; break;
+        case OP_JUMP: case OP_CALL: XLATE_NEED(uint64_t); fields[n++] = (xlate_address_field){0, sizeof(uint64_t)}; break;
         case OP_SIGNAL_EVENT: XLATE_NEED(xlate_signal); XLATE_FIELD(xlate_signal, address); break;
         case OP_REPORT_COUNTER: XLATE_NEED(xlate_counter); XLATE_FIELD(xlate_counter, address); break;
         case OP_COPY_B2B: XLATE_NEED(xlate_copy); XLATE_FIELD(xlate_copy, source); XLATE_FIELD(xlate_copy, destination); break;
-        case OP_UPDATE_UB: {
-            XLATE_NEED(xlate_update); const xlate_update *u = (const void *)a;
-            if (u->size > size - sizeof *u) return -1;
-            XLATE_FIELD(xlate_update, destination); break;
-        }
-        case OP_SET_RT:
-            XLATE_NEED(p_set_rt);
-            for (unsigned i = 0; i < 8; i++) fields[n++] = (xlate_address_field){
-                offsetof(p_set_rt, color) + i * sizeof(((p_set_rt *)0)->color[0]), sizeof(((p_set_rt *)0)->color[0])};
-            XLATE_FIELD(p_set_rt, depth); break;
+        case OP_UPDATE_UB: { XLATE_NEED(xlate_update); const xlate_update *u = (const void *)a; if (u->size > size - sizeof *u) return -1; XLATE_FIELD(xlate_update, destination); break; }
         case OP_BIND_PROGRAM: XLATE_NEED(p_bind_program); XLATE_FIELD(p_bind_program, prog); break;
-        case OP_BIND_VBUF: {
-            XLATE_ARRAY(p_bind_vbuf, r, 16); const p_bind_vbuf *b = (const void *)a;
-            for (int i = 0; i < b->n; i++) fields[n++] = (xlate_address_field){
-                offsetof(p_bind_vbuf, r) + (size_t)i * sizeof b->r[0] + offsetof(NVNbufferRange, address), sizeof b->r[0].address};
-            break;
-        }
         case OP_BIND_UBO: case OP_BIND_SSBO: XLATE_NEED(p_bind_buf); XLATE_FIELD(p_bind_buf, addr); break;
-        case OP_BIND_TEX: case OP_BIND_IMG: case OP_BIND_SAMP:
-            XLATE_ARRAY(p_bind_handles, h, 32); XLATE_FIELD(p_bind_handles, src); break;
         case OP_DRAW_IDX: XLATE_NEED(p_draw_idx); XLATE_FIELD(p_draw_idx, ibuf); break;
         case OP_DRAW_INDIRECT: XLATE_NEED(p_draw_indirect); XLATE_FIELD(p_draw_indirect, buf); break;
         case OP_DRAW_IDX_INDIRECT: XLATE_NEED(p_draw_idx_indirect); XLATE_FIELD(p_draw_idx_indirect, ibuf); XLATE_FIELD(p_draw_idx_indirect, buf); break;
         case OP_DISPATCH: XLATE_NEED(p_dispatch); XLATE_FIELD(p_dispatch, caller); break;
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: XLATE_NEED(p_set_pool); XLATE_FIELD(p_set_pool, pool); break;
-        case OP_COPY_B2T: case OP_COPY_T2B:
-            XLATE_NEED(p_copy_b2t); XLATE_FIELD(p_copy_b2t, src); XLATE_FIELD(p_copy_b2t, tex); break;
+        case OP_COPY_B2T: case OP_COPY_T2B: XLATE_NEED(p_copy_b2t); XLATE_FIELD(p_copy_b2t, src); XLATE_FIELD(p_copy_b2t, tex); break;
         case OP_COPY_T2T: XLATE_NEED(p_copy_t2t); XLATE_FIELD(p_copy_t2t, src); XLATE_FIELD(p_copy_t2t, dst); break;
         case OP_CLEAR_TEX: XLATE_NEED(p_clear_tex); XLATE_FIELD(p_clear_tex, tex); break;
         case OP_RENDER_COND: XLATE_NEED(p_render_cond); XLATE_FIELD(p_render_cond, addr); break;
-        case OP_CLEAR_COLOR: XLATE_NEED(p_clear_color); break;
-        case OP_CLEAR_DS: XLATE_NEED(p_clear_ds); break;
-        case OP_ALPHA_REF: XLATE_NEED(p_alpha_ref); break;
-        case OP_VIEWPORTS: XLATE_ARRAY(p_viewports, v, 16); break;
-        case OP_SCISSOR: XLATE_NEED(p_scissor); break;
-        case OP_DEPTH_RANGE: XLATE_NEED(p_depth_range); break;
-        case OP_BIND_STATE: XLATE_NEED(p_bind_state); break;
-        case OP_BIND_VATTR: XLATE_ARRAY(p_bind_vattr, st, 16); break;
-        case OP_BIND_VSTREAM: XLATE_ARRAY(p_bind_vstream, st, 16); break;
-        case OP_STENCIL: XLATE_NEED(p_stencil); break;
-        case OP_POLY_OFFSET: XLATE_NEED(p_poly_offset); break;
-        case OP_DRAW: XLATE_NEED(p_draw); break;
-        case OP_BARRIER: XLATE_NEED(int32_t); break;
-        case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE: XLATE_NEED(p_copy_stride); break;
-        case OP_BLEND_COLOR: XLATE_NEED(p_blend_color); break;
-        case OP_RESET_COUNTER: XLATE_NEED(uint64_t); break;
-        case OP_DEPTH_CLAMP: case OP_RENDER_ENABLE: case OP_RASTER_DISCARD: XLATE_NEED(p_flag); break;
         default: return -1;
     }
-#undef XLATE_ARRAY
 #undef XLATE_FIELD
 #undef XLATE_NEED
     return (int)n;
+}
+static int xlate_address_fields(unsigned op, const uint8_t *a, size_t size, xlate_address_field fields[17]) {
+    if (totk_vk_res_samp_fast_on()) return totk_xlate_address_fields_fast(k_xlate_specs, OP_COUNT_, op, a, size, (totk_xlate_field_t *)fields);
+    return xlate_address_fields_slow(op, a, size, fields);
 }
 static int xlate_hash_equal(const xlate_hash *a, const xlate_hash *b) {
     return a->h[0] == b->h[0] && a->h[1] == b->h[1] && a->bytes == b->bytes && a->ops == b->ops;

@@ -39,6 +39,12 @@
 #include "vk_img_fast.h"
 #include "vk_imgmem_fast.h"
 #include "vk_canvas_fast.h"
+#include "vk_res_samp_fast.h"
+_Static_assert(sizeof(samp_par) == 44u, "TOTK samp_par 44B");
+_Static_assert(VK_FORMAT_R8G8B8A8_UNORM == 37 && VK_FORMAT_R8G8B8A8_SRGB == 43 &&
+               VK_FORMAT_B8G8R8A8_UNORM == 44 && VK_FORMAT_B8G8R8A8_SRGB == 50 &&
+               VK_FORMAT_A8B8G8R8_UNORM_PACK32 == 51 && VK_FORMAT_A8B8G8R8_SRGB_PACK32 == 57,
+               "sRGB twin VkFormat constants");
 static int img_fast_res_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static __thread totk_view_memo4 *T_view_memo;
 static __thread totk_view_id_memo4 *T_view_id_memo;
@@ -400,27 +406,42 @@ static void retire_img(vk_img *im) {
 }
 static _Atomic uint64_t g_tbv_evict_gen = 1;
 static __thread totk_tbuf_memo4 *T_tbuf_memo;
-static void retire_bview(VkBufferView bv, VkBuffer buffer) { if (bv) { atomic_fetch_add_explicit(&g_tbv_evict_gen, 1, memory_order_release); retire((retired_t){.bv = bv, .bv_buffer = buffer}); } }
+static totk_tb_tracker_t g_tb_tracker;
+static void retire_bview(VkBufferView bv, VkBuffer buffer) {
+    if (bv) {
+        if (buffer) totk_tb_note_add(&g_tb_tracker, (uint64_t)(uintptr_t)buffer);
+        atomic_fetch_add_explicit(&g_tbv_evict_gen, 1, memory_order_release);
+        retire((retired_t){.bv = bv, .bv_buffer = buffer});
+    }
+}
 static void retire_host(void *p) { if (p) retire((retired_t){.host = p}); }
 /* Caller has retired every recording/GPU use of this arena buffer. Cached
    texel views must not survive its destruction or the lag-off cutover. */
 void vk_res_buffer_released(VkBuffer buffer) {
+    if (!buffer) return;
+    if (totk_vk_res_samp_fast_on() && !totk_tb_may_have(&g_tb_tracker, (uint64_t)(uintptr_t)buffer)) return;
     pthread_mutex_lock(&g_tex_mu);
-    atomic_fetch_add_explicit(&g_tex_serial_gen, 1u, memory_order_release);
-    atomic_fetch_add_explicit(&g_tbv_evict_gen, 1, memory_order_release);
+    uint32_t sub_n = 0u;
     for (uint32_t i = 0; i < g_by_serial.cap; i++) {
         vk_tex *x = g_by_serial.vals ? g_by_serial.vals[i] : NULL;
         if (!x || x->tb_buffer != buffer) continue;
         if (x->tbv) vkDestroyBufferView(V.dev, x->tbv, NULL);
         x->tbv = VK_NULL_HANDLE; x->tb_buffer = VK_NULL_HANDLE;
         x->tb_offset = x->tb_range = 0;
+        sub_n++;
     }
     for (int i = 0; i < g_nretired; ) {
         retired_t *r = &g_retired[i];
         if (r->bv_buffer != buffer) { i++; continue; }
         vkDestroyBufferView(V.dev, r->bv, NULL);
         g_retired[i] = g_retired[--g_nretired];
+        sub_n++;
     }
+    if (!totk_vk_res_samp_fast_on() || sub_n > 0u) {
+        atomic_fetch_add_explicit(&g_tex_serial_gen, 1u, memory_order_release);
+        atomic_fetch_add_explicit(&g_tbv_evict_gen, 1, memory_order_release);
+    }
+    if (sub_n > 0u) totk_tb_note_sub(&g_tb_tracker, sub_n);
     pthread_mutex_unlock(&g_tex_mu);
 }
 void vk_res_sweep(void) {   /* nvn_vk.c, after each commit */
@@ -436,7 +457,7 @@ void vk_res_sweep(void) {   /* nvn_vk.c, after each commit */
         free(r->views);
         if (r->img) vkDestroyImage(V.dev, r->img, NULL);
         vk_mem_free(&r->mem);
-        if (r->bv) vkDestroyBufferView(V.dev, r->bv, NULL);
+        if (r->bv) { if (r->bv_buffer) totk_tb_note_sub(&g_tb_tracker, 1u); vkDestroyBufferView(V.dev, r->bv, NULL); }
         free(r->host);
         g_retired[i] = g_retired[--g_nretired];
     }
@@ -575,6 +596,7 @@ static void image_barrier_init(VkCommandBuffer cb, VkImage img, VkImageAspectFla
    upgrades the image (img_upgrade), like nvn_mtl.m tex_upgrade_pfv. TOTK_VK_UBWC=0 gives every image the full set. */
 static int ubwc_lists_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("TOTK_VK_UBWC"); on = !(e && !strcmp(e, "0")); } return on; }
 static VkFormat srgb_twin(VkFormat f) {
+    if (totk_vk_res_samp_fast_on()) return (VkFormat)totk_srgb_twin_fast((uint32_t)f);
     switch (f) {
         case VK_FORMAT_R8G8B8A8_UNORM: return VK_FORMAT_R8G8B8A8_SRGB; case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
         case VK_FORMAT_B8G8R8A8_UNORM: return VK_FORMAT_B8G8R8A8_SRGB; case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
@@ -812,7 +834,7 @@ static void tex_drop_locked(vk_tex *x) {
     if (!x) return;
     tex_stamp_drop(x->identity);
     texcopy_resource("drop", x);
-    if (x->tbv) retire_bview(x->tbv, x->tb_buffer);
+    if (x->tbv) { retire_bview(x->tbv, x->tb_buffer); if (x->tb_buffer) { x->tb_buffer = VK_NULL_HANDLE; totk_tb_note_sub(&g_tb_tracker, 1u); } }
     if (x->im) {
         if (x->im->shared) { if (--x->im->refs == 0) { x->im->idle_sub = vk_submit_serial(); if (!x->im->wbrefs) totk_idle_shared_note(&g_idle_shared, x->im->idle_sub); } }
         else if (x->im->wbrefs) x->im->orphan = 1;   /* a rendering waiting for write-back keeps it */
@@ -2774,8 +2796,8 @@ static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *li
             if (live && *reason) *live = (VkDescriptorBufferInfo){b, off, size};
             if (off % V.props.limits.minTexelBufferOffsetAlignment) RED(4, "buffer texture offset %#llx is not aligned", (unsigned long long)off);
             else {
-                if (x->tbv && (x->tb_buffer != b || x->tb_offset != off || x->tb_range != size)) { retire_bview(x->tbv, x->tb_buffer); x->tbv = VK_NULL_HANDLE; }
-                if (!x->tbv) { VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f, .offset = off, .range = size}; if (!vkCreateBufferView(V.dev, &ci, NULL, &x->tbv)) { x->tb_buffer = b; x->tb_offset = off; x->tb_range = size; } }
+                if (x->tbv && (x->tb_buffer != b || x->tb_offset != off || x->tb_range != size)) { retire_bview(x->tbv, x->tb_buffer); x->tbv = VK_NULL_HANDLE; if (x->tb_buffer) { x->tb_buffer = VK_NULL_HANDLE; totk_tb_note_sub(&g_tb_tracker, 1u); } }
+                if (!x->tbv) { VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f, .offset = off, .range = size}; if (!vkCreateBufferView(V.dev, &ci, NULL, &x->tbv)) { x->tb_buffer = b; x->tb_offset = off; x->tb_range = size; if (b) totk_tb_note_add(&g_tb_tracker, (uint64_t)(uintptr_t)b); } }
                 bv = x->tbv;
             }
         }
@@ -2786,16 +2808,20 @@ static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *li
 }
 VkBufferView vk_tbuf_by_id(int tid, int writable) { return tbuf_by_id(tid, writable, NULL, NULL); }
 VkBufferView vk_tbuf_by_id_record(int tid, int writable, VkDescriptorBufferInfo *live, uint32_t *reason) { return tbuf_by_id(tid, writable, live, reason); }
+static totk_sreg_shadow_t g_sreg_fast;
 void mtl_reg_samp(int sid, const samp_par *sp) {
     if (sid < 0) return;
+    if (totk_vk_res_samp_fast_on() && totk_sreg_same_with_obj(&g_sreg_fast, sid, sp)) return;
     pthread_mutex_lock(&g_reg_mu);
     if (sid >= g_nsreg) {
         int n = sid + 256; g_sreg = realloc(g_sreg, (size_t)n * sizeof *g_sreg); g_sreg_ok = realloc(g_sreg_ok, (size_t)n); g_sobj = realloc(g_sobj, (size_t)n * sizeof *g_sobj);
         memset(g_sreg_ok + g_nsreg, 0, (size_t)(n - g_nsreg)); memset(g_sobj + g_nsreg, 0, (size_t)(n - g_nsreg) * sizeof *g_sobj); g_nsreg = n;
     }
-    if (g_sobj[sid] && !memcmp(&g_sreg[sid], sp, sizeof *sp)) { pthread_mutex_unlock(&g_reg_mu); return; }
+    int same = g_sobj[sid] && (totk_vk_res_samp_fast_on() ? totk_samp_par_eq_fast(&g_sreg[sid], sp) : !memcmp(&g_sreg[sid], sp, sizeof *sp));
+    if (same) { pthread_mutex_unlock(&g_reg_mu); return; }
     if (g_sobj[sid]) { /* the old sampler may still be in recorded descriptor sets: keep it (samplers are few) */ g_sobj[sid] = VK_NULL_HANDLE; }
     g_sreg[sid] = *sp; g_sreg_ok[sid] = 1;
+    totk_sreg_write(&g_sreg_fast, sid, sp, sizeof *sp, 0u);
     atomic_fetch_add(&g_samp_epoch, 1);
     pthread_mutex_unlock(&g_reg_mu);
 }
@@ -2848,6 +2874,7 @@ VkSampler vk_samp_by_id(int sid) {
             g_sobj[sid] = have;
         }
         s = g_sobj[sid];
+        if (s) totk_sreg_mark_obj(&g_sreg_fast, sid, 1u);
     }
     pthread_mutex_unlock(&g_reg_mu);
     if (s) { if (fast && T_sc4) totk_scache4_put(T_sc4, sid, ep, (uint64_t)(uintptr_t)s); else { sc[h].sid = sid; sc[h].ep = ep; sc[h].s = s; } }
