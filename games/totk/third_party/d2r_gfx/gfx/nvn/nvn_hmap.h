@@ -38,9 +38,30 @@ static inline uint64_t nvn_hm_hash(const void *k, uint32_t len) {
         h = (h ^ w1) * 0xff51afd7ed558ccdull; h ^= h >> 32;
         return nvn_hm_fin(h);
     }
-    for (; len >= 8; p += 8, len -= 8) { uint64_t w; memcpy(&w, p, 8); h = (h ^ w) * 0xff51afd7ed558ccdull; h ^= h >> 32; }
+    if (len == 24) {
+        uint64_t w0, w1, w2; memcpy(&w0, p, 8); memcpy(&w1, p + 8, 8); memcpy(&w2, p + 16, 8);
+        h = (h ^ w0) * 0xff51afd7ed558ccdull; h ^= h >> 32;
+        h = (h ^ w1) * 0xff51afd7ed558ccdull; h ^= h >> 32;
+        h = (h ^ w2) * 0xff51afd7ed558ccdull; h ^= h >> 32;
+        return nvn_hm_fin(h);
+    }
+    for (; len >= 16; p += 16, len -= 16) {
+        uint64_t w0, w1; memcpy(&w0, p, 8); memcpy(&w1, p + 8, 8);
+        h = (h ^ w0) * 0xff51afd7ed558ccdull; h ^= h >> 32;
+        h = (h ^ w1) * 0xff51afd7ed558ccdull; h ^= h >> 32;
+    }
+    if (len >= 8) { uint64_t w; memcpy(&w, p, 8); h = (h ^ w) * 0xff51afd7ed558ccdull; h ^= h >> 32; p += 8; len -= 8; }
     if (len) { uint64_t w = 0; memcpy(&w, p, len); h = (h ^ w) * 0xff51afd7ed558ccdull; }
     return nvn_hm_fin(h);
+}
+
+static inline int nvn_hm_eq_gen(const void *a, const void *b, uint32_t len) {
+    if (len > 8u) {
+        uint64_t a0, b0; memcpy(&a0, a, 8); memcpy(&b0, b, 8);
+        if (a0 != b0) return 0;
+        if (TOTK_HMAP_FAULT(185)) return 1;
+    }
+    return memcmp(a, b, len) == 0;
 }
 
 static inline int nvn_hm_eq16(const void *a, uint64_t k0, uint64_t k1) {
@@ -82,7 +103,7 @@ static inline void *nvn_hm_get(const nvn_hmap *m, const void *k) {
     uint32_t i = (uint32_t)nvn_hm_hash(k, m->klen) & mask;
     for (uint32_t step = 0; step < m->cap; step++, i = (i + 1u) & mask) {
         if (!m->vals[i]) return NULL;
-        if (!memcmp(m->keys + (size_t)i * m->klen, k, m->klen)) return m->vals[i];
+        if (nvn_hm_eq_gen(m->keys + (size_t)i * m->klen, k, m->klen)) return m->vals[i];
     }
     return NULL;
 }
@@ -108,7 +129,7 @@ static inline void *nvn_hm_put(nvn_hmap *m, const void *k, void *v) {
         uint8_t *ki = m->keys + (size_t)i * m->klen;
         if (!m->vals[i]) { memcpy(ki, k, m->klen); m->vals[i] = v; m->n++; return NULL; }
         int eq = m->klen == 8 ? !memcmp(ki, k, 8) :
-                 m->klen == 16 ? !memcmp(ki, k, 16) : !memcmp(ki, k, m->klen);
+                 m->klen == 16 ? !memcmp(ki, k, 16) : nvn_hm_eq_gen(ki, k, m->klen);
         if (eq) { void *old = m->vals[i]; m->vals[i] = v; return old; }
     }
     abort();
@@ -123,7 +144,7 @@ static inline void *nvn_hm_del(nvn_hmap *m, const void *k) {
     for (uint32_t step = 0; step < m->cap; step++, i = (i + 1u) & mask) {
         if (!m->vals[i]) return NULL;
         int eq = m->klen == 8 ? !memcmp(m->keys + (size_t)i * 8u, k, 8) :
-                 m->klen == 16 ? !memcmp(m->keys + (size_t)i * 16u, k, 16) : !memcmp(m->keys + (size_t)i * m->klen, k, m->klen);
+                 m->klen == 16 ? !memcmp(m->keys + (size_t)i * 16u, k, 16) : nvn_hm_eq_gen(m->keys + (size_t)i * m->klen, k, m->klen);
         if (eq) { found = i; break; }
     }
     if (found == UINT32_MAX) return NULL;

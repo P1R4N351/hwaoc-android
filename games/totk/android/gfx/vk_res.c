@@ -38,6 +38,7 @@
 #include "vk_serial_fast.h"
 #include "vk_img_fast.h"
 #include "vk_imgmem_fast.h"
+#include "vk_canvas_fast.h"
 static int img_fast_res_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static __thread totk_view_memo4 *T_view_memo;
 static __thread totk_view_id_memo4 *T_view_id_memo;
@@ -209,7 +210,14 @@ void vk_mem_free(vk_alloc *a) {
 }
 
 /* ---------- format support ---------- */
+static totk_fmt_feats_cache_t g_totk_fmt_feats;
+static uint32_t totk_fmt_feats_probe_vk(uint32_t f, void *ctx) {
+    (void)ctx;
+    VkFormatProperties fp; V.get_format_props(V.pd, (VkFormat)f, &fp);
+    return (uint32_t)fp.optimalTilingFeatures;
+}
 static VkFormatFeatureFlags fmt_features(VkFormat f) {
+    if (totk_vk_canvas_fast_on()) return (VkFormatFeatureFlags)totk_fmt_feats_fast_get(&g_totk_fmt_feats, (uint32_t)f, totk_fmt_feats_probe_vk, NULL);
     static VkFormatFeatureFlags cache[256]; static uint8_t known[256];
     unsigned i = f < 185 ? (unsigned)f : f >= 1000340000 && f <= 1000340001 ? 185 + (unsigned)(f - 1000340000) : 255;
     if (i < 255 && known[i]) return cache[i];

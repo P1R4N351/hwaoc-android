@@ -1,11 +1,13 @@
 #include "vk_canvas.h"
 #include <string.h>
+#include "vk_canvas_fast.h"
 int vk_canvas_on;
 static vk_canvas_frame current = {.frame=1};
 /* Canvas allocations rotate/rebuild; retain a small recent identity set rather
    than guessing all equal-sized targets. Eviction loses sharpness/eligibility,
    never nominates an unrelated image. No per-draw allocation or hashing. */
-static struct { vk_canvas_image canvas, window; uint64_t seen, ui_frame; } known[16];
+static totk_canvas_known_t known[16];
+static uint32_t known_hint;
 #ifdef TOTK_VK_TESTS
 static char test_ui_vertex[80],test_terminal_fragment[80];
 int vk_canvas_test_shaders(const char *ui_vertex,const char *terminal_fragment) {
@@ -20,10 +22,12 @@ int vk_canvas_test_shaders(const char *ui_vertex,const char *terminal_fragment) 
 }
 #endif
 static int same(const vk_canvas_image *a,const vk_canvas_image *b) {
+    if (totk_vk_canvas_fast_on()) return totk_canvas_same_fast(a, b);
     return a->image && a->image==b->image && a->incarnation==b->incarnation && a->storage==b->storage && a->size==b->size &&
         a->width==b->width && a->height==b->height && a->format==b->format && a->level==b->level && a->layer==b->layer;
 }
 static unsigned slot(const vk_canvas_image *image) {
+    if (totk_vk_canvas_fast_on()) return totk_canvas_slot_fast(image, known, &known_hint);
     unsigned oldest=0;
     for(unsigned i=0;i<16;i++) {
         if(same(image,&known[i].canvas))return i;
@@ -39,6 +43,7 @@ int vk_canvas_ui_shader(const char *key,int after) {
 #ifdef TOTK_VK_TESTS
     if (*test_ui_vertex && !strcmp(key,test_ui_vertex)) return 1;
 #endif
+    if (totk_vk_canvas_fast_on()) return totk_canvas_ui_shader_fast(key, after);
     unsigned count=after?sizeof keys/sizeof *keys:9;
     for(unsigned i=0;i<count;i++)if(!strncmp(key,keys[i],8))return 1;
     return 0;
@@ -47,6 +52,7 @@ int vk_canvas_transfer_shader(const char *key) {
 #ifdef TOTK_VK_TESTS
     if (key && *test_terminal_fragment && !strcmp(key,test_terminal_fragment)) return 1;
 #endif
+    if (totk_vk_canvas_fast_on()) return totk_canvas_transfer_shader_fast(key);
     return key&&!strncmp(key,"dd3d1e0ebf73242845970b5655fac199a30f5acf747975c5e771caa49af8b12b",64);
 }
 void vk_canvas_transfer(const vk_canvas_image *source,const vk_canvas_image *window,int committed) {
