@@ -4,9 +4,11 @@
  * remains explicit until the next frame can include it. */
 #pragma once
 #include <stdint.h>
+#include "vk_gpuprof_fast.h"
 #define VK_GPUPROF_PIPE_ORDINALS 2048u
 #define VK_GPUPROF_PIPE_BUDGET 16u
 static inline uint32_t vk_gpuprof_pipe_population(uint32_t previous, uint32_t observed) {
+    if (totk_vk_gpuprof_fast_on()) return vk_gp_pipe_population_fast(previous, observed);
     while (previous < observed && previous < (UINT32_C(1) << 31)) previous <<= 1;
     return previous;
 }
@@ -19,6 +21,7 @@ static inline int vk_gpuprof_pipe_selected(uint32_t ordinal, uint32_t phase, uin
  * Indexed restart strips cannot be counted without reading the index payload. */
 static inline int vk_gpuprof_pipe_primitives(int prim, uint32_t count, uint32_t instances,
                                             int indexed, uint64_t *out) {
+    if (totk_vk_gpuprof_fast_on()) return vk_gp_pipe_primitives_fast(prim, count, instances, indexed, out);
     if (indexed && (prim == 3 || prim == 5)) return 0;
     uint64_t n;
     switch (prim) {

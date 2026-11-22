@@ -40,7 +40,7 @@ enum { GP_IA_VERTICES, GP_IA_PRIMITIVES, GP_VS, GP_CLIP_INVOCATIONS, GP_CLIP_PRI
     VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT | \
     VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT)
 
-typedef struct { uint32_t format, w, h, load, store, bytes; } gp_attachment;
+typedef vk_gp_att_t gp_attachment;
 typedef struct {
     gp_attachment a[10];
     uint64_t shader;
@@ -652,6 +652,7 @@ static uint32_t gcd_u32(uint32_t a, uint32_t b) {
     return a ? a : 1;
 }
 static uint64_t key_hash(const gp_key *key) {
+    if (totk_vk_gpuprof_fast_on()) return vk_gp_key_hash_fast(key->shader, key->w, key->h, key->samples, key->colors, key->compute, key->a);
     uint64_t h = UINT64_C(14695981039346656037);
     h = hash_bytes(h, &key->shader, sizeof key->shader);
     const uint32_t fields[] = {key->w, key->h, key->samples, key->colors, key->compute};
@@ -664,6 +665,7 @@ static uint64_t key_hash(const gp_key *key) {
     return h;
 }
 static int key_equal(const gp_key *a, const gp_key *b) {
+    if (totk_vk_gpuprof_fast_on()) return vk_gp_key_eq_fast(a->shader, a->w, a->h, a->samples, a->colors, a->compute, a->a, b->shader, b->w, b->h, b->samples, b->colors, b->compute, b->a);
     if (a->w != b->w || a->h != b->h || a->shader != b->shader || a->samples != b->samples ||
         a->colors != b->colors || a->compute != b->compute) return 0;
     for (unsigned j = 0; j < 10; j++) {
@@ -777,7 +779,9 @@ static void finalize_passes(void) {
 }
 /* Core VkFormat families are contiguous. Use the VIEW format, not guest storage: a BC
    texture can have an uncompressed attachment view and depth formats can be substituted. */
+_Static_assert(VK_FORMAT_R4G4B4A4_UNORM_PACK16 == 2 && VK_FORMAT_A1R5G5B5_UNORM_PACK16 == 8 && VK_FORMAT_B10G11R11_UFLOAT_PACK32 == 122 && VK_FORMAT_S8_UINT == 127, "VkFormat IDs");
 static uint32_t texel_bytes(VkFormat f) {
+    if (totk_vk_gpuprof_fast_on()) return vk_gp_texel_bytes_fast((uint32_t)f);
     if (f >= VK_FORMAT_R4G4B4A4_UNORM_PACK16 && f <= VK_FORMAT_A1R5G5B5_UNORM_PACK16) return 2;
     if (f >= VK_FORMAT_R8_UNORM && f <= VK_FORMAT_R8_SRGB) return 1;
     if (f >= VK_FORMAT_R8G8_UNORM && f <= VK_FORMAT_R8G8_SRGB) return 2;
@@ -801,18 +805,48 @@ static int rank_cmp(const void *a, const void *b) {
     const gp_group *x = *(gp_group *const *)a, *y = *(gp_group *const *)b;
     return x->ms < y->ms ? 1 : x->ms > y->ms ? -1 : x->hash < y->hash ? -1 : x->hash > y->hash;
 }
-static void report(void) {
-    uint64_t report_start = monotonic_ns();
-    unsigned previous_phase = atomic_exchange_explicit(&background_phase, GP_REPORT, memory_order_relaxed);
-    gp_group *rank[GP_GROUPS]; size_t n = 0;
+static size_t report_collect_rank(gp_group *rank[GP_GROUPS]) {
+    static vk_gp_rank_item_t big_items[GP_GROUPS];
+    vk_gp_rank_item_t small_items[64]; size_t n = 0;
+    int fast = totk_vk_gpuprof_fast_on();
     for (size_t word = 0; word < GP_GROUPS / 64; word++) {
         uint64_t bits = group_occupied[word];
-        while (bits) {
-            unsigned bit = (unsigned)__builtin_ctzll(bits);
-            rank[n++] = &groups[word * 64 + bit]; bits &= bits - 1;
-        }
+        while (bits) { unsigned bit = (unsigned)__builtin_ctzll(bits); rank[n++] = &groups[word * 64 + bit]; bits &= bits - 1; }
     }
-    qsort(rank, n, sizeof *rank, rank_cmp);
+    if (!fast) { qsort(rank, n, sizeof *rank, rank_cmp); return n; }
+    vk_gp_rank_item_t *items = n <= 64u ? small_items : big_items;
+    for (size_t i = 0; i < n; i++) items[i] = (vk_gp_rank_item_t){rank[i]->ms, rank[i]->hash, (uint32_t)(rank[i] - groups), 0u};
+    vk_gp_rank_sort_fast(items, n);
+    for (size_t i = 0; i < n; i++) rank[i] = &groups[items[i].idx];
+    return n;
+}
+static void report_log_top(gp_group *const *rank, size_t n) {
+    for (size_t i = 0; i < n && i < 5; i++) {
+        const gp_group *g = rank[i]; const gp_key *k = &g->key; char attachments[800]; size_t used = 0; attachments[0] = 0;
+        for (int j = 0; j < 10; j++) if (k->a[j].format) {
+            const gp_attachment *a = &k->a[j];
+            int nn = snprintf(attachments + used, sizeof attachments - used, " %c%d=%u:%ux%u:%u/%u", j < 8 ? 'c' : 'd', j, a->format, a->w, a->h, a->load, a->store);
+            if (nn < 0 || (size_t)nn >= sizeof attachments - used) break;
+            used += (size_t)nn;
+        }
+        LOGV("[gpu-profile] #%zu sig=%016llx %s ordinal=%u area=%ux%u reference=%ux%u samples=%u colors=%u shader=%016llx: %.3f ms/frame %.2f%% %.2f instances/frame %.2f draws/frame; attachments(fmt:absolute-widthxheight:load/store)%s",
+             i + 1, (unsigned long long)g->hash, kind_name(k), g->ordinal, k->w, k->h, g->reference_w, g->reference_h, k->samples, k->colors,
+             (unsigned long long)k->shader, g->ms / GP_WINDOW, total_ms ? 100 * g->ms / total_ms : 0, g->count / (double)GP_WINDOW, g->draws / (double)GP_WINDOW, attachments);
+        LOGV("[gpu-profile scale] sig=%016llx: %.2f draws/instance, %.1f ns/draw (whole pass); geometry-stats %s valid=%llu/%llu IA-vertices=%.0f IA-primitives=%.0f VS=%.0f clipping-invocations=%.0f clipping-primitives=%.0f fragments=%.0f/frame; %.2f verts/draw %.2f prims/draw %.3f fragments/prim %.3f ns/vertex %.3f ns/primitive",
+             (unsigned long long)g->hash, g->count ? g->draws / (double)g->count : 0, g->draws ? g->ms * 1e6 / g->draws : 0,
+             stats_on ? "on" : "off", (unsigned long long)g->stats_count, (unsigned long long)g->count,
+             g->counters[0] / (double)GP_WINDOW, g->counters[1] / (double)GP_WINDOW, g->counters[2] / (double)GP_WINDOW,
+             g->counters[3] / (double)GP_WINDOW, g->counters[4] / (double)GP_WINDOW, g->counters[5] / (double)GP_WINDOW,
+             g->stats_draws ? g->counters[0] / (double)g->stats_draws : 0, g->stats_draws ? g->counters[1] / (double)g->stats_draws : 0,
+             g->counters[1] ? g->counters[5] / (double)g->counters[1] : 0,
+             g->counters[0] ? g->stats_ms * 1e6 / g->counters[0] : 0, g->counters[1] ? g->stats_ms * 1e6 / g->counters[1] : 0);
+    }
+}
+static void report(void) {
+    static gp_group *rank_buf[GP_GROUPS]; gp_group **rank = rank_buf;
+    uint64_t report_start = monotonic_ns();
+    unsigned previous_phase = atomic_exchange_explicit(&background_phase, GP_REPORT, memory_order_relaxed);
+    size_t n = report_collect_rank(rank);
     if (!partial_report) report_end = (window + 1) * GP_WINDOW;
     for (size_t i = 0; i < n; i++) output_pass(rank[i], "pass", 0);
     gp_json summary; json_init(&summary);
@@ -848,30 +882,7 @@ static void report(void) {
          loads / (double)GP_WINDOW, clears / (double)GP_WINDOW, stores / (double)GP_WINDOW, discards / (double)GP_WINDOW,
          load_bytes / (1048576.0 * GP_WINDOW), store_bytes / (1048576.0 * GP_WINDOW),
          (unsigned long long)unknown_bytes, (unsigned long long)dropped_records, (unsigned long long)failed_slots);
-    for (size_t i = 0; i < n && i < 5; i++) {
-        const gp_group *g = rank[i]; const gp_key *k = &g->key;
-        char attachments[800]; size_t used = 0; attachments[0] = 0;
-        for (int j = 0; j < 10; j++) if (k->a[j].format) {
-            const gp_attachment *a = &k->a[j];
-            int nn = snprintf(attachments + used, sizeof attachments - used, " %c%d=%u:%ux%u:%u/%u", j < 8 ? 'c' : 'd', j, a->format, a->w, a->h, a->load, a->store);
-            if (nn < 0 || (size_t)nn >= sizeof attachments - used) break;
-            used += (size_t)nn;
-        }
-        LOGV("[gpu-profile] #%zu sig=%016llx %s ordinal=%u area=%ux%u reference=%ux%u samples=%u colors=%u shader=%016llx: %.3f ms/frame %.2f%% %.2f instances/frame %.2f draws/frame; attachments(fmt:absolute-widthxheight:load/store)%s",
-             i + 1, (unsigned long long)g->hash, kind_name(k), g->ordinal, k->w, k->h, g->reference_w, g->reference_h, k->samples, k->colors,
-             (unsigned long long)k->shader, g->ms / GP_WINDOW, total_ms ? 100 * g->ms / total_ms : 0,
-             g->count / (double)GP_WINDOW, g->draws / (double)GP_WINDOW, attachments);
-        LOGV("[gpu-profile scale] sig=%016llx: %.2f draws/instance, %.1f ns/draw (whole pass); geometry-stats %s valid=%llu/%llu IA-vertices=%.0f IA-primitives=%.0f VS=%.0f clipping-invocations=%.0f clipping-primitives=%.0f fragments=%.0f/frame; %.2f verts/draw %.2f prims/draw %.3f fragments/prim %.3f ns/vertex %.3f ns/primitive",
-             (unsigned long long)g->hash, g->count ? g->draws / (double)g->count : 0, g->draws ? g->ms * 1e6 / g->draws : 0,
-             stats_on ? "on" : "off", (unsigned long long)g->stats_count, (unsigned long long)g->count,
-             g->counters[0] / (double)GP_WINDOW, g->counters[1] / (double)GP_WINDOW, g->counters[2] / (double)GP_WINDOW,
-             g->counters[3] / (double)GP_WINDOW, g->counters[4] / (double)GP_WINDOW, g->counters[5] / (double)GP_WINDOW,
-             g->stats_draws ? g->counters[0] / (double)g->stats_draws : 0,
-             g->stats_draws ? g->counters[1] / (double)g->stats_draws : 0,
-             g->counters[1] ? g->counters[5] / (double)g->counters[1] : 0,
-             g->counters[0] ? g->stats_ms * 1e6 / g->counters[0] : 0,
-             g->counters[1] ? g->stats_ms * 1e6 / g->counters[1] : 0);
-    }
+    report_log_top(rank, n);
     for (size_t i = 0; i < n; i++) {
         if (sample_budget) free(rank[i]->histogram);
         memset(rank[i], 0, sizeof *rank[i]);
@@ -1920,9 +1931,15 @@ void vk_gpuprof_draw(vk_shader *const shaders[6]) {
     if (!open_record) return;
     /* Fixed first-draw identity work; never inspect bound resources or earlier passes. */
     if (!open_record->draws) {
-        uint64_t h = UINT64_C(14695981039346656037);
-        for (int i = 0; i < 6; i++) if (shaders[i]) { h = hash_bytes(h, &i, sizeof i); h = hash_bytes(h, shaders[i]->key, strlen(shaders[i]->key) + 1); }
-        open_record->key.shader = h;
+        if (totk_vk_gpuprof_fast_on()) {
+            const char *keys[6];
+            for (int i = 0; i < 6; i++) keys[i] = shaders[i] ? shaders[i]->key : NULL;
+            open_record->key.shader = vk_gp_draw_shaders_hash_fast(keys);
+        } else {
+            uint64_t h = UINT64_C(14695981039346656037);
+            for (int i = 0; i < 6; i++) if (shaders[i]) { h = hash_bytes(h, &i, sizeof i); h = hash_bytes(h, shaders[i]->key, strlen(shaders[i]->key) + 1); }
+            open_record->key.shader = h;
+        }
     }
     open_record->draws++;
 }

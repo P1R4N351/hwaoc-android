@@ -46,6 +46,7 @@
 #include "test_vk_ktgl_opt_w41.h"
 #include "test_vk_ktgl_opt_w42.h"
 #include "test_vk_ktgl_opt_w43.h"
+#include "test_vk_ktgl_opt_w44.h"
 #include "nvn_dirty.h"
 #include <assert.h>
 #include <stdint.h>
@@ -337,6 +338,7 @@ int main(void) {
     if (run_ktgl_w41_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w42_tests(g_fault_mode) != 0) g_fail++;
     if (run_ktgl_w43_tests(g_fault_mode) != 0) g_fail++;
+    if (run_ktgl_w44_tests(g_fault_mode) != 0) g_fail++;
     printf("ktglopttest: fault_mode=%d failures=%d\n", g_fault_mode, g_fail);
     return g_fail != 0;
 }
