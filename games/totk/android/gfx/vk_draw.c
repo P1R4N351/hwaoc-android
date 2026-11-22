@@ -32,6 +32,7 @@
 #include "vk_img_fast.h"
 #include "vk_bind_fast.h"
 #include "vk_pso_key_fast.h"
+#include "vk_sig_fast.h"
 _Static_assert(VK_PRIMITIVE_TOPOLOGY_POINT_LIST == 0 && VK_PRIMITIVE_TOPOLOGY_LINE_LIST == 1 && VK_PRIMITIVE_TOPOLOGY_LINE_STRIP == 2 && VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST == 3 && VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP == 4 && VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN == 5, "topology");
 _Static_assert(sizeof(VkDynamicState) == sizeof(uint32_t), "VkDynamicState size");
 _Static_assert(TOTK_DYN_VIEWPORT == VK_DYNAMIC_STATE_VIEWPORT && TOTK_DYN_SCISSOR == VK_DYNAMIC_STATE_SCISSOR && TOTK_DYN_LINE_WIDTH == VK_DYNAMIC_STATE_LINE_WIDTH && TOTK_DYN_DEPTH_BIAS == VK_DYNAMIC_STATE_DEPTH_BIAS && TOTK_DYN_BLEND_CONSTANTS == VK_DYNAMIC_STATE_BLEND_CONSTANTS && TOTK_DYN_STENCIL_COMPARE_MASK == VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK && TOTK_DYN_STENCIL_WRITE_MASK == VK_DYNAMIC_STATE_STENCIL_WRITE_MASK && TOTK_DYN_STENCIL_REFERENCE == VK_DYNAMIC_STATE_STENCIL_REFERENCE && TOTK_DYN_CULL_MODE == VK_DYNAMIC_STATE_CULL_MODE && TOTK_DYN_FRONT_FACE == VK_DYNAMIC_STATE_FRONT_FACE && TOTK_DYN_PRIMITIVE_TOPOLOGY == VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY && TOTK_DYN_VERTEX_INPUT_BINDING_STRIDE == VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE && TOTK_DYN_DEPTH_TEST_ENABLE == VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE && TOTK_DYN_DEPTH_WRITE_ENABLE == VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE && TOTK_DYN_DEPTH_COMPARE_OP == VK_DYNAMIC_STATE_DEPTH_COMPARE_OP && TOTK_DYN_STENCIL_TEST_ENABLE == VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE && TOTK_DYN_STENCIL_OP == VK_DYNAMIC_STATE_STENCIL_OP && TOTK_DYN_DEPTH_BIAS_ENABLE == VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE && TOTK_DYN_PRIMITIVE_RESTART_ENABLE == VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, "totk dynamic states");
@@ -161,7 +162,7 @@ static void state_reset(void) {
     S.poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
     S.ds = (ds_st){0, 1, NVN_DEPTH_FUNC_LESS, 0, NVN_STENCIL_FUNC_ALWAYS, NVN_STENCIL_FUNC_ALWAYS, 1, 1, 1, 1, 1, 1};
     S.st_vmask[0] = S.st_vmask[1] = S.st_wmask[0] = S.st_wmask[1] = 0xff; S.dr[1] = 1;
-    for (int i = 0; i < 6; i++) S.tex_hi[i] = 1;
+    for (int i = 0; i < 6; i++) S.tex_hi[i] = 1; S.tex_nz_ready = 1;
 }
 static void pso_life_init(void);
 static void state_init(void) { static int done; if (!done) { done = 1; pso_life_init(); state_reset(); } }
@@ -4330,6 +4331,7 @@ static void pipe_predict_maybe(const uint8_t *next) {
                     h.size < sizeof h + offsetof(p_bind_handles, h) + (size_t)b->n * 8) goto predicted_done;
                 if (h.op == OP_BIND_TEX) {
                     memcpy(&predicted.tex[b->stage][b->first], b->h, (size_t)b->n * 8);
+                    totk_tex_nz_update(predicted.tex_nz[b->stage], &predicted.tex_nz_ready, b->first, b->h, b->n);
                     if (b->first + b->n > predicted.tex_hi[b->stage]) predicted.tex_hi[b->stage] = b->first + b->n;
                 } else memcpy(&predicted.img[b->stage][b->first], b->h, (size_t)b->n * 8);
                 break;
@@ -5829,9 +5831,30 @@ static int record_indirect_buffers(vk_record_draw *d) {
     d->index = buffer; d->index_offset = offset; d->vertex_offset = 0;
     return 1;
 }
+static uint32_t active_vin_streams(uint32_t vin_mask) {
+    uint32_t used = 0;
+    if (totk_vk_sig_fast_on()) {
+        for (uint32_t c = totk_vin_cand_mask_fast(vin_mask, S.nattr); c; c &= c - 1u) {
+            unsigned a = (unsigned)__builtin_ctz(c);
+            if (S.attr[a].fmt) used |= 1u << (S.attr[a].stream & 15);
+        }
+    } else for (int a = 0; a < 16; a++) if ((vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) used |= 1u << (S.attr[a].stream & 15);
+    return used;
+}
+static uint64_t record_widen_u8(vk_record_draw *d, uint64_t ibuf, uint32_t count) {
+#ifdef TOTK_VK_TESTS
+    g_test_widened++;
+#endif
+    VkDeviceSize to;
+    uint16_t *copy = vk_transient((size_t)count * 2 + 2, 16, &d->index, &to);
+    const uint8_t *source = (const uint8_t *)(uintptr_t)ibuf;
+    for (uint32_t i = 0; i < count; i++) copy[i] = source[i] == 0xff ? 0xffff : source[i];
+    d->index_address = 0; d->index_offset = to; d->index_type = VK_INDEX_TYPE_UINT16;
+    return to;
+}
 static int record_buffers(vk_shader *sh, const p_draw *dw, const p_draw_idx *di, int prim, uint32_t count, uint32_t instances, uint32_t base_instance) {
     vk_record_draw *d = g_record_draw;
-    for (int a = 0; a < 16; a++) if ((sh->vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) d->vertex_mask |= 1u << (S.attr[a].stream & 15);
+    d->vertex_mask |= active_vin_streams(sh->vin_mask);
     for (uint32_t s = 0; s < 16; s++) if (d->vertex_mask >> s & 1) {
         d->vertex[s].address = S.vbuf[s].address; d->vertex[s].size = S.vbuf[s].size ? S.vbuf[s].size : 16; d->vertex[s].stride = S.stream[s].stride;
         /* Packets survive slot reuse: a previous hot/copy draw may have overridden this stream.
@@ -5878,15 +5901,7 @@ static int record_buffers(vk_shader *sh, const p_draw *dw, const p_draw_idx *di,
             }
             d->index_bytes = (uint64_t)count * stride;
         }
-        if (di->itype == 0 && !V.has_index_u8) {
-            #ifdef TOTK_VK_TESTS
-            g_test_widened++;
-            #endif
-            VkDeviceSize to; uint16_t *copy = vk_transient((size_t)count * 2 + 2, 16, &d->index, &to);
-            const uint8_t *source = (const uint8_t *)(uintptr_t)di->ibuf;
-            for (uint32_t i = 0; i < count; i++) copy[i] = source[i] == 0xff ? 0xffff : source[i];
-            d->index_address = 0; d->index_offset = offset = to; d->index_type = VK_INDEX_TYPE_UINT16;
-        }
+        if (di->itype == 0 && !V.has_index_u8) offset = record_widen_u8(d, di->ibuf, count);
         if (offset % stride) { g_stat_skips[8]++; return 0; }
     }
     return 1;
@@ -5943,7 +5958,7 @@ static inline void ib_bind_fast(VkCommandBuffer cb, uint64_t sub, VkBuffer ib, V
 static void draw_bind_vbufs(VkCommandBuffer cb, vk_shader *sh, uint64_t sub, int vbfast, vk_record_draw *replay, int owned_geometry) {
     VkBuffer vb[TOTK_VB_SLOTS]; VkDeviceSize vo[TOTK_VB_SLOTS], vsz[TOTK_VB_SLOTS], vst[TOTK_VB_SLOTS];
     uint32_t used = 0, dirty = 0;
-    for (int a = 0; a < 16; a++) if ((sh->vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) used |= 1u << (S.attr[a].stream & 15);
+    used = active_vin_streams(sh->vin_mask);
     for (uint32_t s = 0; s < 16; s++) if (used >> s & 1) {
         VkBuffer b; uint64_t o, avail; uint64_t sz = S.vbuf[s].size ? S.vbuf[s].size : 16;
         int pool_backed = vbuf_resolve_fast(S.vbuf[s].address, &b, &o, &avail, vbfast);
@@ -6928,6 +6943,37 @@ static void exec_render_cond(const p_render_cond *c) {
     g_pops.cond++; if (S.render_disabled) g_pops.cond_off++;
     if (PD.active) { char l[200]; pd_note(l, snprintf(l, sizeof l, "  render cond %#llx mode %d: %llu vs %llu -> %s%s\n", (unsigned long long)c->addr, c->mode, (unsigned long long)x, (unsigned long long)y, S.render_disabled ? "off" : "on", known ? "" : " (pending samples: visible)")); }
 }
+static _Thread_local totk_treg_depth_cache_t t_draw_depth_cache;
+static int draw_tid_is_depth(int tid, uint64_t rev) {
+    if (tid <= 0) return 0;
+    int d = 0;
+    if (totk_treg_depth_peek(&t_draw_depth_cache, tid, rev, &d)) return d;
+    int f = 0, tg = 0;
+    d = (vk_treg_kind(tid, &f, &tg) && totk_is_depth_fmt_fast(f)) ? 1 : 0;
+    totk_treg_depth_put(&t_draw_depth_cache, tid, d);
+    return d;
+}
+static void exec_bind_tex(const p_bind_handles *b) {
+    if (b->stage < 0 || b->stage >= 6 || b->first < 0 || b->first + b->n > 128) return;
+    int changed = memcmp(&S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n) || b->first + b->n > S.tex_hi[b->stage];
+    if (totk_vk_state_fast_on() && !changed && vk_record_enabled() && !(vk_native_ui_enabled() && vk_native_descriptor_revision())) return;
+    if (vk_fg_extract_active && R.open && changed) fg_extract_state_change(1);
+    if (vk_record_enabled() && changed) g_record_bind_revision[b->stage]++;
+    int signature_changed = !vk_record_enabled(), sfast = totk_vk_sig_fast_on();
+    uint64_t rev = (!signature_changed && sfast) ? vk_treg_revision() : 0u;
+    for (int i = 0; !signature_changed && i < b->n; i++) {
+        uint64_t oh = S.tex[b->stage][b->first + i], nh = b->h[i];
+        if ((oh & 0xfffff) == (nh & 0xfffff) && (!oh == !nh || !sfast)) continue;
+        signature_changed = !sfast ? 1 : ((oh ? draw_tid_is_depth((int)(oh & 0xfffff), rev) : 0) !=
+                                          (nh ? draw_tid_is_depth((int)(nh & 0xfffff), rev) : 0));
+    }
+    for (int i = 0; i < b->n; i++) if ((uint32_t)S.tex[b->stage][b->first + i] != (uint32_t)b->h[i]) { g_driver_revision[1][b->stage]++; break; }
+    memcpy(&S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n);
+    totk_tex_nz_update(S.tex_nz[b->stage], &S.tex_nz_ready, b->first, b->h, b->n);
+    if (b->first + b->n > S.tex_hi[b->stage]) S.tex_hi[b->stage] = b->first + b->n;
+    if (vk_native_ui_enabled() && vk_native_descriptor_revision()) native_bound_update(b->stage, 0, b->first, b->n);
+    if (signature_changed) vk_stage_sig_invalidate(1u << b->stage);
+}
 void vk_draw_exec(uint32_t op, const void *a) {
     state_init();
     if (R.open && (op==OP_CLEAR_COLOR || op==OP_CLEAR_DS)) R.feedback_written|=0x3ffu;
@@ -7047,20 +7093,7 @@ void vk_draw_exec(uint32_t op, const void *a) {
             if (old->addr != b->addr || (uint32_t)old->size != (uint32_t)b->size) g_driver_revision[0][b->stage]++;
             *old = *b;
         } break; }
-        case OP_BIND_TEX: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) {
-            int changed = memcmp(&S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n) || b->first + b->n > S.tex_hi[b->stage];
-            if (totk_vk_state_fast_on() && !changed && vk_record_enabled() &&
-                !(vk_native_ui_enabled() && vk_native_descriptor_revision())) break;
-            if (vk_fg_extract_active && R.open && changed) fg_extract_state_change(1);
-            if (vk_record_enabled() && changed) g_record_bind_revision[b->stage]++;
-            int signature_changed = !vk_record_enabled();
-            for (int i = 0; !signature_changed && i < b->n; i++)
-                signature_changed = (S.tex[b->stage][b->first + i] & 0xfffff) != (b->h[i] & 0xfffff);
-            for (int i = 0; i < b->n; i++) if ((uint32_t)S.tex[b->stage][b->first + i] != (uint32_t)b->h[i]) { g_driver_revision[1][b->stage]++; break; }
-            memcpy(&S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n); if (b->first + b->n > S.tex_hi[b->stage]) S.tex_hi[b->stage] = b->first + b->n;
-            if (vk_native_ui_enabled() && vk_native_descriptor_revision()) native_bound_update(b->stage,0,b->first,b->n);
-            if (signature_changed) vk_stage_sig_invalidate(1u << b->stage);
-        } break; }
+        case OP_BIND_TEX: exec_bind_tex(a); break;
         case OP_BIND_SAMP: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 128) {
             int ch = memcmp(&S.samp[b->stage][b->first], b->h, 8 * (size_t)b->n) != 0;
             if (totk_vk_state_fast_on() && !ch) break;

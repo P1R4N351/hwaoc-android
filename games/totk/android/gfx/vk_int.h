@@ -720,6 +720,8 @@ typedef struct {
     p_scissor sc; int has_sc;
     p_set_rt rt; int has_rt;
     int tex_hi[6];
+    uint64_t tex_nz[6][2];
+    uint8_t tex_nz_ready;
 } vk_state;
 extern vk_state S;
 int vk_prog_predict(const vk_state *state, vk_shader *out[6]);   /* borrowed ready variants only; no loads or active-state/memo changes */

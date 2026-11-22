@@ -27,6 +27,7 @@
 #include "vk_shader_fast.h"
 #include "vk_cs_fast.h"
 #include "vk_prog_fast.h"
+#include "vk_sig_fast.h"
 #include "vk_spv_fast.h"
 #include "vk_subgroup.h"
 #include "vk_position.h"
@@ -711,22 +712,51 @@ static long miss_wait_ms(void) {
 static uint64_t g_stage_sig[6], g_stage_sig_revision[6];
 static unsigned g_stage_sig_valid;
 void vk_stage_sig_invalidate(unsigned stages) { g_stage_sig_valid &= ~stages; }   /* S and this memo belong to the recording thread */
-static uint64_t stage_sig_for(const vk_state *state, int st) {
-    uint64_t sg = 0;
+static _Thread_local totk_treg_depth_cache_t t_sh_depth_cache;
+static int sig_tid_is_depth(int tid, uint64_t revision, int fast) {
+    if (tid <= 0) return 0;
+    int depth = 0;
+    if (fast && totk_treg_depth_peek(&t_sh_depth_cache, tid, revision, &depth)) return depth;
+    int f = 0, tg = 0;
+    depth = (vk_treg_kind(tid, &f, &tg) && totk_is_depth_fmt_fast(f)) ? 1 : 0;
+    if (fast) totk_treg_depth_put(&t_sh_depth_cache, tid, depth);
+    return depth;
+}
+static uint64_t stage_tex_dm_fast(const vk_state *state, int st, uint64_t revision, int hi) {
+    uint64_t w[2], dm = 0u;
+    totk_stage_tex_hi_words(state->tex_nz[st], hi, w);
+    for (int half = 0; half < 2; half++) {
+        uint64_t m = w[half];
+        while (m) {
+            unsigned r = (unsigned)half * 64u + (unsigned)__builtin_ctzll(m);
+            m &= m - UINT64_C(1);
+            if (sig_tid_is_depth((int)(state->tex[st][r] & 0xfffffu), revision, 1))
+                dm ^= UINT64_C(0x9e3779b97f4a7c15) * (uint64_t)(r + 1u);
+        }
+    }
+    return dm;
+}
+static uint64_t stage_sig_for_rev(const vk_state *state, int st, uint64_t revision) {
+    uint64_t sg = 0, dm = 0;
     if (st == 1 && state->has_rt) for (int i = 0; i < state->rt.n && i < 8; i++) if (state->rt.color[i])
         sg |= (uint64_t)(1 + vk_fmt_class(state->rt.has_cview[i] && state->rt.cview[i].set_format ? state->rt.cview[i].format : state->rt.color[i]->d.format)) << (3 * i);
     if (st == 0) for (int i = 0; i < state->nattr && i < 16; i++) sg |= (uint64_t)vk_fmt_class(state->attr[i].fmt) << (2 * i);
-    uint64_t dm = 0; int hi = st >= 0 && st < 6 && state->tex_hi[st] ? state->tex_hi[st] : 128;
-    for (int r = 0; r < hi && r < 128; r++) if (state->tex[st][r]) {
-        int f, tg; if (!vk_treg_kind((int)(state->tex[st][r] & 0xfffff), &f, &tg)) continue;
-        if (f >= 0x32 && f <= 0x36) dm ^= 0x9E3779B97F4A7C15ull * (uint64_t)(r + 1);
+    int hi = st >= 0 && st < 6 && state->tex_hi[st] ? state->tex_hi[st] : 128;
+    int fast = totk_vk_sig_fast_on();
+    if (fast && state->tex_nz_ready && st >= 0 && st < 6) dm = stage_tex_dm_fast(state, st, revision, hi);
+    else for (int r = 0; r < hi && r < 128; r++) if (state->tex[st][r]) {
+        if (sig_tid_is_depth((int)(state->tex[st][r] & 0xfffff), revision, fast))
+            dm ^= 0x9E3779B97F4A7C15ull * (uint64_t)(r + 1);
     }
     if (dm) sg ^= dm | 1ull << 63;
     return sg;
 }
+static uint64_t stage_sig_for(const vk_state *state, int st) {
+    return stage_sig_for_rev(state, st, vk_treg_revision());
+}
 static uint64_t stage_sig_at(int st, uint64_t revision) {   /* nvn_mtl.m stage_sig */
     if ((g_stage_sig_valid & (1u << st)) && g_stage_sig_revision[st] == revision) return g_stage_sig[st];
-    uint64_t sg = stage_sig_for(&S, st);
+    uint64_t sg = stage_sig_for_rev(&S, st, revision);
     g_stage_sig[st] = sg; g_stage_sig_revision[st] = revision; g_stage_sig_valid |= 1u << st;   /* pre-scan revision: a concurrent registration invalidates the next lookup */
     return sg;
 }
@@ -736,7 +766,7 @@ struct vk_prog {
     char key[6][65]; const uint8_t *ctl[6], *code[6]; int has[6]; unsigned stages;
     uint64_t xlate_epoch;
     uint64_t prepare_epoch; int prepared;
-    alt_t *alt[6]; int nalt[6], capalt[6];
+    alt_t *alt[6]; int nalt[6], capalt[6]; totk_alt_map_t alt_map[6];
     vk_shader *cur[6]; uint64_t cur_sig[6]; int cur_ok[6];
     struct { uint64_t registry, xlate_epoch, signature[6]; vk_shader *shader[6]; int ready, result; } record;
     struct { uint64_t registry, xlate_epoch, signature; vk_shader *shader; int ready, result; } stage_record[6];
@@ -873,7 +903,12 @@ static void prog_sync_epoch(vk_prog *pr, uint64_t epoch) {
        Ready variants remain valid; only misses must resolve again after publication. */
     for (int st = 0; st < 6; st++) {
         int n = 0;
-        for (int i = 0; i < pr->nalt[st]; i++) if (!pr->alt[st][i].missing) pr->alt[st][n++] = pr->alt[st][i];
+        totk_alt_map_clear(&pr->alt_map[st]);
+        for (int i = 0; i < pr->nalt[st]; i++) if (!pr->alt[st][i].missing) {
+            pr->alt[st][n] = pr->alt[st][i];
+            totk_alt_map_put(&pr->alt_map[st], pr->alt[st][n].sig, (uint16_t)(n + 1));
+            n++;
+        }
         pr->nalt[st] = n;
         if (!pr->cur[st]) pr->cur_ok[st] = 0;
     }
@@ -884,7 +919,12 @@ static int prog_resolve_stage(vk_prog *pr, int st, vk_shader **out_sh) {
     uint64_t sg = stage_sig(st);
     if (pr->cur_ok[st] && pr->cur_sig[st] == sg) { *out_sh = pr->cur[st]; return *out_sh ? 0 : -1; }
     alt_t *hit = NULL;
-    for (int i = 0; i < pr->nalt[st]; i++) if (pr->alt[st][i].sig == sg) { hit = &pr->alt[st][i]; break; }
+    int sfast = totk_vk_sig_fast_on();
+    if (sfast) {
+        int ai = totk_alt_map_find(&pr->alt_map[st], sg);
+        if (ai >= 0 && ai < pr->nalt[st]) hit = &pr->alt[st][ai];
+    }
+    if (!hit && (!sfast || pr->alt_map[st].overflow)) for (int i = 0; i < pr->nalt[st]; i++) if (pr->alt[st][i].sig == sg) { hit = &pr->alt[st][i]; break; }
     if (!hit) {
         answers_t a; answers_of(st, &a);
         variant_list *vl = variants_of(pr->key[st]);
@@ -910,6 +950,7 @@ static int prog_resolve_stage(vk_prog *pr, int st, vk_shader **out_sh) {
         }
         if (pr->nalt[st] == pr->capalt[st]) { pr->capalt[st] = pr->capalt[st] ? 2 * pr->capalt[st] : 2; pr->alt[st] = realloc(pr->alt[st], (size_t)pr->capalt[st] * sizeof *pr->alt[st]); }
         pr->alt[st][pr->nalt[st]++] = (alt_t){sg, sh, !sh};
+        totk_alt_map_put(&pr->alt_map[st], sg, (uint16_t)pr->nalt[st]);
         hit = &pr->alt[st][pr->nalt[st] - 1];
     }
     pr->cur[st] = hit->sh; pr->cur_sig[st] = sg; pr->cur_ok[st] = 1;
@@ -1004,9 +1045,13 @@ int vk_prog_predict(const vk_state *state, vk_shader *out[6]) {
         if (!pr) return 0;
         if (!pr->has[st]) continue;
         if (st >= 2) return 0;
-        uint64_t sig = stage_sig_for(state, st);
+        uint64_t sig = stage_sig_for_rev(state, st, revision);
         if (pr->cur_ok[st] && pr->cur_sig[st] == sig) out[st] = pr->cur[st];
-        else for (int i = 0; i < pr->nalt[st]; i++) if (pr->alt[st][i].sig == sig) { out[st] = pr->alt[st][i].sh; break; }
+        else {
+            int sfast = totk_vk_sig_fast_on(), ai = sfast ? totk_alt_map_find(&pr->alt_map[st], sig) : -1;
+            if (ai >= 0 && ai < pr->nalt[st]) out[st] = pr->alt[st][ai].sh;
+            else if (!sfast || pr->alt_map[st].overflow) for (int i = 0; i < pr->nalt[st]; i++) if (pr->alt[st][i].sig == sig) { out[st] = pr->alt[st][i].sh; break; }
+        }
         if (!out[st]) return 0;
     }
     return out[0] != NULL && revision == vk_treg_revision();
