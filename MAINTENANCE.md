@@ -1,8 +1,9 @@
-# Maintaining the two apps
+# Maintaining the three apps
 
-One branch, `common`, builds both Android apps: **TotK Native (fork)** (Tears of the Kingdom 1.4.3) and **BotW Native**
-(Breath of the Wild 1.6.0). They share the runtime, the graphics layer, the app and the tools; what differs between them
-is one list of variables, `games/games.toml`, below. Everything not on that list is common code: a fix or feature lands
+One branch, `common`, builds the three Android apps in `games/games.toml`: **TotK Native (fork)** (Tears of the Kingdom
+1.4.3), **BotW Native** (Breath of the Wild 1.6.0) and **AoC Native** (Hyrule Warriors: Age of Calamity 1.3.0).
+They share the runtime, the graphics layer, the app and the tools; what differs between them is one list of variables,
+`games/games.toml`, below. Everything not on that list is common code: a fix or feature lands
 once and ships to both apps in the same commit. A new difference is added to the list first (meaning and both values),
 then read from it; code that still branches on the game itself is declared there file by file (`[branches]`), and
 `tests/test_game_variables.py` fails when code and list disagree.
