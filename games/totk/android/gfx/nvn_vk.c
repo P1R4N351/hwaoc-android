@@ -3666,6 +3666,7 @@ void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n) {
 typedef struct { uint64_t lo, hi, seq, fence; int flushed; uint8_t *data; } ub_ent;   /* fence: submission it reached memory in (0: not yet) */
 static uint64_t ub_address(uint64_t addr, uint64_t size);
 static ub_ent *g_ub; static uint64_t *g_ub_maxhi; static int g_nub, g_capub, g_ub_unflushed; static uint64_t g_ub_seq, g_ub_lo = UINT64_MAX, g_ub_hi;
+static totk_ub_unsealed_t g_ub_unsealed;
 static uint64_t g_ub_maxlen, g_ub_pruned_at;   /* longest logged entry (bounds the overlap scan); g_done at the last prune */
 static uint64_t g_ub_gen = 1;   /* rename memo: every log or snapshot change invalidates its answer */
 uint64_t vk_record_uniform_revision(void) { return g_ub_gen; }
@@ -3884,8 +3885,10 @@ static void ub_prune_inner(void) {   /* drop entries whose submission the GPU ha
     if (done == g_ub_pruned_at) return;
     g_ub_pruned_at = done;
     g_ub_lo = UINT64_MAX; g_ub_hi = 0; g_ub_maxlen = 0;
+    totk_ub_unsealed_reset(&g_ub_unsealed);
     for (int i = 0; i < g_nub; i++) {
         if (g_ub[i].fence && g_ub[i].fence <= done) { free(g_ub[i].data); continue; }
+        if (g_ub[i].flushed && !g_ub[i].fence) totk_ub_unsealed_note(&g_ub_unsealed, j);
         g_ub[j++] = g_ub[i];
         if (g_ub[i].lo < g_ub_lo) g_ub_lo = g_ub[i].lo; if (g_ub[i].hi > g_ub_hi) g_ub_hi = g_ub[i].hi;
         if (g_ub[i].hi - g_ub[i].lo > g_ub_maxlen) g_ub_maxlen = g_ub[i].hi - g_ub[i].lo;
@@ -3921,7 +3924,10 @@ static void ub_log(uint64_t lo, const uint8_t *data, uint64_t n, int flushed) {
     memmove(g_ub + a + 1, g_ub + a, (size_t)(g_nub - a) * sizeof *g_ub);
     uint8_t *d = reused ? reused : VK_MALLOC((size_t)n); memcpy(d, data, (size_t)n);
     if (vk_rec_profile_on && T_rec.active) { if (reused) g_rec.ub_reused++; else g_rec.ub_allocated++; }
-    g_ub[a] = (ub_ent){lo, lo + n, ++g_ub_seq, 0, flushed, d}; g_nub++; g_ub_unflushed += !flushed; ub_changed(lo, n);
+    g_ub[a] = (ub_ent){lo, lo + n, ++g_ub_seq, 0, flushed, d}; g_nub++; g_ub_unflushed += !flushed;
+    totk_ub_unsealed_shift_on_log(&g_ub_unsealed, first, a, g_nub);
+    if (flushed) totk_ub_unsealed_note(&g_ub_unsealed, a);
+    ub_changed(lo, n);
     snap_note_update(lo, n);
     ub_maxhi_from(a);
     if (lo < g_ub_lo) g_ub_lo = lo; if (lo + n > g_ub_hi) g_ub_hi = lo + n; if (n > g_ub_maxlen) g_ub_maxlen = n;
@@ -3943,8 +3949,10 @@ static int ub_entry_cmp(const void *x, const void *y) {
 }
 static void ub_reindex(void) {
     g_ub_lo = UINT64_MAX; g_ub_hi = g_ub_maxlen = 0; g_ub_unflushed = 0;
+    totk_ub_unsealed_reset(&g_ub_unsealed);
     for (int i = 0; i < g_nub; i++) {
         ub_ent *e = &g_ub[i];
+        if (e->flushed && !e->fence) totk_ub_unsealed_note(&g_ub_unsealed, i);
         if (e->lo < g_ub_lo) g_ub_lo = e->lo;
         if (e->hi > g_ub_hi) g_ub_hi = e->hi;
         if (e->hi - e->lo > g_ub_maxlen) g_ub_maxlen = e->hi - e->lo;
@@ -4042,6 +4050,7 @@ static void ub_flush_inner(uint64_t lo, uint64_t hi) {
             if (e->hi > prev_hi) prev_hi = e->hi;
         }
         e->flushed = 1; g_ub_unflushed--;
+        totk_ub_unsealed_note(&g_ub_unsealed, order[k]);
         ub_changed(e->lo, e->hi - e->lo); /* a private overlay became a real original-memory producer */
         lag_producer_changed(e->lo, e->hi - e->lo);
     }
@@ -4351,6 +4360,7 @@ int vk_lag_test_query_bench(void) {
             count, ns[0] / (double)CALLS, ns[1] / (double)CALLS,
             ns[0] / (double)CALLS * .02, ns[1] / (double)CALLS * .02, hits[0], hits[1]);
         free(g_ub); free(g_ub_maxhi); g_ub = NULL; g_ub_maxhi = NULL; g_nub = 0;
+        totk_ub_unsealed_reset(&g_ub_unsealed);
     }
     setenv("TOTK_FRAME_LAG", "1", 1);
     for (unsigned gap = 64; gap <= LAG_PRODUCER_CHANGES; gap *= 8) {
@@ -5311,6 +5321,23 @@ static void lag_guard_mark(uint64_t addr, uint64_t size, unsigned reason) {
 }
 /* The alias graph changes only when pool mappings change. Reuse its exact range projection instead of scanning every
    virtual mapping for every frame's merged guards. Cached arrays are walking-thread-owned, like the guard list. */
+static totk_alias_buf_idx_t g_alias_idx;
+static int alias_idx_sync_locked(void) {
+    uint64_t sgen = atomic_load_explicit(&g_span_gen, memory_order_relaxed);
+    if (g_alias_idx.gen == sgen && g_alias_idx.n == g_nalias) return 1;
+    if (!totk_alias_buf_sync_begin(&g_alias_idx, g_nalias, sgen)) return 0;
+    for (int i = 0; i < g_nalias; i++) totk_alias_buf_push(&g_alias_idx, i, (uint64_t)(uintptr_t)g_alias[i].owner->buf);
+    return 1;
+}
+static void alias_range_append(rng_t **rp, int *np, int *capp, const alias_ent *a, uint64_t addr, uint64_t off, uint64_t len) {
+    uint64_t lo = off > a->off ? off : a->off, end = a->off + a->end - a->va;
+    uint64_t hi = off + len < end ? off + len : end;
+    if (lo >= hi) return;
+    if (*np + 2 > *capp) { *capp = *capp ? *capp * 2 : 64; *rp = VK_REALLOC(*rp, (size_t)*capp * sizeof **rp); }
+    (*rp)[(*np)++] = (rng_t){a->va + lo - a->off, a->va + hi - a->off};
+    if (addr >= a->va && addr < a->end && a->off + addr - a->va == off)
+        (*rp)[(*np)++] = (rng_t){a->owner->base + off, a->owner->base + off + len};
+}
 typedef struct { uint64_t lo, hi, gen; rng_t *r; int n, cap; } lag_alias_cache;
 static const rng_t *lag_alias_ranges(rng_t r, int *count) {
     enum { NA = 2048 };
@@ -5320,22 +5347,18 @@ static const rng_t *lag_alias_ranges(rng_t r, int *count) {
     uint64_t gen = atomic_load_explicit(&g_span_gen, memory_order_acquire);
     if (c->lo == r.lo && c->hi == r.hi && c->gen == gen) { *count = c->n; return c->r; }
     pthread_mutex_lock(&g_pool_mu);
+    int use_idx = totk_vk_touch_alias_fast_on() && alias_idx_sync_locked();
     c->n = 0;
     for (uint64_t addr = r.lo; addr < r.hi; ) {
         VkBuffer b; uint64_t off, avail;
         if (!resolve_span(addr, 1, &b, &off, &avail)) { addr += page_sz(); continue; }
         uint64_t len = r.hi - addr; if (len > avail) len = avail;
-        for (int i = 0; i < g_nalias; i++) {
-            const alias_ent *a = &g_alias[i];
-            if (a->owner->buf != b) continue;
-            uint64_t lo = off > a->off ? off : a->off, end = a->off + a->end - a->va;
-            uint64_t hi = off + len < end ? off + len : end;
-            if (lo < hi) {
-                if (c->n + 2 > c->cap) { c->cap = c->cap ? c->cap * 2 : 64; c->r = VK_REALLOC(c->r, (size_t)c->cap * sizeof *c->r); }
-                c->r[c->n++] = (rng_t){a->va + lo - a->off, a->va + hi - a->off};
-                if (addr >= a->va && addr < a->end && a->off + addr - a->va == off)
-                    c->r[c->n++] = (rng_t){a->owner->base + off, a->owner->base + off + len};
-            }
+        uint64_t bkey = (uint64_t)(uintptr_t)b;
+        if (use_idx) {
+            for (int i = totk_alias_buf_first(&g_alias_idx, bkey); i >= 0; i = totk_alias_buf_next(&g_alias_idx, i, bkey))
+                alias_range_append(&c->r, &c->n, &c->cap, &g_alias[i], addr, off, len);
+        } else {
+            for (int i = 0; i < g_nalias; i++) if (g_alias[i].owner->buf == b) alias_range_append(&c->r, &c->n, &c->cap, &g_alias[i], addr, off, len);
         }
         addr += len;
     }
@@ -6270,7 +6293,21 @@ void mtl_sub_counter(uint64_t addr, uint32_t type) {
 void mtl_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }
 void mtl_exec_rest(const uint64_t *h, int n) { (void)h; (void)n; }
 void vk_note_draw(void) { g_stat_draw++; }
-static void ub_seal(uint64_t fence) { for (int i = 0; i < g_nub; i++) if (g_ub[i].flushed && !g_ub[i].fence) g_ub[i].fence = fence; ub_changed(0, 0); }
+static void ub_seal(uint64_t fence) {
+    if (totk_vk_touch_alias_fast_on()) {
+        if (g_ub_unsealed.count > 0) {
+            int lo = g_ub_unsealed.lo < 0 ? 0 : g_ub_unsealed.lo;
+            int hi = g_ub_unsealed.hi > g_nub ? g_nub : g_ub_unsealed.hi;
+            for (int i = lo; i < hi; i++) if (g_ub[i].flushed && !g_ub[i].fence) g_ub[i].fence = fence;
+            totk_ub_unsealed_reset(&g_ub_unsealed);
+        }
+        ub_changed(0, 0);
+        return;
+    }
+    for (int i = 0; i < g_nub; i++) if (g_ub[i].flushed && !g_ub[i].fence) g_ub[i].fence = fence;
+    totk_ub_unsealed_reset(&g_ub_unsealed);
+    ub_changed(0, 0);
+}
 
 /* A bounded draw-side lookahead never escapes the current recording or follows calls. Restored on recursive return. */
 static const uint8_t *g_exec_next; static uint32_t g_exec_op;

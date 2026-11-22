@@ -384,9 +384,11 @@ static void native_index_remove(vk_img *im);
 /* retired objects: destroyed once the GPU is past the submission that last could use them */
 typedef struct { VkImage img; vk_alloc mem; view_ent *views; int nviews; VkBufferView bv; VkBuffer bv_buffer; void *host; uint64_t after; } retired_t;   /* host: a vk_img / vk_tex the replay thread may still hold */
 static retired_t *g_retired; static int g_nretired, g_capretired;
+static totk_retired_filter_t g_ret_filter;
 static void retire(retired_t r) {
     if (g_nretired == g_capretired) { g_capretired = g_capretired ? 2 * g_capretired : 64; g_retired = realloc(g_retired, (size_t)g_capretired * sizeof *g_retired); }
-    r.after = mtl_last_fence() + 1;   /* the submission being recorded now */
+    r.after = mtl_last_fence() + 1;
+    totk_retired_add(&g_ret_filter, (uint64_t)(uintptr_t)r.bv_buffer, (uint64_t)(uintptr_t)r.img);
     g_retired[g_nretired++] = r;
 }
 /* The game finalises textures on its own threads while the replay thread may be recording with them, so the host
@@ -432,12 +434,16 @@ void vk_res_buffer_released(VkBuffer buffer) {
         x->tb_offset = x->tb_range = 0;
         sub_n++;
     }
-    for (int i = 0; i < g_nretired; ) {
-        retired_t *r = &g_retired[i];
-        if (r->bv_buffer != buffer) { i++; continue; }
-        vkDestroyBufferView(V.dev, r->bv, NULL);
-        g_retired[i] = g_retired[--g_nretired];
-        sub_n++;
+    uint32_t ret_bv_sub = 0u;
+    if (!totk_vk_touch_alias_fast_on() || totk_retired_may_have_bv(&g_ret_filter, (uint64_t)(uintptr_t)buffer)) {
+        for (int i = 0; i < g_nretired; ) {
+            retired_t *r = &g_retired[i];
+            if (r->bv_buffer != buffer) { i++; continue; }
+            vkDestroyBufferView(V.dev, r->bv, NULL);
+            g_retired[i] = g_retired[--g_nretired];
+            sub_n++; ret_bv_sub++;
+        }
+        if (ret_bv_sub) totk_retired_sub_bv(&g_ret_filter, ret_bv_sub);
     }
     if (!totk_vk_res_samp_fast_on() || sub_n > 0u) {
         atomic_fetch_add_explicit(&g_tex_serial_gen, 1u, memory_order_release);
@@ -449,20 +455,23 @@ void vk_res_buffer_released(VkBuffer buffer) {
 void vk_res_sweep(void) {   /* nvn_vk.c, after each commit */
     uint64_t start = host_now_ns();
     pthread_mutex_lock(&g_tex_mu);
+    uint32_t ret_bv_sub = 0u, ret_img_sub = 0u;
     for (int i = 0; i < g_nretired; ) {
         vk_rec_service_check();
-        if (i >= g_nretired) break; /* a serviced readback may compact retired buffer views through slot reuse */
+        if (i >= g_nretired) break;
         retired_t *r = &g_retired[i];
         if (!mtl_wait(r->after, 0)) { i++; continue; }
         if (r->img && r->host) texcopy_retire(r->host, "destroy");
         for (int v = 0; v < r->nviews; v++) vkDestroyImageView(V.dev, r->views[v].v, NULL);
         free(r->views);
-        if (r->img) vkDestroyImage(V.dev, r->img, NULL);
+        if (r->img) { vkDestroyImage(V.dev, r->img, NULL); ret_img_sub++; }
         vk_mem_free(&r->mem);
-        if (r->bv) { if (r->bv_buffer) totk_tb_note_sub(&g_tb_tracker, 1u); vkDestroyBufferView(V.dev, r->bv, NULL); }
+        if (r->bv) { if (r->bv_buffer) { totk_tb_note_sub(&g_tb_tracker, 1u); ret_bv_sub++; } vkDestroyBufferView(V.dev, r->bv, NULL); }
         free(r->host);
         g_retired[i] = g_retired[--g_nretired];
     }
+    if (ret_bv_sub) totk_retired_sub_bv(&g_ret_filter, ret_bv_sub);
+    if (ret_img_sub) totk_retired_sub_img(&g_ret_filter, ret_img_sub);
     wb_sweep_locked();
     wb_age_locked();
     /* shared images nobody holds for a while (the game re-creates per-frame textures at the same storage) */
@@ -559,7 +568,8 @@ void vk_texcopy_image(const char *op, const char *side, const tex_t *t, vk_tex *
     int pinned = t && dm_nvn_pin_has_serial ? dm_nvn_pin_has_serial(t->serial) : -1;
     int finalized = t ? totk_texcopy_finalized(t->serial) : -1;
     pthread_mutex_lock(&g_tex_mu);
-    if (x && x->im) for (int i = 0; i < g_nretired; i++) if (g_retired[i].img == x->im->img) { retired = 1; break; }
+    if (x && x->im && (!totk_vk_touch_alias_fast_on() || totk_retired_may_have_img(&g_ret_filter, (uint64_t)(uintptr_t)x->im->img)))
+        for (int i = 0; i < g_nretired; i++) if (g_retired[i].img == x->im->img) { retired = 1; break; }
     totk_texcopy_log(vk_submit_serial(), "phase=image op=%s side=%s ser=%llu mem=%p image=%#llx mirrored=%d cpu_pool=%d shared=%d gpu_written=%d pin=%d finalized=%d live_ser=%llu retired=%d",
         op, side, (unsigned long long)(t ? t->serial : 0), t ? (void *)t->mem : NULL,
         (unsigned long long)(uintptr_t)(x && x->im ? x->im->img : VK_NULL_HANDLE),
@@ -1648,9 +1658,11 @@ static void wb_memory_locked(uint64_t v[5]) {
     v[1] = (uint64_t)g_wb_history.cap * (sizeof(wb_hist_key) + sizeof(void *)) +
         (uint64_t)g_wb_history.n * sizeof(wb_history);
     v[2] = v[3] = 0; v[4] = g_wb_history.n;
+    totk_ptr_set256_t seen = {0}; int use_set = totk_vk_touch_alias_fast_on() && g_nwb <= 192;
     for (int i = 0; i < g_nwb; i++) {
         vk_img *im = g_wb[i].im; int duplicate = 0;
-        for (int j = 0; j < i; j++) if (g_wb[j].im == im) { duplicate = 1; break; }
+        if (use_set) duplicate = !totk_ptr_set256_insert(&seen, (uintptr_t)im);
+        else for (int j = 0; j < i; j++) if (g_wb[j].im == im) { duplicate = 1; break; }
         if (duplicate) continue;
         uint64_t bytes = wb_image_bytes(im); v[2] += bytes;
         if (im->shared ? !im->refs : im->orphan) v[3] += bytes;

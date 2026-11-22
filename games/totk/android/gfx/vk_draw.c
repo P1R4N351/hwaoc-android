@@ -1028,22 +1028,37 @@ void vk_pass_merge_counters(uint64_t out[4]) {
 }
 /* No rw inference: even a nominally read-only storage descriptor is a hazard. This also
    protects readers before a deferred barrier from a later storage writer (WAR). */
+static int pass_merge_tex_hazard(int st, int reg) {
+    uint64_t handle = S.tex[st][reg]; if (!handle) return 0;
+    vk_treg t; if (!vk_treg_get((int)(handle & 0xfffff), &t) || !t.t.mem || !t.t.L.size) return 1;
+    uint64_t lo = (uint64_t)(uintptr_t)t.t.mem, hi = lo + t.t.L.size; if (hi < lo) return 1;
+    for (int a = 0; S.has_rt && a < 9; a++) {
+        const tex_t *att = a < 8 ? (a < S.rt.n ? S.rt.color[a] : NULL) : S.rt.depth;
+        if (!att) continue;
+        uint64_t alo = (uint64_t)(uintptr_t)att->mem, ahi = alo + att->L.size;
+        if (att->serial == t.t.serial || !att->L.size || ahi < alo || (lo < ahi && alo < hi)) return 1;
+    }
+    return 0;
+}
 static int pass_merge_draw_hazard(vk_shader *const sh[6]) {
-    for (int st = 0; st < 2; st++) for (int i = 0; sh[st] && i < sh[st]->nb; i++) {
-        const vk_bind *b = &sh[st]->b[i];
-        if (!b->kind || b->kind == RB_IMG) return 1;
-        if (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_SAMPLER) continue;
-        if (b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
-            b->dtype != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) return 1;   /* includes dynamic storage and unknown types */
-        if (b->reg < 0 || b->reg >= 128) return 1;
-        uint64_t handle = S.tex[st][b->reg]; if (!handle) continue;   /* dummy texture */
-        vk_treg t; if (!vk_treg_get((int)(handle & 0xfffff), &t) || !t.t.mem || !t.t.L.size) return 1;
-        uint64_t lo = (uint64_t)(uintptr_t)t.t.mem, hi = lo + t.t.L.size; if (hi < lo) return 1;
-        for (int a = 0; S.has_rt && a < 9; a++) {
-            const tex_t *att = a < 8 ? (a < S.rt.n ? S.rt.color[a] : NULL) : S.rt.depth;
-            if (!att) continue;
-            uint64_t alo = (uint64_t)(uintptr_t)att->mem, ahi = alo + att->L.size;
-            if (att->serial == t.t.serial || !att->L.size || ahi < alo || (lo < ahi && alo < hi)) return 1;
+    int fast = totk_vk_touch_alias_fast_on();
+    for (int st = 0; st < 2; st++) {
+        if (!sh[st]) continue;
+        if (fast && sh[st]->touch_sum.fast) {
+            if (sh[st]->touch_sum.pm_imm_hazard) return 1;
+            for (uint64_t m = sh[st]->touch_sum.pm_tex_mask; m; m &= m - 1u) {
+                if (pass_merge_tex_hazard(st, sh[st]->b[(unsigned)__builtin_ctzll(m)].reg)) return 1;
+            }
+            continue;
+        }
+        for (int i = 0; i < sh[st]->nb; i++) {
+            const vk_bind *b = &sh[st]->b[i];
+            if (!b->kind || b->kind == RB_IMG) return 1;
+            if (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_SAMPLER) continue;
+            if (b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
+                b->dtype != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) return 1;
+            if (b->reg < 0 || b->reg >= 128) return 1;
+            if (pass_merge_tex_hazard(st, b->reg)) return 1;
         }
     }
     return 0;
@@ -1080,27 +1095,33 @@ static feedback_usage feedback_draw_usage(vk_shader *const sh[6]) {
     }
     for (unsigned st=0;st<2;st++)
         if (sh[st] && (sh[st]->has_storage_writes || sh[st]->has_storage_reads)) use.unknown=1;
-    for (unsigned st=0;st<2;st++) for (int i=0;sh[st] && i<sh[st]->nb;i++) {
-        const vk_bind *b=&sh[st]->b[i];
-        if (b->dtype==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
-            if (b->kind!=RB_SUPPORT && b->kind!=RB_CBUF && b->kind!=RB_C1 && b->kind!=RB_DRV0 && b->kind!=RB_DRV2)
-                use.unknown=1;
-            continue;
-        }
-        if (b->dtype==VK_DESCRIPTOR_TYPE_SAMPLER) continue;
-        if ((b->dtype!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
-            (b->kind!=RB_TEX && b->kind!=RB_TEXSAMP) || b->count!=1 || b->reg<0 || b->reg>=128) {
-            use.unknown=1; continue;
-        }
-        uint64_t handle=S.tex[st][b->reg]; if (!handle) continue;
-        vk_treg t;
-        if (!vk_treg_get((int)(handle&0xfffff),&t) || !t.t.mem || !t.t.L.size) { use.unknown=1; continue; }
-        for (unsigned a=0;a<9;a++) {
-            const tex_t *att=a<8 ? (a<(unsigned)S.rt.n ? S.rt.color[a] : NULL) : S.rt.depth;
-            if (!att) continue;
-            if (att->serial==t.t.serial && att->mem==t.t.mem && att->L.size==t.t.L.size)
-                use.read |= a<8 ? 1u<<a : 3u<<8; /* all levels/aspects: no view/LOD guesses */
-            else if (feedback_overlap(att,&t.t)) use.unknown=1;
+    int fast = totk_vk_touch_alias_fast_on();
+    for (unsigned st=0;st<2;st++) {
+        if (!sh[st]) continue;
+        int fmask = fast && sh[st]->touch_sum.fast;
+        if (fmask && sh[st]->touch_sum.fb_imm_unknown) use.unknown = 1;
+        uint64_t m = fmask ? sh[st]->touch_sum.fb_tex_mask : 0u;
+        for (int i=0; fmask ? (m!=0u) : (i<sh[st]->nb); ) {
+            const vk_bind *b = &sh[st]->b[fmask ? (int)__builtin_ctzll(m) : i++];
+            if (fmask) m &= m - 1u;
+            else {
+                if (b->dtype==VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
+                    if (b->kind!=RB_SUPPORT && b->kind!=RB_CBUF && b->kind!=RB_C1 && b->kind!=RB_DRV0 && b->kind!=RB_DRV2) use.unknown=1;
+                    continue;
+                }
+                if (b->dtype==VK_DESCRIPTOR_TYPE_SAMPLER) continue;
+                if ((b->dtype!=VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype!=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) ||
+                    (b->kind!=RB_TEX && b->kind!=RB_TEXSAMP) || b->count!=1 || b->reg<0 || b->reg>=128) { use.unknown=1; continue; }
+            }
+            uint64_t handle=S.tex[st][b->reg]; if (!handle) continue;
+            vk_treg t;
+            if (!vk_treg_get((int)(handle&0xfffff),&t) || !t.t.mem || !t.t.L.size) { use.unknown=1; continue; }
+            for (unsigned a=0;a<9;a++) {
+                const tex_t *att=a<8 ? (a<(unsigned)S.rt.n ? S.rt.color[a] : NULL) : S.rt.depth;
+                if (!att) continue;
+                if (att->serial==t.t.serial && att->mem==t.t.mem && att->L.size==t.t.L.size) use.read |= a<8 ? 1u<<a : 3u<<8;
+                else if (feedback_overlap(att,&t.t)) use.unknown=1;
+            }
         }
     }
     return use;
@@ -2556,16 +2577,16 @@ static void fg_extract_reads(vk_shader *const sh[6], unsigned first, unsigned en
             if (FGX.diag) FGX.diag_window.binding_overflows[FGX.binding_class]++;
             sources->value.tainted = 1; goto done;
         }
-        for (int i = 0; i < sh[st]->nb; i++) {
-            const vk_bind *b = &sh[st]->b[i];
-            if (b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
-                b->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) continue;
-            if (b->rw) continue;
+        int fast = totk_vk_touch_alias_fast_on() && sh[st]->touch_sum.fast;
+        uint64_t rm = fast ? sh[st]->touch_sum.fg_ro_img_mask : 0u;
+        for (int i = 0; fast ? (rm != 0u) : (i < sh[st]->nb); ) {
+            const vk_bind *b = &sh[st]->b[fast ? (int)__builtin_ctzll(rm) : i++];
+            if (fast) rm &= rm - 1u;
+            else if ((b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
+                      b->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) || b->rw) continue;
             uint64_t handle = b->reg < 0 ? 0 : b->kind == RB_IMG ?
                 (b->reg < 32 ? S.img[st][b->reg] : 0) : (b->reg < 128 ? S.tex[st][b->reg] : 0);
             vk_treg r;
-            /* Match the real emitter's deterministic dummy for an unbound
-               reflected slot; it cannot supply a scene dependency. */
             if (!handle) { FGX.diag_window.dummy++; continue; }
             if (!vk_treg_get((int)(handle & 0xfffff), &r)) {
                 sources->value.tainted |= FG_DEP_TAINT_IDENTITY; FGX.diag_window.missing++; continue;
@@ -5618,50 +5639,52 @@ static void dynamic_state(VkCommandBuffer cb, int prim) {
 }
 /* Every stage's writable aliases precede any read-only preparation/capture. Repeated bindings still publish
    producer invalidations: unchanged addresses do not mean unchanged GPU contents. Only mapping lookup is reusable. */
+static void storage_touch_one(int st, const vk_bind *b, int writable, int lag, int updates) {
+    if (writable && b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER && lag) {
+        int reg = b->reg;
+        uint64_t h = b->kind == RB_IMG ? (reg >= 0 && reg < 32 ? S.img[st][reg] : 0) : (reg >= 0 && reg < 128 ? S.tex[st][reg] : 0);
+        if (h) {
+            if (vk_record_enabled()) { VkDescriptorBufferInfo live; uint32_t reason; (void)vk_tbuf_by_id_record((int)(h & 0xfffff), 1, &live, &reason); }
+            else (void)vk_tbuf_by_id((int)(h & 0xfffff), 1);
+        }
+    }
+    if (b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b->reg < 0 || b->reg >= 16) return;
+    uint64_t addr = 0, size = 0;
+    if (b->kind == RB_SBUF) { addr = S.ssbo[st][b->reg].addr; size = S.ssbo[st][b->reg].size; }
+    else if (b->kind == RB_CBUF || b->kind == RB_UBO_PTR) { addr = S.ubo[st][b->reg].addr; size = S.ubo[st][b->reg].size; }
+    else if (b->kind == RB_SBUF_UBO) {
+        const p_bind_buf *u = &S.ubo[st][b->reg];
+        if (u->addr && u->size >= (uint64_t)b->off + 8) {
+            if (vk_record_enabled()) vk_ub_read_record(u->addr + b->off, &addr, 8);
+            else vk_ub_read(u->addr + b->off, &addr, 8);
+        }
+    }
+    uint64_t known = size;
+    if (lag && b->extent) known = known ? MINV(known, b->extent) : b->extent;
+    if (!writable && addr && known && !vk_ub_pending(addr, known)) return;
+    VkBuffer vb; uint64_t vo, avail;
+    if (addr && vk_resolve_for(addr, 1, &vb, &vo, &avail, VK_LOOKUP_TOUCH)) {
+        uint64_t n = MINV(size ? size : avail, avail);
+        if (lag) { if (b->extent) n = MINV(n, b->extent); else if (!size) n = vk_lag_bound(addr, n); }
+        if (writable && lag) {
+            if (vk_record_enabled()) vk_gpu_write_record(addr, n);
+            else vk_gpu_write(addr, n);
+        }
+        if (updates) vk_ub_touch(addr, n);
+    }
+}
 static void storage_touch(int st, const vk_shader *sh, int writable) {
     if (!sh || (writable ? !sh->has_storage_writes : !sh->has_storage_reads)) return;
     int lag = vk_lag_capture_on(), updates = vk_record_updates_pending();
     if (!updates && (!writable || !lag)) return;
+    if (totk_vk_touch_alias_fast_on() && sh->touch_sum.fast) {
+        uint64_t m = writable ? (sh->touch_sum.rw_sbuf_mask | (lag ? sh->touch_sum.rw_stbuf_mask : 0u)) : sh->touch_sum.ro_sbuf_mask;
+        while (m) { storage_touch_one(st, &sh->b[(unsigned)__builtin_ctzll(m)], writable, lag, updates); m &= m - 1u; }
+        return;
+    }
     for (int i = 0; i < sh->nb; i++) {
         const vk_bind *b = &sh->b[i];
-        if (!!b->rw != writable) continue;
-        if (writable && b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER && lag) {
-            int reg = b->reg;
-            uint64_t h = b->kind == RB_IMG ? (reg >= 0 && reg < 32 ? S.img[st][reg] : 0) : (reg >= 0 && reg < 128 ? S.tex[st][reg] : 0);
-            if (h) {
-                if (vk_record_enabled()) { VkDescriptorBufferInfo live; uint32_t reason; (void)vk_tbuf_by_id_record((int)(h & 0xfffff), 1, &live, &reason); }
-                else (void)vk_tbuf_by_id((int)(h & 0xfffff), 1);
-            }
-        }
-        if (b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b->reg < 0 || b->reg >= 16) continue;
-        uint64_t addr = 0, size = 0;
-        if (b->kind == RB_SBUF) { addr = S.ssbo[st][b->reg].addr; size = S.ssbo[st][b->reg].size; }
-        else if (b->kind == RB_CBUF || b->kind == RB_UBO_PTR) { addr = S.ubo[st][b->reg].addr; size = S.ubo[st][b->reg].size; }
-        else if (b->kind == RB_SBUF_UBO) {
-            const p_bind_buf *u = &S.ubo[st][b->reg];
-            if (u->addr && u->size >= (uint64_t)b->off + 8) {
-                if (vk_record_enabled()) vk_ub_read_record(u->addr + b->off, &addr, 8);
-                else vk_ub_read(u->addr + b->off, &addr, 8);
-            }
-        }
-        /* A known readonly range with no ordered update needs neither a pool lookup nor materialization.
-           Writers must still resolve and invalidate contents on every draw, even with unchanged bindings. */
-        uint64_t known = size;
-        if (lag && b->extent) known = known ? MINV(known, b->extent) : b->extent;
-        if (!writable && addr && known && !vk_ub_pending(addr, known)) continue;
-        VkBuffer vb; uint64_t vo, avail;
-        if (addr && vk_resolve_for(addr, 1, &vb, &vo, &avail, VK_LOOKUP_TOUCH)) {
-            uint64_t n = MINV(size ? size : avail, avail);
-            if (lag) {
-                if (b->extent) n = MINV(n, b->extent);
-                else if (!size) n = vk_lag_bound(addr, n);
-            }
-            if (writable && lag) {
-                if (vk_record_enabled()) vk_gpu_write_record(addr, n);
-                else vk_gpu_write(addr, n);
-            }
-            if (updates) vk_ub_touch(addr, n);
-        }
+        if (!!b->rw == writable) storage_touch_one(st, b, writable, lag, updates);
     }
 }
 static void native_bound_update(unsigned st, int image, unsigned first, unsigned n) {
@@ -5818,26 +5841,35 @@ static void draw_uniform_prepare(vk_shader *const *sh) {
 static void draw_touch(vk_shader *const *sh, const p_draw *dw, const p_draw_idx *di) {
     for (int st = 0; st < 2; st++) storage_touch(st, sh[st], 1);
     for (int st = 0; st < 2; st++) storage_touch(st, sh[st], 0);
-    if (nvn_dirty_lag_vma_pressure()) for (int st = 0; st < 2; st++) for (int i = 0; sh[st] && i < sh[st]->nb; i++) {
-        const vk_bind *b = &sh[st]->b[i];
-        if (b->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
-            b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
-        uint64_t texture = b->kind == RB_IMG ? (b->reg >= 0 && b->reg < 32 ? S.img[st][b->reg] : 0) :
-            (b->reg >= 0 && b->reg < 128 ? S.tex[st][b->reg] : 0);
-        /* Baseline texture watches remain active during lag fallback. Realize any changed inherited
-           bindings before rendering, not while a worker packet's descriptor array is being filled. */
-        int target = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? -2 : b->target;
-        if (texture) (void)vk_tex_by_id((int)(texture & 0xfffff), &target, NULL);
+    int fast = totk_vk_touch_alias_fast_on();
+    if (nvn_dirty_lag_vma_pressure()) for (int st = 0; st < 2; st++) {
+        if (!sh[st]) continue;
+        int fmask = fast && sh[st]->touch_sum.fast;
+        uint64_t m = fmask ? sh[st]->touch_sum.vma_img_mask : 0u;
+        for (int i = 0; fmask ? (m != 0u) : (i < sh[st]->nb); ) {
+            const vk_bind *b = &sh[st]->b[fmask ? (int)__builtin_ctzll(m) : i++];
+            if (fmask) m &= m - 1u;
+            else if (b->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE &&
+                     b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) continue;
+            uint64_t texture = b->kind == RB_IMG ? (b->reg >= 0 && b->reg < 32 ? S.img[st][b->reg] : 0) :
+                (b->reg >= 0 && b->reg < 128 ? S.tex[st][b->reg] : 0);
+            int target = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? -2 : b->target;
+            if (texture) (void)vk_tex_by_id((int)(texture & 0xfffff), &target, NULL);
+        }
     }
     if (!vk_record_updates_pending()) return;
     if (vk_lag_uniform_private()) draw_uniform_prepare(sh);
-    uint32_t touched = 0;
-    for (int a = 0; a < 16; a++) if ((sh[0]->vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) {
-        unsigned stream = S.attr[a].stream & 15;
-        if (touched >> stream & 1) continue;
-        touched |= 1u << stream;
-        const NVNbufferRange *v = &S.vbuf[stream];
-        if (v->address) vk_ub_touch(v->address, v->size ? v->size : 16);
+    uint32_t touched = 0, vm = fast ? (sh[0]->vin_mask & 0xffffu) : 0u;
+    for (int a = 0; fast ? (vm != 0u) : (a < 16); ) {
+        int attr = fast ? (int)__builtin_ctz(vm) : a++;
+        if (fast) vm &= vm - 1u;
+        if ((fast || (sh[0]->vin_mask >> attr & 1)) && attr < S.nattr && S.attr[attr].fmt) {
+            unsigned stream = S.attr[attr].stream & 15;
+            if (touched >> stream & 1) continue;
+            touched |= 1u << stream;
+            const NVNbufferRange *v = &S.vbuf[stream];
+            if (v->address) vk_ub_touch(v->address, v->size ? v->size : 16);
+        }
     }
     if (di) vk_ub_touch(di->ibuf, (uint64_t)di->count * (di->itype == 0 ? 1 : di->itype == 1 ? 2 : 4));
     (void)dw;
