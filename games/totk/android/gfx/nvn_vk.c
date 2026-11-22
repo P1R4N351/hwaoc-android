@@ -1074,6 +1074,19 @@ static span_t *g_span; static span_seg_t *g_span_seg; static int *g_span_heap; s
 static _Atomic uint64_t g_span_gen = 1;   /* bumped (under g_pool_mu) with every change of the pools or aliases */
 static _Atomic uint64_t g_owner_gen = 1; /* physical buffer ownership, independent of virtual mapping churn */
 static void span_changed(void) { g_span_dirty = 1; atomic_fetch_add_explicit(&g_span_gen, 1, memory_order_release); }
+static totk_pool_map_t g_pool_map; static uint64_t g_pool_map_ogen; static int g_pool_map_dirty = 1, g_pool_map_n = -1;
+static void pool_map_sync_locked(void) {
+    uint64_t og = atomic_load_explicit(&g_owner_gen, memory_order_acquire);
+    if (!g_pool_map_dirty && g_pool_map_ogen == og && g_pool_map_n == g_npool) return;
+    totk_pool_map_clear(&g_pool_map);
+    for (int i = 0; i < g_npool; i++) {
+        const pool_ent *p = g_pools[i];
+        if (p->kind == K_OWN) totk_pool_map_put_buf(&g_pool_map, (uint64_t)(uintptr_t)p->buf, (uint64_t)p->base);
+        totk_pool_map_put_id(&g_pool_map, p->identity, i);
+        totk_pool_map_put_ls(&g_pool_map, (uint64_t)p->lo, (uint64_t)(p->hi - p->lo), i);
+    }
+    g_pool_map_ogen = og; g_pool_map_n = g_npool; g_pool_map_dirty = 0;
+}
 
 static uintptr_t page_sz(void) { static uintptr_t p; if (!p) p = (uintptr_t)getpagesize(); return p; }
 static pool_ent *own_containing(uintptr_t a, uintptr_t b) {   /* caller holds g_pool_mu */
@@ -1157,6 +1170,7 @@ static void pool_insert(pool_ent *e) {
     e->identity = ++g_pool_identity;
     if (g_npool == g_cappool) { g_cappool = g_cappool ? 2 * g_cappool : 64; g_pools = VK_REALLOC(g_pools, (size_t)g_cappool * sizeof *g_pools); }
     g_pools[g_npool++] = e;
+    g_pool_map_dirty = 1;
 }
 static void add_range(const void *mem, uint64_t size, int virt) {
     mtl_init();
@@ -1184,7 +1198,7 @@ static void del_range(const void *mem, int wait_gpu) {
     /* Finalize owns recording and has waited outside the registry; no producer
        can reserve another ticket before destruction. MapVirtual keeps its old path. */
     if (!wait_gpu && !pool_gpu_quiet()) DIE("pool finalize lost recording exclusion");
-    pool_ent *e = g_pools[idx]; g_pools[idx] = g_pools[--g_npool]; span_changed();
+    pool_ent *e = g_pools[idx]; g_pools[idx] = g_pools[--g_npool]; g_pool_map_dirty = 1; span_changed();
     if (e->kind == K_VIRT) {   /* its aliases go with it (MapVirtual re-adds the pool after remapping) */
         for (int i = 0; i < g_nalias; ) { if (g_alias[i].va >= e->base && g_alias[i].end <= e->end) g_alias[i] = g_alias[--g_nalias]; else i++; }
     }
@@ -1211,7 +1225,14 @@ uint64_t vk_wb_pool_identity(const pool_t *pool, const void *address, uint64_t s
     uint64_t identity = 0; uintptr_t a = (uintptr_t)address;
     if (!pool || !pool->mem || !size || size > UINTPTR_MAX - a) return 0;
     pthread_mutex_lock(&g_pool_mu);
-    for (int i = g_npool - 1; i >= 0; i--) {
+    if (totk_vk_bind_wb_fast_on() && g_npool <= 2048) {
+        pool_map_sync_locked();
+        int32_t idx = totk_pool_map_find_ls(&g_pool_map, (uint64_t)(uintptr_t)pool->mem, pool->size);
+        if (idx >= 0 && idx < g_npool) {
+            pool_ent *p = g_pools[idx];
+            if (p->lo == (uintptr_t)pool->mem && p->hi - p->lo == pool->size && a >= p->lo && a + size <= p->hi) identity = p->identity;
+        }
+    } else for (int i = g_npool - 1; i >= 0; i--) {
         pool_ent *p = g_pools[i];
         if (p->lo == (uintptr_t)pool->mem && p->hi - p->lo == pool->size && a >= p->lo && a + size <= p->hi) {
             identity = p->identity; break;
@@ -1224,7 +1245,14 @@ int vk_wb_pool_lock(uint64_t identity, const void *address, uint64_t size) {
     uintptr_t a = (uintptr_t)address;
     if (!identity || !size || size > UINTPTR_MAX - a) return 0;
     pthread_mutex_lock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++) {
+    if (totk_vk_bind_wb_fast_on() && g_npool <= 2048) {
+        pool_map_sync_locked();
+        int32_t idx = totk_pool_map_find_id(&g_pool_map, identity);
+        if (idx >= 0 && idx < g_npool) {
+            pool_ent *p = g_pools[idx];
+            if (p->identity == identity && a >= p->lo && a + size <= p->hi) return 1;
+        }
+    } else for (int i = 0; i < g_npool; i++) {
         pool_ent *p = g_pools[i];
         if (p->identity == identity && a >= p->lo && a + size <= p->hi) return 1;
     }
@@ -3772,7 +3800,10 @@ static uint64_t lag_owner_base(VkBuffer buffer) {
     }
     uint64_t base = 0;
     pthread_mutex_lock(&g_pool_mu);
-    for (int i = 0; i < g_npool; i++)
+    if (totk_vk_bind_wb_fast_on() && g_npool <= 2048) {
+        pool_map_sync_locked();
+        base = totk_pool_map_find_buf(&g_pool_map, (uint64_t)(uintptr_t)buffer);
+    } else for (int i = 0; i < g_npool; i++)
         if (g_pools[i]->kind == K_OWN && g_pools[i]->buf == buffer) { base = g_pools[i]->base; break; }
     generation = atomic_load_explicit(&g_owner_gen, memory_order_relaxed);
     pthread_mutex_unlock(&g_pool_mu);

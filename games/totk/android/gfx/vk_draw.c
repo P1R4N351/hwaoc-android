@@ -4807,6 +4807,17 @@ int vk_draw_test_binding_bench(void) {
 }
 #endif
 static int record_uniforms_unchanged(vk_shader *sh, int stage, uint64_t revision) {
+    if (totk_vk_bind_wb_fast_on() && sh->bind_sum.ready) {
+        if (sh->bind_sum.ubo_unchanged_blocked) return 0;
+        uint32_t m = sh->bind_sum.ubo_check_mask;
+        while (m) {
+            int reg = __builtin_ctz(m); m &= m - 1u;
+            const p_bind_buf *u = &S.ubo[stage][reg];
+            uint64_t range = MINV(u->size ? u->size : 0x10000, V.props.limits.maxUniformBufferRange);
+            if (u->addr && !vk_record_uniform_unchanged(revision, u->addr, range)) return 0;
+        }
+        return 1;
+    }
     for (int i = 0; i < sh->nb; i++) {
         const vk_bind *b = &sh->b[i];
         /* Read-only storage can acquire additional frozen-content dependencies (frame-lag integration). */
@@ -4894,6 +4905,7 @@ static void pso_life_reads(const vk_shader *sh, unsigned stage) {
     if (!R.open || PL.memo_sub != sub || PL.memo_pass != g_stat_passes) {
         PL.nmemo = 0; PL.memo_sub = sub; PL.memo_pass = g_stat_passes; totk_pso_life_set_clear(PL.memo_set);
     }
+    if (totk_vk_bind_wb_fast_on() && sh->bind_sum.ready && !sh->bind_sum.has_pso_life_img) return;
     for (int i = 0; i < sh->nb; i++) {
         const vk_bind *b = &sh->b[i];
         if (b->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE && b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER &&
@@ -4991,21 +5003,107 @@ static void record_stage_fast_put(vk_shader *sh, int stage, const struct freeze_
     totk_stage_set_ref ref = {(uint64_t)(uintptr_t)set_ref->layout, (uint64_t)(uintptr_t)set_ref->update, set_ref->first, set_ref->count};
     totk_stage_freeze4_put(&g_stage_freeze4, g_stage_freeze_slots, &env, sig, bindings, &ref);
 }
+static unsigned record_stage_miss_causes(const struct freeze_key *key, const __typeof__(g_freeze_memo[0]) *last, int c1off) {
+    if (c1off) return 1u << VK_REC_M_DISABLED;
+    if (!last->valid) return 1u << VK_REC_M_COLD;
+    unsigned causes = 0;
+    if (last->key.uniforms != key->uniforms || last->key.cpu_dirty != key->cpu_dirty ||
+        last->key.dirty_epoch != key->dirty_epoch) causes |= 1u << VK_REC_M_UNIFORM;
+    if (last->key.bindings != key->bindings) causes |= 1u << VK_REC_M_BINDING;
+    if (last->key.spans != key->spans) causes |= 1u << VK_REC_M_SPAN;
+    if (last->key.chunk != key->chunk) causes |= 1u << VK_REC_M_CHUNK;
+    if (last->key.submission != key->submission) causes |= 1u << VK_REC_M_SUBMISSION;
+    if (last->key.shader != key->shader) causes |= 1u << VK_REC_M_SHADER;
+    if (last->key.resources != key->resources) causes |= 1u << VK_REC_M_REGISTRY;
+    if (last->key.samplers != key->samplers) causes |= 1u << VK_REC_M_SAMPLER;
+    if (last->key.width != key->width || last->key.height != key->height) causes |= 1u << VK_REC_M_DIMENSIONS;
+    return causes;
+}
+static void record_stage_fill_buf(vk_shader *sh, const vk_bind *b, int stage, int c1off, int storage, vk_record_descriptor *d) {
+    if (b->kind == RB_ALPHA) { alpha_desc(&d->b); return; }
+    if (b->kind == RB_SUPPORT || b->kind == RB_DRV0 || b->kind == RB_DRV2) { generated_desc(b->kind, stage, NULL, &d->b); return; }
+    if (b->kind == RB_C1) {
+        uint64_t sub = vk_submit_serial();
+        if (c1off || sh->c1_sub != sub) {
+            size_t n = (sh->c1_len + 15) & ~(size_t)15; if (!n) n = 16;
+            VkBuffer buffer; VkDeviceSize offset; void *bytes = vk_transient(n, V.props.limits.minUniformBufferOffsetAlignment, &buffer, &offset);
+            memset(bytes, 0, n); if (sh->c1_len) memcpy(bytes, sh->c1, sh->c1_len);
+            sh->c1_d = (VkDescriptorBufferInfo){buffer, offset, n}; sh->c1_sub = sub;
+        }
+        d->b = sh->c1_d; return;
+    }
+    uint64_t address = 0, size = 0;
+    if (b->reg >= 0 && b->reg < 16) {
+        if (b->kind == RB_CBUF || b->kind == RB_UBO_PTR) { address = S.ubo[stage][b->reg].addr; size = S.ubo[stage][b->reg].size; }
+        else if (b->kind == RB_SBUF) { address = S.ssbo[stage][b->reg].addr; size = S.ssbo[stage][b->reg].size; }
+        else if (b->kind == RB_SBUF_UBO) { const p_bind_buf *u = &S.ubo[stage][b->reg]; if (u->addr && u->size >= (uint64_t)b->off + 8) vk_ub_read_record(u->addr + b->off, &address, 8); }
+    }
+    if (!storage) {
+        uint64_t range = MINV(size ? size : 0x10000, V.props.limits.maxUniformBufferRange);
+        if (address && !vk_lag_uniform_read(address, range, V.props.limits.minUniformBufferOffsetAlignment, &d->b) &&
+            !vk_ub_snapshot_descriptor(address, range, &d->b)) ubo_desc(address, size, &d->b, 0, 0, b->extent, d);
+    } else if (address) {
+        if (vk_lag_capture_on() || !vk_record_storage_aligned(g_record_draw->spans, address)) ubo_desc(address, size, &d->b, 1, b->rw, b->extent, d);
+        else {
+            d->raw.address = address; d->raw.size = size;
+            if (b->rw) { VkBuffer buffer; uint64_t offset, available;
+                if (vk_record_resolve(g_record_draw->spans, address, 1, &buffer, &offset, &available, NULL))
+                    vk_gpu_write(address, MINV(size ? size : available, available));
+            }
+        }
+    }
+}
+static void record_stage_fill_one(vk_shader *sh, int stage, int c1off, int stats, const vk_bind *b, vk_record_descriptor *d) {
+    int storage = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    if (storage || b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) { record_stage_fill_buf(sh, b, stage, c1off, storage, d); return; }
+    uint64_t texture = b->reg >= 0 ? (b->kind == RB_IMG ? (b->reg < 32 ? S.img[stage][b->reg] : 0) : (b->reg < 128 ? S.tex[stage][b->reg] : 0)) : 0;
+    if (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
+        d->t = texture ? vk_tbuf_by_id_record((int)(texture & 0xfffff), b->rw, &d->lag_range, &d->lag_reason) : VK_NULL_HANDLE;
+        if (!d->t) d->t = vk_dummy_tbuf(); return;
+    }
+    if (b->dtype == VK_DESCRIPTOR_TYPE_SAMPLER) {
+        int sid = b->kind == RB_SAMP && b->reg >= 0 && b->reg < 128 ? (int)((b->sreg == -2 ? S.tex[stage][b->reg] : S.samp[stage][b->reg]) >> 20) : 0;
+        d->i.sampler = sid ? vk_samp_by_id(sid) : VK_NULL_HANDLE;
+        if (!d->i.sampler) d->i.sampler = vk_dummy_sampler(); return;
+    }
+    int want = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? -2 : b->target; vk_tex *object = NULL;
+    d->i.imageView = texture ? native_texture_by_id((int)(texture & 0xfffff), &want, &object) : VK_NULL_HANDLE;
+    if (stats) xlate_texture_view(texture, object, d->i.imageView);
+    if (b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && object) vk_tex_mark_gpu_written(object);
+    if (!d->i.imageView) d->i.imageView = vk_dummy_view(b->target, b->is_int);
+    if (b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+        int sid = b->reg >= 0 && b->reg < 128 ? (int)((b->sreg >= 0 && b->sreg < 128 ? S.samp[stage][b->sreg] : texture) >> 20) : 0;
+        d->i.sampler = sid ? vk_samp_by_id(sid) : VK_NULL_HANDLE;
+        if (!d->i.sampler) d->i.sampler = vk_dummy_sampler();
+    }
+}
+static int record_stage_publish_miss(vk_shader *sh, int stage, uint32_t set, int stats,
+                                     const struct freeze_key *key, __typeof__(g_freeze_memo[0]) *last,
+                                     vk_record_descriptor *input, uint32_t count, int cacheable, uint64_t unwatched) {
+    if (stats) xlate_selected(sh, stage, input);
+    if (vk_lag_copy_unwatched() != unwatched) { cacheable = 0; last->valid = 0; }
+    if (stats) xlate_uncacheable(sh, stage, cacheable, vk_lag_copy_unwatched() != unwatched);
+    if (R.open && count) g_record_draw->sets[set].update = vk_record_template(sh->dsl, input, count);
+    if (R.open && cacheable) {
+        if (last->cap < sh->nb) { last->cap = sh->nb; last->bindings = realloc(last->bindings, (size_t)last->cap * sizeof *last->bindings); }
+        for (int i = 0; i < sh->nb; i++) record_binding_of(&sh->b[i], stage, &last->bindings[i]);
+        last->key = *key; last->set = g_record_draw->sets[set]; last->valid = 1;
+        if (!stats && totk_vk_stage_fast_on() && sh->nb > 0 && sh->nb <= TOTK_STAGE_MAX_NB) record_stage_fast_put(sh, stage, key, last->bindings, &last->set);
+    } else if (!cacheable) vk_record_memo_miss(0, 1u << VK_REC_M_DISABLED);
+    return R.open;
+}
 /* Constant-specialized entry points keep all diagnostic work out of the normal binding walk. */
 static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh, int stage, uint32_t set, int stats) {
     static int c1off = -1; if (c1off < 0) c1off = vk_off("block");
-    struct freeze_key key;
-    memset(&key, 0, sizeof key); key.chunk = vk_record_chunk_id(); key.submission = vk_submit_serial();
+    struct freeze_key key; memset(&key, 0, sizeof key);
+    key.chunk = vk_record_chunk_id(); key.submission = vk_submit_serial();
     key.uniforms = vk_record_uniform_revision(); key.bindings = g_record_bind_revision[stage];
     key.resources = vk_treg_revision(); key.samplers = vk_record_sampler_revision();
-    /* A freeze hit bypasses the core copy memo. CPU writes through any physical alias must make it call
-       the core again; a dirty-unit birth is only lifetime identity, never a content revision. */
     if (vk_lag_capture_on()) { key.cpu_dirty = nvn_dirty_now(); key.dirty_epoch = nvn_dirty_lag_epoch(); }
     key.spans = g_record_draw->spans; key.shader = sh; key.width = R.w; key.height = R.h; key.stage = (uint32_t)stage;
     key.native_sample = g_native_sample; if (feedback_cut_refresh()) key.feedback_pass = g_stat_passes;
     if (g_native_sample) key.native_image = vk_tex_native_image(g_native_sample);
     __typeof__(g_freeze_memo[0]) *last = &g_freeze_memo[((uintptr_t)sh >> 4) % 128];
-    unsigned causes = 0;
     if (!c1off && last->valid && last->key.shader == sh && last->key.chunk == key.chunk &&
         last->key.submission == key.submission && last->key.stage == key.stage) {
         if (last->key.bindings != key.bindings) {
@@ -5025,103 +5123,20 @@ static inline __attribute__((always_inline)) int record_stage_impl(vk_shader *sh
     }
     if (!stats && !c1off && totk_vk_stage_fast_on() && sh->nb > 0 && sh->nb <= TOTK_STAGE_MAX_NB &&
         record_stage_fast_hit(sh, stage, set, &key, last)) return 1;
-    if (c1off) causes |= 1u << VK_REC_M_DISABLED;
-    else if (!last->valid) causes |= 1u << VK_REC_M_COLD;
-    else {
-        if (last->key.uniforms != key.uniforms || last->key.cpu_dirty != key.cpu_dirty ||
-            last->key.dirty_epoch != key.dirty_epoch) causes |= 1u << VK_REC_M_UNIFORM;
-        if (last->key.bindings != key.bindings) causes |= 1u << VK_REC_M_BINDING;
-        if (last->key.spans != key.spans) causes |= 1u << VK_REC_M_SPAN;
-        if (last->key.chunk != key.chunk) causes |= 1u << VK_REC_M_CHUNK;
-        if (last->key.submission != key.submission) causes |= 1u << VK_REC_M_SUBMISSION;
-        if (last->key.shader != key.shader) causes |= 1u << VK_REC_M_SHADER;
-        if (last->key.resources != key.resources) causes |= 1u << VK_REC_M_REGISTRY;
-        if (last->key.samplers != key.samplers) causes |= 1u << VK_REC_M_SAMPLER;
-        if (last->key.width != key.width || last->key.height != key.height) causes |= 1u << VK_REC_M_DIMENSIONS;
-    }
+    unsigned causes = record_stage_miss_causes(&key, last, c1off);
     if (stats) xlate_stage(sh, stage, &key, 0, c1off, NULL);
-    vk_record_memo_miss(0, causes);
-    g_record_freeze_misses++;
-    int cacheable = !c1off;
-    uint32_t count = 0; for (int i = 0; i < sh->nb; i++) { count += sh->b[i].count; if (sh->b[i].rw) cacheable = 0; }
+    vk_record_memo_miss(0, causes); g_record_freeze_misses++;
+    int cacheable = !c1off; uint32_t count = 0;
+    if (totk_vk_bind_wb_fast_on() && sh->bind_sum.ready) { count = sh->bind_sum.desc_total_count; if (sh->bind_sum.has_any_rw) cacheable = 0; }
+    else for (int i = 0; i < sh->nb; i++) { count += sh->b[i].count; if (sh->b[i].rw) cacheable = 0; }
     uint64_t unwatched = vk_lag_copy_unwatched();
     vk_record_descriptor *input = vk_record_descriptors(g_record_draw, set, sh->dsl, count);
     for (int i = 0, k = 0; i < sh->nb; i++) for (int e = 0; e < sh->b[i].count; e++, k++) {
-        const vk_bind *b = &sh->b[i]; vk_record_descriptor *d = &input[k];
-        d->binding = b->binding; d->element = (uint32_t)e; d->type = (VkDescriptorType)b->dtype;
-        int storage = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        if (storage || b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER) {
-            if (b->kind == RB_ALPHA) { alpha_desc(&d->b); continue; }
-            if (b->kind == RB_SUPPORT || b->kind == RB_DRV0 || b->kind == RB_DRV2) { generated_desc(b->kind, stage, NULL, &d->b); continue; }
-            if (b->kind == RB_C1) {
-                uint64_t sub = vk_submit_serial();
-                if (c1off || sh->c1_sub != sub) {
-                    size_t n = (sh->c1_len + 15) & ~(size_t)15; if (!n) n = 16;
-                    VkBuffer buffer; VkDeviceSize offset; void *bytes = vk_transient(n, V.props.limits.minUniformBufferOffsetAlignment, &buffer, &offset);
-                    memset(bytes, 0, n); if (sh->c1_len) memcpy(bytes, sh->c1, sh->c1_len);
-                    sh->c1_d = (VkDescriptorBufferInfo){buffer, offset, n}; sh->c1_sub = sub;
-                }
-                d->b = sh->c1_d; continue;
-            }
-            uint64_t address = 0, size = 0;
-            if (b->reg >= 0 && b->reg < 16) {
-                if (b->kind == RB_CBUF || b->kind == RB_UBO_PTR) { address = S.ubo[stage][b->reg].addr; size = S.ubo[stage][b->reg].size; }
-                else if (b->kind == RB_SBUF) { address = S.ssbo[stage][b->reg].addr; size = S.ssbo[stage][b->reg].size; }
-                else if (b->kind == RB_SBUF_UBO) { const p_bind_buf *u = &S.ubo[stage][b->reg]; if (u->addr && u->size >= (uint64_t)b->off + 8) vk_ub_read_record(u->addr + b->off, &address, 8); }
-            }
-            if (!storage) {
-                uint64_t range = MINV(size ? size : 0x10000, V.props.limits.maxUniformBufferRange);
-                if (address && !vk_lag_uniform_read(address, range, V.props.limits.minUniformBufferOffsetAlignment, &d->b) &&
-                    !vk_ub_snapshot_descriptor(address, range, &d->b)) ubo_desc(address, size, &d->b, 0, 0, b->extent, d);
-            } else if (address) {
-                /* Lag registration/capture belongs to the walk, once per actual submission (freeze key above).
-                   Wait mode keeps a live descriptor; copy mode returns the immutable arena override. */
-                if (vk_lag_capture_on() || !vk_record_storage_aligned(g_record_draw->spans, address)) ubo_desc(address, size, &d->b, 1, b->rw, b->extent, d);
-                else {
-                    d->raw.address = address; d->raw.size = size;
-                    if (b->rw) { VkBuffer buffer; uint64_t offset, available;
-                        if (vk_record_resolve(g_record_draw->spans, address, 1, &buffer, &offset, &available, NULL))
-                            vk_gpu_write(address, MINV(size ? size : available, available));
-                    }
-                }
-            }
-            continue;
-        }
-        uint64_t texture = b->reg >= 0 ? (b->kind == RB_IMG ? (b->reg < 32 ? S.img[stage][b->reg] : 0) : (b->reg < 128 ? S.tex[stage][b->reg] : 0)) : 0;
-        if (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
-            d->t = texture ? vk_tbuf_by_id_record((int)(texture & 0xfffff), b->rw, &d->lag_range, &d->lag_reason) : VK_NULL_HANDLE;
-            if (!d->t) d->t = vk_dummy_tbuf(); continue;
-        }
-        if (b->dtype == VK_DESCRIPTOR_TYPE_SAMPLER) {
-            int sid = b->kind == RB_SAMP && b->reg >= 0 && b->reg < 128 ? (int)((b->sreg == -2 ? S.tex[stage][b->reg] : S.samp[stage][b->reg]) >> 20) : 0;
-            d->i.sampler = sid ? vk_samp_by_id(sid) : VK_NULL_HANDLE;
-            if (!d->i.sampler) d->i.sampler = vk_dummy_sampler(); continue;
-        }
-        int want = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? -2 : b->target; vk_tex *object = NULL;
-        d->i.imageView = texture ? native_texture_by_id((int)(texture & 0xfffff), &want, &object) : VK_NULL_HANDLE;
-        if (stats) xlate_texture_view(texture, object, d->i.imageView);
-        if (b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && object) vk_tex_mark_gpu_written(object);
-        if (!d->i.imageView) d->i.imageView = vk_dummy_view(b->target, b->is_int);
-        if (b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
-            int sid = b->reg >= 0 && b->reg < 128 ? (int)((b->sreg >= 0 && b->sreg < 128 ? S.samp[stage][b->sreg] : texture) >> 20) : 0;
-            d->i.sampler = sid ? vk_samp_by_id(sid) : VK_NULL_HANDLE;
-            if (!d->i.sampler) d->i.sampler = vk_dummy_sampler();
-        }
+        vk_record_descriptor *d = &input[k];
+        d->binding = sh->b[i].binding; d->element = (uint32_t)e; d->type = (VkDescriptorType)sh->b[i].dtype;
+        record_stage_fill_one(sh, stage, c1off, stats, &sh->b[i], d);
     }
-    if (stats) xlate_selected(sh, stage, input);
-    /* A positive copy without complete CPU write-watch authority cannot be reused by a stage freeze,
-       even when every observable revision is unchanged. The core reports those selections without
-       requiring another alias scan here. */
-    if (vk_lag_copy_unwatched() != unwatched) { cacheable = 0; last->valid = 0; }
-    if (stats) xlate_uncacheable(sh, stage, cacheable, vk_lag_copy_unwatched() != unwatched);
-    if (R.open && count) g_record_draw->sets[set].update = vk_record_template(sh->dsl, input, count);
-    if (R.open && cacheable) {
-        if (last->cap < sh->nb) { last->cap = sh->nb; last->bindings = realloc(last->bindings, (size_t)last->cap * sizeof *last->bindings); }
-        for (int i = 0; i < sh->nb; i++) record_binding_of(&sh->b[i], stage, &last->bindings[i]);
-        last->key = key; last->set = g_record_draw->sets[set]; last->valid = 1;
-        if (!stats && totk_vk_stage_fast_on() && sh->nb > 0 && sh->nb <= TOTK_STAGE_MAX_NB) record_stage_fast_put(sh, stage, &key, last->bindings, &last->set);
-    } else if (!cacheable) vk_record_memo_miss(0, 1u << VK_REC_M_DISABLED);
-    return R.open;
+    return record_stage_publish_miss(sh, stage, set, stats, &key, last, input, count, cacheable, unwatched);
 }
 static VkDescriptorSet dsc_resolve(vk_shader *sh, dinfo *info, size_t total, uint64_t sub, int dsoff) {
     uint64_t h[2] = {0xcbf29ce484222325ull, 0x6a09e667f3bcc909ull};

@@ -1048,6 +1048,7 @@ static wb_tile g_wb_tiles[WB_TILE_MAX];
 static unsigned g_wb_ntiles, g_wb_tile_next;
 static uint64_t g_wb_tile_version, g_wb_tile_invalidates, g_wb_tile_stale;
 static _Atomic uint64_t g_wb_tile_lo = UINT64_MAX, g_wb_tile_hi;
+static totk_wb_tile_idx_t g_wb_tile_idx;
 static int wb_tile_match(const tex_t *t) {
     return t->d.width == 260 && t->d.height == 260 && t->d.format == 0xd && t->d.levels == 9;
 }
@@ -1060,25 +1061,36 @@ static void wb_tile_log(const wb_tile *d, const char *event, uint64_t sub, uint6
         (unsigned long long)d->staged, d->reason, d->landed == d->version,
         (void *)(uintptr_t)address, (unsigned long long)n);
 }
+static unsigned wb_tile_slot_locked(uint64_t address, uint64_t pool, int fast, uint64_t *old_addr, uint64_t *old_size) {
+    unsigned i = g_wb_ntiles; uint16_t si = 0u;
+    if (fast && totk_wb_tile_find_ap(&g_wb_tile_idx, address, pool, &si) && si < g_wb_ntiles) i = si;
+    else if (!fast) for (i = 0; i < g_wb_ntiles; i++) if (g_wb_tiles[i].address == address && g_wb_tiles[i].pool == pool) break;
+    if (i < g_wb_ntiles) {
+        *old_addr = g_wb_tiles[i].address; *old_size = g_wb_tiles[i].size;
+        if (fast && g_wb_tiles[i].version) totk_wb_tile_del_ver(&g_wb_tile_idx, g_wb_tiles[i].version);
+        return i;
+    }
+    if (g_wb_ntiles < WB_TILE_MAX) { i = g_wb_ntiles++; }
+    else {
+        i = g_wb_tile_next++ % WB_TILE_MAX; *old_addr = g_wb_tiles[i].address; *old_size = g_wb_tiles[i].size;
+        if (fast) { totk_wb_tile_del_ap(&g_wb_tile_idx, g_wb_tiles[i].address, g_wb_tiles[i].pool); totk_wb_tile_del_ver(&g_wb_tile_idx, g_wb_tiles[i].version); }
+    }
+    g_wb_tiles[i] = (wb_tile){0};
+    return i;
+}
 static uint64_t wb_tile_note(const vk_tex *x) {
     if (!wb_tile_match(&x->t)) return 0;
-    uint64_t address = (uintptr_t)x->t.mem, sub = vk_submit_serial();
+    uint64_t address = (uintptr_t)x->t.mem, sub = vk_submit_serial(), old_addr = 0, old_size = 0;
     uint64_t pool = vk_wb_pool_identity(x->t.pool, x->t.mem, x->t.L.size);
+    int fast = totk_vk_bind_wb_fast_on();
     pthread_mutex_lock(&g_wb_lookup_mu);
-    unsigned i = 0;
-    for (; i < g_wb_ntiles; i++) if (g_wb_tiles[i].address == address && g_wb_tiles[i].pool == pool) break;
-    uint64_t old_addr = 0, old_size = 0;
-    if (i < g_wb_ntiles) { old_addr = g_wb_tiles[i].address; old_size = g_wb_tiles[i].size; }
-    if (i == g_wb_ntiles) {
-        if (g_wb_ntiles < WB_TILE_MAX) g_wb_ntiles++;
-        else { i = g_wb_tile_next++ % WB_TILE_MAX; old_addr = g_wb_tiles[i].address; old_size = g_wb_tiles[i].size; }
-        g_wb_tiles[i] = (wb_tile){0};
-    }
+    unsigned i = wb_tile_slot_locked(address, pool, fast, &old_addr, &old_size);
     wb_tile *d = &g_wb_tiles[i];
     d->address = address; d->size = x->t.L.size; d->pool = pool; d->serial = x->t.serial;
     totk_wb_sum_replace(&g_wb_tile_sum, old_addr, old_size, d->address, d->size);
     d->image = (uintptr_t)x->im->img; d->version = ++g_wb_tile_version; d->write_sub = sub;
     d->reason = "pending"; d->staged = 0;
+    if (fast) { totk_wb_tile_put_ap(&g_wb_tile_idx, address, pool, (uint16_t)i); totk_wb_tile_put_ver(&g_wb_tile_idx, d->version, (uint16_t)i); }
     if (address < atomic_load(&g_wb_tile_lo)) atomic_store(&g_wb_tile_lo, address);
     if (address + d->size > atomic_load(&g_wb_tile_hi)) atomic_store(&g_wb_tile_hi, address + d->size);
     uint64_t version = d->version;
@@ -1087,9 +1099,16 @@ static uint64_t wb_tile_note(const vk_tex *x) {
 }
 static void wb_tile_event(uint64_t version, const char *reason, int landed, int staged) {
     if (!version) return;
-    wb_tile snapshot = {0};
+    wb_tile snapshot = {0}; uint16_t si = 0u;
     pthread_mutex_lock(&g_wb_lookup_mu);
-    for (unsigned i = 0; i < g_wb_ntiles; i++) {
+    if (totk_vk_bind_wb_fast_on()) {
+        if (totk_wb_tile_find_ver(&g_wb_tile_idx, version, &si) && si < g_wb_ntiles) {
+            wb_tile *d = &g_wb_tiles[si]; d->reason = reason;
+            if (landed) { d->landed = version; d->land_sub = vk_submit_serial(); }
+            if (staged) d->staged = version;
+            snapshot = *d;
+        }
+    } else for (unsigned i = 0; i < g_wb_ntiles; i++) {
         wb_tile *d = &g_wb_tiles[i]; if (d->version != version) continue;
         d->reason = reason;
         if (landed) { d->landed = version; d->land_sub = vk_submit_serial(); }
@@ -1315,6 +1334,7 @@ static void wb_note_locked(vk_tex *x) {
 /* GPU copies into guest storage are newer than any rendering covering it. */
 void vk_wb_gpu_wrote(uint64_t a, uint64_t n) {
     if (!n || a >= atomic_load(&g_wb_hi) || a + n <= atomic_load(&g_wb_lo)) return;
+    if (totk_vk_bind_wb_fast_on() && !totk_wb_sum_may_overlap(&g_wb_sum, a, n)) return;
     pthread_mutex_lock(&g_tex_mu);
     for (int i = 0; i < g_nwb; ) {
         if (!g_wb[i].cancelled && wb_overlap(&g_wb[i], a, n)) {

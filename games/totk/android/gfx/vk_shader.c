@@ -547,6 +547,17 @@ static vk_shader *shader_fail_cleanup(char *spv, vk_shader *sh) {
     return NULL;
 }
 
+static void shader_build_bind_sum(vk_shader *sh) {
+    for (int i = 0; i < sh->nb; i++) {
+        const vk_bind *b = &sh->b[i];
+        int blk = b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
+        int ucb = b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && (b->kind == RB_CBUF || b->kind == RB_UBO_PTR);
+        int pimg = b->dtype == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE || b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        totk_sh_bind_sum_add(&sh->bind_sum, b->count, b->rw, blk, ucb, b->reg, pimg);
+    }
+    totk_sh_bind_sum_finish(&sh->bind_sum);
+}
+
 static vk_shader *shader_load(const char *variant, int early_tests) {
     pthread_once(&g_position_once, position_init); pthread_once(&g_int_fold_once, int_fold_init);
     shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant);
@@ -579,6 +590,7 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     r = vkCreateDescriptorSetLayout(V.dev, &dci, NULL, &sh->dsl); if (heap_lb) free(lb);
     if (r) { RED(16, "descriptor set layout of %s: %d", variant, r); return shader_fail_cleanup(NULL, sh); }
     sh->xlate_miss_ns = vk_shader_xlate_take_miss(variant);
+    shader_build_bind_sum(sh);
     nvn_hm_put(&g_shaders, &key, sh); HK_ADD(shloads, 1); HK_ADD(shbytes, spv_len + vk_len);
     if (sh->stage == 5) vk_compute_prepare(sh);
     return sh;
