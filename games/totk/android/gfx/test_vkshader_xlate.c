@@ -66,7 +66,7 @@ int main(int argc, char **argv) {
             if (!saved) usleep(1000);
         }
         if (!saved) { puts("FAIL missing shader request was not persisted"); return 1; }
-        if (vk_seed_io_active()) { vk_seed_io_stats stats; vk_seed_io_stats_get(&stats); if (stats.inline_reads) return 1; }
+        if (vk_seed_io_active()) { vk_seed_io_stats stats; vk_seed_io_stats_get(&stats); if (stats.demand_reads) return 1; }
         puts("disabled/absent translator retained PC request and skipped missing dispatch"); return 0;
     }
     /* Unchanged program/signature must stop returning its cached miss after publication. */

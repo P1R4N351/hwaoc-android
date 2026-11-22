@@ -2,6 +2,7 @@
  * to replay; shader/module/layout maps stay startup/recording-thread owned. */
 #include "vk_int.h"
 #include "vk_compute_store.h"
+#include "vk_compute_fast.h"
 #include "vk_ktgl_memo.h"
 #include "vk_overlay.h"
 #include "nvn_hmap.h"
@@ -20,11 +21,15 @@ typedef struct compute_entry {
     VkPipeline pipeline;
     int state, learned;
     struct compute_entry *next;
+    totk_cp_q_node_t q;
 } compute_entry;
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t cv = PTHREAD_COND_INITIALIZER;
 static nvn_hmap pipes = {.klen = COMPUTE_KEY_BYTES};
 static compute_entry *head, *tail;
+static totk_cp_queue_t cp_q;
+static totk_cp_hist_t cp_hist;
+static totk_cp_prep_memo_t cp_prep;
 static pthread_t thread;
 static int started, running, stopping, stats_on, dirty;
 static uint64_t save_after;
@@ -36,11 +41,11 @@ static uint32_t count;
 static compute_header identity;
 static _Atomic uint64_t blocking_ns, build_ns;
 static struct { uint64_t background, recording, joins, ready, total, maximum, failures; } window;
+static _Atomic uint32_t waiters, worker_sleeping;
 #ifdef TOTK_VK_TESTS
-static unsigned waiters;
 void vk_compute_test_counts(uint64_t out[4]) {
     pthread_mutex_lock(&mu);
-    out[0] = window.recording; out[1] = window.background; out[2] = count; out[3] = waiters;
+    out[0] = window.recording; out[1] = window.background; out[2] = count; out[3] = atomic_load_explicit(&waiters, memory_order_relaxed);
     pthread_mutex_unlock(&mu);
 }
 #endif
@@ -48,17 +53,20 @@ void vk_compute_test_counts(uint64_t out[4]) {
 uint64_t vk_compute_pipe_cum_ns(void) { return atomic_load_explicit(&blocking_ns, memory_order_relaxed); }
 uint64_t vk_compute_pipe_build_ns(void) { return atomic_load_explicit(&build_ns, memory_order_relaxed); }
 static void enqueue(compute_entry *e) { /* mu; exactly one builder owns each entry */
-    e->state = CP_QUEUED; e->next = NULL;
-    if (tail) tail->next = e; else head = e;
-    tail = e; pthread_cond_broadcast(&cv);
+    int fast = totk_vk_compute_fast_on();
+    e->state = CP_QUEUED;
+    if (fast) totk_cp_q_push(&cp_q, &e->q);
+    else { e->next = NULL; if (tail) tail->next = e; else head = e; tail = e; }
+    totk_cp_wake_enqueue(&cv, &waiters, &worker_sleeping, fast);
 }
 static void promote(compute_entry *e) { /* mu; active dispatch outranks speculative/learned keys */
-    if (e->state != CP_QUEUED || head == e) return;
+    if (e->state != CP_QUEUED) return;
+    if (totk_vk_compute_fast_on()) { totk_cp_q_promote(&cp_q, &e->q); return; }
+    if (head == e) return;
     compute_entry *previous = head;
     while (previous && previous->next != e) previous = previous->next;
     if (!previous) return;
-    previous->next = e->next; if (tail == e) tail = previous;
-    e->next = head; head = e;
+    previous->next = e->next; if (tail == e) tail = previous; e->next = head; head = e;
 }
 static void build(compute_entry *e, int background) {
     VkComputePipelineCreateInfo ci = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
@@ -93,14 +101,14 @@ static void build(compute_entry *e, int background) {
             background ? "background" : "recording", e->shader->key, e->shader->spv_bytes,
             e->shader->local[0], e->shader->local[1], e->shader->local[2], elapsed / 1e6, result);
     }
-    pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mu);
+    totk_cp_wake_built(&cv, &waiters, totk_vk_compute_fast_on()); pthread_mutex_unlock(&mu);
     vk_pipe_boost_restore(&done);
 }
 static void save(void) { /* mu held; payload snapshot and fsync never on recording */
     char (*copy)[COMPUTE_KEY_BYTES] = count ? malloc((size_t)count * COMPUTE_KEY_BYTES) : NULL;
     if (count && !copy) return;
     uint32_t n = count;
-    if (n) memcpy(copy, history, (size_t)n * COMPUTE_KEY_BYTES);
+    if (n) { if (totk_vk_compute_fast_on()) totk_cp_hist_snapshot(&cp_hist, copy); else memcpy(copy, history, (size_t)n * COMPUTE_KEY_BYTES); }
     dirty = 0;
     pthread_mutex_unlock(&mu);
     int ok = compute_history_save(path, identity, (const char (*)[COMPUTE_KEY_BYTES])copy, n);
@@ -113,17 +121,18 @@ static void *worker(void *unused) {
     pthread_mutex_lock(&mu);
     lend.tid = vk_thread_tid();
     for (;;) {
-        if (head) {
-            compute_entry *e = head; head = e->next; if (!head) tail = NULL;
-            e->next = NULL; e->state = CP_BUILDING;
+        if (totk_vk_compute_fast_on() ? (cp_q.head != NULL) : (head != NULL)) {
+            compute_entry *e = NULL;
+            if (totk_vk_compute_fast_on()) { totk_cp_q_node_t *qn = totk_cp_q_pop(&cp_q); e = (compute_entry *)((char *)qn - offsetof(compute_entry, q)); }
+            else { e = head; head = e->next; if (!head) tail = NULL; e->next = NULL; }
+            e->state = CP_BUILDING;
             pthread_mutex_unlock(&mu); build(e, 1); pthread_mutex_lock(&mu); continue;
         }
         if (dirty && (stopping || host_now_ns() >= save_after)) save();
         if (stopping) break;
-        if (dirty) {
-            struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec++;
-            pthread_cond_timedwait(&cv, &mu, &until);
-        } else pthread_cond_wait(&cv, &mu);
+        atomic_fetch_add_explicit(&worker_sleeping, 1u, memory_order_relaxed);
+        if (dirty) { struct timespec until; clock_gettime(CLOCK_REALTIME, &until); until.tv_sec++; pthread_cond_timedwait(&cv, &mu, &until); } else pthread_cond_wait(&cv, &mu);
+        atomic_fetch_sub_explicit(&worker_sleeping, 1u, memory_order_relaxed);
     }
     pthread_mutex_unlock(&mu); return NULL;
 }
@@ -131,6 +140,7 @@ static vk_cs_memo g_cs_memo;
 static int cs_memo_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
 static compute_entry *compute_prepare_locked(vk_shader *cs) {
     compute_entry *e = nvn_hm_get(&pipes, cs->key);
+    if (e && totk_vk_compute_fast_on()) totk_cp_prep_memo_put_locked(&cp_prep, cs->key);
     if (!e) {
         e = calloc(1, sizeof *e); if (!e) DIE("compute pipeline entry allocation");
         e->shader = cs; e->layout = vk_layout_of(cs, NULL);
@@ -141,6 +151,7 @@ static compute_entry *compute_prepare_locked(vk_shader *cs) {
 }
 void vk_compute_prepare(vk_shader *cs) {
     if (!cs || cs->stage != 5) return;
+    if (totk_vk_compute_fast_on() && totk_cp_prep_memo_seen(&cp_prep, cs->key)) return;
     /* All callers are startup/replay. Precreate layouts here, never on worker. */
     pthread_mutex_lock(&mu);
     (void)compute_prepare_locked(cs);
@@ -151,7 +162,7 @@ void vk_compute_stop(void) {
     if (!running || stopping) { pthread_mutex_unlock(&mu); return; }
     stopping = 1; pthread_cond_broadcast(&cv); pthread_mutex_unlock(&mu);
     pthread_join(thread, NULL);
-    pthread_mutex_lock(&mu); running = 0; pthread_mutex_unlock(&mu);
+    pthread_mutex_lock(&mu); running = 0; totk_cp_prep_memo_reset(&cp_prep); pthread_mutex_unlock(&mu);
 }
 void vk_compute_start(void) { /* Vulkan device ready, before replay */
     if (started) return;
@@ -165,7 +176,8 @@ void vk_compute_start(void) { /* Vulkan device ready, before replay */
     int loaded = compute_history_load(path, identity, &keys);
     history = calloc(COMPUTE_KEYS_MAX, COMPUTE_KEY_BYTES);
     if (!history) DIE("compute history allocation");
-    if (loaded > 0) { count = (uint32_t)loaded; memcpy(history, keys, (size_t)count * COMPUTE_KEY_BYTES); }
+    totk_cp_hist_reset(&cp_hist, history);
+    if (loaded > 0) { count = (uint32_t)loaded; memcpy(history, keys, (size_t)count * COMPUTE_KEY_BYTES); totk_cp_hist_load_bulk(&cp_hist, count); }
     free(keys);
     if (loaded < 0) LOGV("[compute-prewarm] ignored %s: corrupt/incomplete or incompatible version/device/driver", path);
     running = !pthread_create(&thread, NULL, worker, NULL);
@@ -196,15 +208,18 @@ VkPipeline vk_compute_pipeline(vk_shader *cs, VkPipelineLayout *layout) {
     if (!e->learned) {
         e->learned = 1;
         /* Bounded exact-key set. Full histories replace the oldest discovered key. */
-        uint32_t i;
-        for (i = 0; i < count; i++) if (!memcmp(history[i], cs->key, COMPUTE_KEY_BYTES)) break;
-        if (i == count) {
-            if (count == COMPUTE_KEYS_MAX) { memmove(history, history + 1, (COMPUTE_KEYS_MAX - 1) * COMPUTE_KEY_BYTES); i--; }
-            else count++;
-            memcpy(history[i], cs->key, COMPUTE_KEY_BYTES);
-            if (!dirty) save_after = host_now_ns() + UINT64_C(5000000000);
-            dirty = 1; pthread_cond_signal(&cv);
+        int learned_new = 0;
+        if (totk_vk_compute_fast_on()) { learned_new = totk_cp_hist_learn(&cp_hist, cs->key); count = cp_hist.count; }
+        else {
+            uint32_t i;
+            for (i = 0; i < count; i++) if (!memcmp(history[i], cs->key, COMPUTE_KEY_BYTES)) break;
+            if (i == count) {
+                if (count == COMPUTE_KEYS_MAX) { memmove(history, history + 1, (COMPUTE_KEYS_MAX - 1) * COMPUTE_KEY_BYTES); i--; }
+                else count++;
+                memcpy(history[i], cs->key, COMPUTE_KEY_BYTES); learned_new = 1;
+            }
         }
+        if (learned_new) { if (!dirty) save_after = host_now_ns() + UINT64_C(5000000000); dirty = 1; pthread_cond_signal(&cv); }
     }
     *layout = e->layout;
     uint64_t began = 0;
@@ -216,13 +231,9 @@ VkPipeline vk_compute_pipeline(vk_shader *cs, VkPipelineLayout *layout) {
         while (e->state == CP_QUEUED || e->state == CP_BUILDING) {
             /* The single worker may still be finishing an earlier entry; the loan covers it and ends with this one. */
             if (!refused) { int lent = vk_pipe_boost_lend(&lend); if (lent > 0) lend_for = e; else if (lent < 0) refused = 1; }
-#ifdef TOTK_VK_TESTS
-            waiters++;
-#endif
+            atomic_fetch_add_explicit(&waiters, 1u, memory_order_relaxed);
             pthread_cond_wait(&cv, &mu);
-#ifdef TOTK_VK_TESTS
-            waiters--;
-#endif
+            atomic_fetch_sub_explicit(&waiters, 1u, memory_order_relaxed);
         }
         if (joined) vk_pipe_boost_waited(host_now_ns() - began);
         if (e->state != CP_READY) {

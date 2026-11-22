@@ -3,6 +3,7 @@
    which alone owns Vulkan objects and shader/program maps. Requests remain available for PC fills. */
 #include "vk_shader_xlate.h"
 #include "vk_seed_io.h"
+#include "vk_compute_fast.h"
 #include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -33,6 +34,8 @@ static int xlate_started;
 static _Atomic int xlate_stopped;
 static _Atomic uint64_t xlate_epoch;
 static _Atomic int xlate_pid;
+static _Atomic uint32_t xlate_ready_n;
+static totk_xlate_bad_fast_t g_xlate_bad_fast;
 
 static uint64_t xlate_now(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
@@ -40,10 +43,11 @@ static uint64_t xlate_now(void) {
 }
 uint64_t vk_shader_xlate_epoch(void) { return atomic_load_explicit(&xlate_epoch, memory_order_acquire); }
 uint64_t vk_shader_xlate_take_miss(const char *variant) {
+    if (totk_vk_compute_fast_on() && atomic_load_explicit(&xlate_ready_n, memory_order_acquire) == 0u) return 0;
     uint64_t miss = 0;
     pthread_mutex_lock(&xlate_mu);
     for (xlate_job **p = &xlate_ready; *p; p = &(*p)->next) if (!strcmp((*p)->variant, variant)) {
-        xlate_job *job = *p; *p = job->next; miss = job->miss_ns; free(job); break;
+        xlate_job *job = *p; *p = job->next; miss = job->miss_ns; atomic_fetch_sub_explicit(&xlate_ready_n, 1u, memory_order_release); free(job); break;
     }
     pthread_mutex_unlock(&xlate_mu);
     return miss;
@@ -172,7 +176,7 @@ static void *xlate_worker(void *unused) {
                             (double)(xlate_now() - start) / 1e6, (double)(xlate_now() - job->miss_ns) / 1e6);
                     pthread_mutex_lock(&xlate_mu);
                     free(job->request); job->request = NULL;
-                    job->next = xlate_ready; xlate_ready = job; job = NULL;
+                    job->next = xlate_ready; xlate_ready = job; atomic_fetch_add_explicit(&xlate_ready_n, 1u, memory_order_release); job = NULL;
                     pthread_mutex_unlock(&xlate_mu);
                     atomic_fetch_add_explicit(&xlate_epoch, 1, memory_order_release);
                 } else fprintf(stderr, "[shader-xlate] %s translation rejected: %s", job->variant, reply);
@@ -193,9 +197,11 @@ static void xlate_note_bad(const char *variant) {
     pthread_mutex_lock(&xlate_mu);
     if (xlate_nbad == xlate_capbad) { size_t cap = xlate_capbad ? 2 * xlate_capbad : 64; void *v = realloc(xlate_bad, cap * sizeof *xlate_bad); if (v) { xlate_bad = v; xlate_capbad = cap; } }
     if (xlate_nbad < xlate_capbad) snprintf(xlate_bad[xlate_nbad++], 80, "%s", variant);
+    totk_xlate_bad_add_locked(&g_xlate_bad_fast, variant);
     pthread_mutex_unlock(&xlate_mu);
 }
 int vk_shader_xlate_rejected(const char *variant) {
+    if (totk_vk_compute_fast_on()) { int r = totk_xlate_bad_check(&g_xlate_bad_fast, variant); if (r >= 0) return r; }
     int hit = 0;
     pthread_mutex_lock(&xlate_mu);
     for (size_t i = 0; i < xlate_nbad && !hit; i++) hit = !strcmp(xlate_bad[i], variant);
