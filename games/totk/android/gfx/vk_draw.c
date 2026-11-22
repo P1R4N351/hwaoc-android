@@ -163,7 +163,7 @@ static void state_reset(void) {
     S.poly = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0};
     S.ds = (ds_st){0, 1, NVN_DEPTH_FUNC_LESS, 0, NVN_STENCIL_FUNC_ALWAYS, NVN_STENCIL_FUNC_ALWAYS, 1, 1, 1, 1, 1, 1};
     S.st_vmask[0] = S.st_vmask[1] = S.st_wmask[0] = S.st_wmask[1] = 0xff; S.dr[1] = 1;
-    for (int i = 0; i < 6; i++) S.tex_hi[i] = 1; S.tex_nz_ready = 1;
+    for (int i = 0; i < 6; i++) S.tex_hi[i] = 1; S.tex_nz_ready = 1; S.img_nz_ready = 1;
 }
 static void pso_life_init(void);
 static void state_init(void) { static int done; if (!done) { done = 1; pso_life_init(); state_reset(); } }
@@ -1258,96 +1258,95 @@ static int rt_same(const p_set_rt *a, const p_set_rt *b) {
 }
 /* Only a proven full clear kills an attachment. Treat all bound texture/image slots as reads, including aliases
    at the same guest address; uncertainty retains the store. This also excludes feedback in the opening draw. */
-static uint32_t store_read_mask(uint64_t slots[2][160], uint32_t possible) {
+static uint32_t store_read_slot(uint64_t handle, uint32_t rem, uint32_t *done_early) {
+    vk_treg t; if (!vk_treg_get((int)(handle & 0xfffff), &t)) { *done_early = 1; return rem; }
     uint32_t read = 0;
-    for (int st = 0; st < 2; st++) for (int i = 0; i < 160 && (possible & ~read); i++) {
-        uint64_t handle = slots[st][i]; if (!handle) continue;
-        vk_treg t; if (!vk_treg_get((int)(handle & 0xfffff), &t)) return possible;
-        for (int k = 0; k < 9; k++) {
-            uint32_t bit = k < 8 ? 1u << k : 3u << 8; if (!(possible & bit)) continue;
-            const tex_t *att = k < 8 ? S.rt.color[k] : S.rt.depth;
-            if (att && (att->serial == t.t.serial || att->mem == t.t.mem)) read |= bit;
-        }
+    for (int k = 0; k < 9; k++) {
+        uint32_t bit = k < 8 ? 1u << k : 3u << 8; if (!(rem & bit)) continue;
+        const tex_t *att = k < 8 ? S.rt.color[k] : S.rt.depth;
+        if (att && (att->serial == t.t.serial || att->mem == t.t.mem)) read |= bit;
     }
     return read;
 }
-/* Dynamic rendering fixes storeOp at BEGIN, not END (unlike Metal). A future draw with this attachment would need
-   its store if an implicit split occurs, so don't elide it even when it might stay in this pass. Unrelated draws
-   may be crossed, but no copies/dispatches, calls, conditions, events, updates, submissions or unknown operations.
-   CLEAR_LOAD splits at a full clear of the exact same target set: DONT_CARE never discards the clear or later writes.
-   Bits 0..7: colors, 8: depth, 9: stencil. Pass dumps read the pre-clear pixels and always retain stores. */
+static uint32_t store_read_mask(uint64_t slots[2][160], const totk_slot160_nz_t sm[2], uint32_t possible) {
+    uint32_t read = 0, early = 0;
+    if (sm) {
+        for (int st = 0; st < 2; st++) for (int w = 0; w < 3 && (possible & ~read); w++) {
+            for (uint64_t m = sm[st].w[w]; m && (possible & ~read); m &= m - 1u) {
+                int i = (w << 6) + __builtin_ctzll(m);
+                if (i < 160 && slots[st][i]) { read |= store_read_slot(slots[st][i], possible & ~read, &early); if (early) return possible; }
+            }
+        }
+        return read;
+    }
+    for (int st = 0; st < 2; st++) for (int i = 0; i < 160 && (possible & ~read); i++) {
+        if (slots[st][i]) { read |= store_read_slot(slots[st][i], possible & ~read, &early); if (early) return possible; }
+    }
+    return read;
+}
+static uint32_t store_clear_draw_need(const p_set_rt *rt, uint64_t slots[2][160], const totk_slot160_nz_t *sm, uint32_t rem, int check_reads) {
+    uint32_t need = 0;
+    for (int k = 0; k < 9; k++) {
+        uint32_t bit = k < 8 ? 1u << k : 3u << 8; if (!(rem & bit)) continue;
+        const tex_t *t = k < 8 ? S.rt.color[k] : S.rt.depth; if (!t) continue;
+        for (int j = 0; j < 9; j++) {
+            const tex_t *u = j < 8 ? (j < rt->n ? rt->color[j] : NULL) : rt->depth;
+            if (u && (t->serial == u->serial || t->mem == u->mem)) need |= bit;
+        }
+    }
+    if (check_reads) need |= store_read_mask(slots, sm, rem & ~need);
+    return need;
+}
+static uint32_t store_clear_pass(uint64_t slots[2][160], totk_slot160_nz_t *sm, uint32_t possible, int check_reads) {
+    const uint8_t *p = vk_exec_draw_next(); const p_set_rt *rt = &S.rt; p_scissor sc = S.sc;
+    int has_sc = S.has_sc, disabled = S.render_disabled; uint32_t mask = 0, live = possible;
+    for (int guard = 0; guard < 128 && (live & ~mask); guard++) {
+        op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
+        if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) break;
+        switch (h.op) {
+        case OP_SET_RT: rt = a; break;
+        case OP_SCISSOR: sc = *(const p_scissor *)a; has_sc = 1; break;
+        case OP_RENDER_ENABLE: disabled = !((const p_flag *)a)->value; break;
+        case OP_BIND_TEX: case OP_BIND_IMG: if (check_reads) {
+            const p_bind_handles *b = a; int n = h.op == OP_BIND_TEX ? 128 : 32, base = h.op == OP_BIND_TEX ? 0 : 128;
+            if (b->stage < 0 || b->stage >= 6 || b->first < 0 || b->n < 0 || b->first + b->n > n) return mask;
+            if (b->stage < 2) { memcpy(&slots[b->stage][base + b->first], b->h, (size_t)b->n * 8); if (sm) totk_slot160_update_range(&sm[b->stage], base + b->first, b->h, b->n); }
+        } break;
+        case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_INDIRECT: case OP_DRAW_IDX_INDIRECT:
+            live &= ~store_clear_draw_need(rt, slots, sm, live & ~mask, check_reads); break;
+        case OP_CLEAR_COLOR: case OP_CLEAR_DS:
+            if (disabled || !rt_same(&S.rt, rt) || (has_sc && !(sc.x <= 0 && sc.y <= 0 && (int64_t)sc.x + sc.w >= R.w && (int64_t)sc.y + sc.h >= R.h))) break;
+            if (h.op == OP_CLEAR_COLOR) { const p_clear_color *c = a; if (c->index >= 0 && c->index < S.rt.n && c->index < 8 && (c->mask & 15) == 15) mask |= live & (1u << c->index); }
+            else { const p_clear_ds *c = a; int s_m = c->stencil_mask & 255; if (!s_m || s_m == 255) { if (c->depth_mask) mask |= live & (1u << 8); if (s_m == 255) mask |= live & (1u << 9); } } break;
+        case OP_BEGIN: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE:
+        case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO:
+        case OP_BIND_SAMP: case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_DEPTH_CLAMP:
+        case OP_RASTER_DISCARD: case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE: case OP_BARRIER: break;
+        default: return mask;
+        }
+        p += h.size;
+    }
+    return mask;
+}
 static uint32_t store_clear_mask(void) {
     if (!store_clear_on() || PD.active || !S.has_rt || !vk_exec_draw_next()) return 0;
     uint32_t possible = 0;
     for (int i = 0; i < 8; i++) if (R.ctex[i]) possible |= 1u << i;
     if (R.dfmt != VK_FORMAT_UNDEFINED) possible |= 1u << 8;
     if (R.sfmt != VK_FORMAT_UNDEFINED) possible |= 1u << 9;
-    /* Aliased slots have independent load/store operations; don't reason about their write order. */
     for (int i = 0; i < 9; i++) for (int j = 0; j < i; j++) {
-        vk_tex *x = i < 8 ? R.ctex[i] : R.dtex, *y = j < 8 ? R.ctex[j] : R.dtex;
-        if (x && x == y) return 0;
+        vk_tex *x = i < 8 ? R.ctex[i] : R.dtex, *y = j < 8 ? R.ctex[j] : R.dtex; if (x && x == y) return 0;
     }
-    /* First scan just finds candidates. Only if one exists, copy bindings and resolve their identities on the
-       second scan. Most passes reach another draw on their own attachments and return without registry lookups. */
-    uint64_t slots[2][160];
+    uint64_t slots[2][160]; totk_slot160_nz_t sm[2], *smp = NULL;
     for (int check_reads = 0; check_reads < 2; check_reads++) {
         if (check_reads) {
             for (int st = 0; st < 2; st++) { memcpy(slots[st], S.tex[st], sizeof S.tex[st]); memcpy(slots[st] + 128, S.img[st], sizeof S.img[st]); }
-            possible &= ~store_read_mask(slots, possible); if (!possible) return 0;
-        }
-        const uint8_t *p = vk_exec_draw_next();
-        const p_set_rt *rt = &S.rt; p_scissor sc = S.sc; int has_sc = S.has_sc, disabled = S.render_disabled;
-        uint32_t mask = 0, live = possible;
-        for (int guard = 0; guard < 128 && (live & ~mask); guard++) {
-            op_hdr h; memcpy(&h, p, sizeof h); const void *a = p + 8;
-            if (h.size < 8 || (h.size & 7) || h.op >= OP_COUNT_) break;
-            switch (h.op) {
-                case OP_SET_RT: rt = a; break;
-                case OP_SCISSOR: sc = *(const p_scissor *)a; has_sc = 1; break;
-                case OP_RENDER_ENABLE: disabled = !((const p_flag *)a)->value; break;
-                case OP_BIND_TEX: case OP_BIND_IMG: {
-                    if (!check_reads) break;
-                    const p_bind_handles *b = a; int n = h.op == OP_BIND_TEX ? 128 : 32, base = h.op == OP_BIND_TEX ? 0 : 128;
-                    if (b->stage < 0 || b->stage >= 6 || b->first < 0 || b->n < 0 || b->first + b->n > n) goto scanned;
-                    if (b->stage < 2) memcpy(&slots[b->stage][base + b->first], b->h, (size_t)b->n * 8);
-                    break;
-                }
-                case OP_DRAW: case OP_DRAW_IDX: case OP_DRAW_INDIRECT: case OP_DRAW_IDX_INDIRECT: {
-                    uint32_t need = 0;
-                    for (int k = 0; k < 9; k++) {
-                        uint32_t bit = k < 8 ? 1u << k : 3u << 8; if (!(live & ~mask & bit)) continue;
-                        const tex_t *t = k < 8 ? S.rt.color[k] : S.rt.depth; if (!t) continue;
-                        for (int j = 0; j < 9; j++) {
-                            const tex_t *u = j < 8 ? (j < rt->n ? rt->color[j] : NULL) : rt->depth;
-                            if (u && (t->serial == u->serial || t->mem == u->mem)) need |= bit;
-                        }
-                    }
-                    if (check_reads) need |= store_read_mask(slots, live & ~mask & ~need);
-                    live &= ~need; break;   /* even disabled draws are conservatively considered reads */
-                }
-                case OP_CLEAR_COLOR: case OP_CLEAR_DS: {
-                    if (disabled || !rt_same(&S.rt, rt)) break;
-                    if (has_sc && !(sc.x <= 0 && sc.y <= 0 && (int64_t)sc.x + sc.w >= R.w && (int64_t)sc.y + sc.h >= R.h)) break;
-                    if (h.op == OP_CLEAR_COLOR) {
-                        const p_clear_color *c = a;
-                        if (c->index >= 0 && c->index < S.rt.n && c->index < 8 && (c->mask & 15) == 15) mask |= live & (1u << c->index);
-                    } else {
-                        const p_clear_ds *c = a; int sm = c->stencil_mask & 255;
-                        if (sm && sm != 255) break;   /* clear_ds cannot move a masked stencil clear to loadOp */
-                        if (c->depth_mask) mask |= live & (1u << 8);
-                        if (sm == 255) mask |= live & (1u << 9);
-                    }
-                    break;
-                }
-                case OP_BEGIN: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_BIND_PROGRAM: case OP_BIND_STATE:
-                case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_UBO: case OP_BIND_SSBO:
-                case OP_BIND_SAMP: case OP_STENCIL: case OP_POLY_OFFSET: case OP_BLEND_COLOR: case OP_DEPTH_CLAMP:
-                case OP_RASTER_DISCARD: case OP_COPY_STRIDE: case OP_COPY_IMAGE_STRIDE: case OP_BARRIER: break;
-                default: goto scanned;
+            if (totk_vk_load_wb_fast_on() && S.tex_nz_ready && S.img_nz_ready) {
+                smp = sm; for (int st = 0; st < 2; st++) totk_slot160_from_state(&sm[st], S.tex_nz[st], S.img_nz[st]);
             }
-            p += h.size;
+            possible &= ~store_read_mask(slots, smp, possible); if (!possible) return 0;
         }
-scanned:
+        uint32_t mask = store_clear_pass(slots, smp, possible, check_reads);
         if (!mask || check_reads) return mask;
         possible = mask;
     }
@@ -1468,96 +1467,92 @@ static VkDescriptorBufferInfo g_load_geometry;
 static unsigned g_load_stream;
 static int g_load_override;
 static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLayout layout);
+static int load_cov_cover_ok(const float xy[6][2], unsigned count) {
+    if (count == 3) {
+        double area = ((double)xy[1][0] - xy[0][0]) * ((double)xy[2][1] - xy[0][1]) - ((double)xy[1][1] - xy[0][1]) * ((double)xy[2][0] - xy[0][0]);
+        if (!area) return 0;
+        for (unsigned corner = 0; corner < 4; corner++) for (unsigned edge = 0; edge < 3; edge++) {
+            unsigned j = (edge + 1) % 3;
+            double cross = ((double)xy[j][0] - xy[edge][0]) * ((corner & 2 ? 1.0 : -1.0) - xy[edge][1]) - ((double)xy[j][1] - xy[edge][1]) * ((corner & 1 ? 1.0 : -1.0) - xy[edge][0]);
+            if (area > 0 ? cross < 0 : cross > 0) return 0;
+        }
+        return 1;
+    }
+    unsigned corners[2] = {0}, shared;
+    for (unsigned i = 0; i < 6; i++) {
+        if ((xy[i][0] != -1 && xy[i][0] != 1) || (xy[i][1] != -1 && xy[i][1] != 1)) return 0;
+        unsigned bit = 1u << ((xy[i][0] == 1) | ((xy[i][1] == 1) << 1)); if (corners[i / 3] & bit) return 0;
+        corners[i / 3] |= bit;
+    }
+    shared = corners[0] & corners[1];
+    return (corners[0] | corners[1]) == 15 && (shared == 6 || shared == 9);
+}
+static uint32_t load_cov_mask_slot(uint64_t handle, uint32_t mask, int *bad) {
+    vk_treg t; if (!vk_treg_get((int)(handle & 0xfffff), &t)) { *bad = 1; return 0u; }
+    for (unsigned i = 0; i < 8; i++) {
+        const tex_t *a = S.rt.color[i];
+        if (a && (a->serial == t.t.serial || !a->L.size || !t.t.L.size ||
+            ((uintptr_t)a->mem < (uintptr_t)t.t.mem + t.t.L.size && (uintptr_t)t.t.mem < (uintptr_t)a->mem + a->L.size))) mask &= ~(1u << i);
+    }
+    return mask;
+}
+static uint32_t load_cov_mask_views(uint32_t mask) {
+    int bad = 0;
+    if (totk_vk_load_wb_fast_on() && S.tex_nz_ready && S.img_nz_ready) {
+        totk_slot160_nz_t sm;
+        for (unsigned st = 0; st < 2 && mask; st++) {
+            totk_slot160_from_state(&sm, S.tex_nz[st], S.img_nz[st]);
+            for (int w = 0; w < 3 && mask; w++) for (uint64_t m = sm.w[w]; m && mask; m &= m - 1u) {
+                int slot = (w << 6) + __builtin_ctzll(m);
+                uint64_t h = slot < 128 ? S.tex[st][slot] : (slot < 160 ? S.img[st][slot - 128] : 0u);
+                if (h) { mask = load_cov_mask_slot(h, mask, &bad); if (bad) return 0u; }
+            }
+        }
+        return mask;
+    }
+    for (unsigned st = 0; st < 2; st++) for (unsigned slot = 0; slot < 160; slot++) {
+        uint64_t handle = slot < 128 ? S.tex[st][slot] : S.img[st][slot - 128];
+        if (handle) { mask = load_cov_mask_slot(handle, mask, &bad); if (bad) return 0u; }
+    }
+    return mask;
+}
 static uint32_t load_coverage_mask(void) {
     vk_shader *vs = g_load_sh ? g_load_sh[0] : NULL, *fs = g_load_sh ? g_load_sh[1] : NULL;
-    if (g_indirect.on || !vs || !fs || !vs->load_position_attr || !fs->load_full_outputs ||
-        vs->has_storage_writes || fs->has_storage_writes || S.ds.dt || S.ds.st ||
-        S.color.blend_en || S.color.logic_op != NVN_LOGIC_OP_COPY || (S.ms.a2c & 1) ||
-        S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS || S.poly.mode != NVN_POLYGON_MODE_FILL ||
-        S.poly.cull != NVN_FACE_NONE || R.native || R.canvas || vk_fg_extract_active ||
-        PD.active || PP.active || probe_on() || R.samples != VK_SAMPLE_COUNT_1_BIT ||
-        !S.has_vp || S.vp[0][0] != 0 || S.vp[0][1] != 0 ||
-        S.vp[0][2] != R.w || S.vp[0][3] != R.h ||
-        (S.has_sc && (S.sc.x > 0 || S.sc.y > 0 || (int64_t)S.sc.x + S.sc.w < R.w ||
-                     (int64_t)S.sc.y + S.sc.h < R.h))) return 0;
-    unsigned attr = vs->load_position_attr - 1;
-    if (vs->vin_mask != (1u << attr) || attr >= (unsigned)S.nattr || S.attr[attr].offset) return 0;
-    VkFormat format = vk_vertex_fmt(S.attr[attr].fmt);
-    if (format != VK_FORMAT_R32G32_SFLOAT && format != VK_FORMAT_R16G16_SFLOAT) return 0;
-    unsigned vertex_bytes = format == VK_FORMAT_R32G32_SFLOAT ? 8 : 4;
-    unsigned stream = S.attr[attr].stream;
-    if (stream >= 16 || S.stream[stream].divisor) return 0;
-    if (!g_load_draw && !g_load_indexed) return 0;
+    if (g_indirect.on || !vs || !fs || !vs->load_position_attr || !fs->load_full_outputs || vs->has_storage_writes || fs->has_storage_writes ||
+        S.ds.dt || S.ds.st || S.color.blend_en || S.color.logic_op != NVN_LOGIC_OP_COPY || (S.ms.a2c & 1) || S.color.alpha_func != NVN_ALPHA_FUNC_ALWAYS ||
+        S.poly.mode != NVN_POLYGON_MODE_FILL || S.poly.cull != NVN_FACE_NONE || R.native || R.canvas || vk_fg_extract_active || PD.active || PP.active ||
+        probe_on() || R.samples != VK_SAMPLE_COUNT_1_BIT || !S.has_vp || S.vp[0][0] != 0 || S.vp[0][1] != 0 || S.vp[0][2] != R.w || S.vp[0][3] != R.h ||
+        (S.has_sc && (S.sc.x > 0 || S.sc.y > 0 || (int64_t)S.sc.x + S.sc.w < R.w || (int64_t)S.sc.y + S.sc.h < R.h))) return 0;
+    unsigned attr = vs->load_position_attr - 1; if (vs->vin_mask != (1u << attr) || attr >= (unsigned)S.nattr || S.attr[attr].offset) return 0;
+    VkFormat format = vk_vertex_fmt(S.attr[attr].fmt); if (format != VK_FORMAT_R32G32_SFLOAT && format != VK_FORMAT_R16G16_SFLOAT) return 0;
+    unsigned vertex_bytes = format == VK_FORMAT_R32G32_SFLOAT ? 8 : 4, stream = S.attr[attr].stream;
+    if (stream >= 16 || S.stream[stream].divisor || (!g_load_draw && !g_load_indexed)) return 0;
     int prim = g_load_draw ? g_load_draw->prim : g_load_indexed->prim;
     unsigned count = g_load_draw ? g_load_draw->count : g_load_indexed->count;
-    if (prim != 4 || (count != 3 && count != 6)) return 0; /* triangle list only */
-    if (g_load_indexed && (g_load_indexed->itype < 0 || g_load_indexed->itype > 2)) return 0;
+    if (prim != 4 || (count != 3 && count != 6) || (g_load_indexed && (g_load_indexed->itype < 0 || g_load_indexed->itype > 2))) return 0;
     float xy[6][2];
     for (unsigned i = 0; i < count; i++) {
         int64_t vertex = g_load_draw ? (int64_t)g_load_draw->first + i : 0;
         if (g_load_indexed) {
-            unsigned bytes = 1u << g_load_indexed->itype; uint32_t index = 0;
-            uint64_t address = g_load_indexed->ibuf + (uint64_t)i * bytes;
-            VkDescriptorBufferInfo frozen;
-            if (address < g_load_indexed->ibuf || !vk_ub_replay_read(address, bytes, 16, &frozen)) return 0;
-            vk_ub_read(address, &index, bytes); vertex = (int64_t)index + g_load_indexed->base_vertex;
+            unsigned bytes = 1u << g_load_indexed->itype; uint32_t index = 0; uint64_t addr = g_load_indexed->ibuf + (uint64_t)i * bytes; VkDescriptorBufferInfo fr;
+            if (addr < g_load_indexed->ibuf || !vk_ub_replay_read(addr, bytes, 16, &fr)) return 0;
+            vk_ub_read(addr, &index, bytes); vertex = (int64_t)index + g_load_indexed->base_vertex;
         }
         if (vertex < 0 || (S.stream[stream].stride && (uint64_t)vertex > UINT64_MAX / S.stream[stream].stride)) return 0;
-        uint64_t offset = (uint64_t)vertex * S.stream[stream].stride + S.attr[attr].offset;
-        const NVNbufferRange *b = &S.vbuf[stream]; VkDescriptorBufferInfo frozen;
-        if (offset > b->size || b->size - offset < vertex_bytes ||
-            b->address + offset < b->address || !vk_ub_replay_read(b->address + offset, vertex_bytes, 16, &frozen)) return 0;
-        uint8_t *raw = g_load_vertices + i * vertex_bytes;
-        vk_ub_read(b->address + offset, raw, vertex_bytes);
+        uint64_t offset = (uint64_t)vertex * S.stream[stream].stride + S.attr[attr].offset; const NVNbufferRange *b = &S.vbuf[stream]; VkDescriptorBufferInfo fr;
+        if (offset > b->size || b->size - offset < vertex_bytes || b->address + offset < b->address || !vk_ub_replay_read(b->address + offset, vertex_bytes, 16, &fr)) return 0;
+        uint8_t *raw = g_load_vertices + i * vertex_bytes; vk_ub_read(b->address + offset, raw, vertex_bytes);
         if (vertex_bytes == 8) memcpy(xy[i], raw, 8);
-        else for (unsigned k = 0; k < 2; k++) {
-            uint16_t h; memcpy(&h, raw + 2*k, 2);
-            unsigned exponent = h >> 10 & 31, mantissa = h & 1023;
-            if (exponent == 31) return 0;
-            xy[i][k] = ldexpf((float)(exponent ? mantissa + 1024 : mantissa), exponent ? (int)exponent - 25 : -24);
-            if (h & 0x8000) xy[i][k] = -xy[i][k];
-        }
-        for (unsigned k = 0; k < 2; k++)
-            if (!isfinite(xy[i][k]) || fabsf(xy[i][k]) > 16 || xy[i][k] != truncf(xy[i][k])) return 0;
+        else for (unsigned k = 0; k < 2; k++) { uint16_t h; memcpy(&h, raw + 2 * k, 2); unsigned ex = h >> 10 & 31, mn = h & 1023; if (ex == 31) return 0;
+            xy[i][k] = ldexpf((float)(ex ? mn + 1024 : mn), ex ? (int)ex - 25 : -24); if (h & 0x8000) xy[i][k] = -xy[i][k]; }
+        for (unsigned k = 0; k < 2; k++) if (!isfinite(xy[i][k]) || fabsf(xy[i][k]) > 16 || xy[i][k] != truncf(xy[i][k])) return 0;
     }
-    if (count == 3) {
-        double area = ((double)xy[1][0] - xy[0][0]) * ((double)xy[2][1] - xy[0][1]) -
-                      ((double)xy[1][1] - xy[0][1]) * ((double)xy[2][0] - xy[0][0]);
-        if (!area) return 0;
-        for (unsigned corner = 0; corner < 4; corner++) for (unsigned edge = 0; edge < 3; edge++) {
-            unsigned j = (edge + 1) % 3;
-            double cross = ((double)xy[j][0] - xy[edge][0]) * ((corner & 2 ? 1.0 : -1.0) - xy[edge][1]) -
-                           ((double)xy[j][1] - xy[edge][1]) * ((corner & 1 ? 1.0 : -1.0) - xy[edge][0]);
-            if (area > 0 ? cross < 0 : cross > 0) return 0;
-        }
-    } else {
-        unsigned corners[2] = {0}, shared;
-        for (unsigned i = 0; i < 6; i++) {
-            if ((xy[i][0] != -1 && xy[i][0] != 1) || (xy[i][1] != -1 && xy[i][1] != 1)) return 0;
-            unsigned bit = 1u << ((xy[i][0] == 1) | ((xy[i][1] == 1) << 1));
-            if (corners[i / 3] & bit) return 0;
-            corners[i / 3] |= bit;
-        }
-        shared = corners[0] & corners[1];
-        if ((corners[0] | corners[1]) != 15 || (shared != 6 && shared != 9)) return 0;
-    }
+    if (!load_cov_cover_ok(xy, count)) return 0;
     uint32_t mask = fs->load_full_outputs & 255u;
     for (unsigned i = 0; i < 8; i++) if ((S.chmask.mask >> (4 * i) & 15) != 15) mask &= ~(1u << i);
-    /* Aliases and every bound sampled/storage view are MAY-reads. */
-    for (unsigned st = 0; st < 2; st++) for (unsigned slot = 0; slot < 160; slot++) {
-        uint64_t handle = slot < 128 ? S.tex[st][slot] : S.img[st][slot - 128];
-        if (!handle) continue;
-        vk_treg t; if (!vk_treg_get((int)(handle & 0xfffff), &t)) return 0;
-        for (unsigned i = 0; i < 8; i++) {
-            const tex_t *a = S.rt.color[i];
-            if (a && (a->serial == t.t.serial || !a->L.size || !t.t.L.size ||
-                ((uintptr_t)a->mem < (uintptr_t)t.t.mem + t.t.L.size &&
-                 (uintptr_t)t.t.mem < (uintptr_t)a->mem + a->L.size))) mask &= ~(1u << i);
-        }
-    }
+    mask = load_cov_mask_views(mask);
     for (unsigned i = 0; i < 8; i++) for (unsigned j = 0; j < 9; j++) {
-        const tex_t *a = S.rt.color[i], *b = j < 8 ? S.rt.color[j] : S.rt.depth;
-        if (i != j && a && b && (a->serial == b->serial || a->mem == b->mem)) mask &= ~(1u << i);
+        const tex_t *a = S.rt.color[i], *b = j < 8 ? S.rt.color[j] : S.rt.depth; if (i != j && a && b && (a->serial == b->serial || a->mem == b->mem)) mask &= ~(1u << i);
     }
     if (mask) { g_load_vertex_bytes = vertex_bytes; g_load_stream = stream; }
     return mask;
@@ -2050,6 +2045,7 @@ static void fg_extract_invalidate(fg_dep_key key, unsigned writer,
 
 static int fg_extract_camera_equal(const float a[84], const float b[84]);
 static uint64_t fg_extract_camera_hash(const float camera[84]) {
+    if (totk_vk_load_wb_fast_on()) return totk_fg_camera_hash84(camera);
     uint64_t hash=UINT64_C(14695981039346656037);
     for (unsigned i=0;i<84;i++) if (i<58 || i==62 || i==70 || i==72 || i==73) {
         uint32_t bits; memcpy(&bits,camera+i,sizeof bits);
@@ -6010,31 +6006,31 @@ static uint64_t record_widen_u8(vk_record_draw *d, uint64_t ibuf, uint32_t count
     d->index_address = 0; d->index_offset = to; d->index_type = VK_INDEX_TYPE_UINT16;
     return to;
 }
-static int record_buffers(vk_shader *sh, const p_draw *dw, const p_draw_idx *di, int prim, uint32_t count, uint32_t instances, uint32_t base_instance) {
-    vk_record_draw *d = g_record_draw;
-    d->vertex_mask |= active_vin_streams(sh->vin_mask);
-    for (uint32_t s = 0; s < 16; s++) if (d->vertex_mask >> s & 1) {
-        d->vertex[s].address = S.vbuf[s].address; d->vertex[s].size = S.vbuf[s].size ? S.vbuf[s].size : 16; d->vertex[s].stride = S.stream[s].stride;
-        /* Packets survive slot reuse: a previous hot/copy draw may have overridden this stream.
-           Clear that version before choosing between today's live range and a new immutable copy. */
-        d->vertex[s].buffer = VK_NULL_HANDLE; d->vertex[s].offset = 0; d->vertex[s].lag_reason = 0;
-        if (g_load_override && s == g_load_stream) {
-            d->vertex[s].address = 0; d->vertex[s].buffer = g_load_geometry.buffer;
-            d->vertex[s].offset = g_load_geometry.offset; d->vertex[s].size = g_load_geometry.range;
-            d->vertex[s].stride = g_load_vertex_bytes; continue;
-        }
-        if (vk_lag_capture_on() && d->vertex[s].address) {
-            VkBuffer buffer; uint64_t offset, available;
-            if (record_buffer_resolve(d->spans, d->vertex[s].address, d->vertex[s].size, 0, &buffer, &offset, &available)) {
-                d->vertex[s].size = MINV(d->vertex[s].size, available);
-                d->vertex[s].buffer = buffer; d->vertex[s].offset = offset;
-                VkDescriptorBufferInfo frozen;
-                if (vk_lag_read_record(d->vertex[s].address, d->vertex[s].size, 16, &frozen, &d->vertex[s].lag_reason, VK_LAG_VERTEX)) {
-                    d->vertex[s].buffer = frozen.buffer; d->vertex[s].offset = frozen.offset;
-                }
+static void record_one_vstream(vk_record_draw *d, uint32_t s) {
+    d->vertex[s].address = S.vbuf[s].address; d->vertex[s].size = S.vbuf[s].size ? S.vbuf[s].size : 16; d->vertex[s].stride = S.stream[s].stride;
+    d->vertex[s].buffer = VK_NULL_HANDLE; d->vertex[s].offset = 0; d->vertex[s].lag_reason = 0;
+    if (g_load_override && s == g_load_stream) {
+        d->vertex[s].address = 0; d->vertex[s].buffer = g_load_geometry.buffer;
+        d->vertex[s].offset = g_load_geometry.offset; d->vertex[s].size = g_load_geometry.range;
+        d->vertex[s].stride = g_load_vertex_bytes; return;
+    }
+    if (vk_lag_capture_on() && d->vertex[s].address) {
+        VkBuffer buffer; uint64_t offset, available;
+        if (record_buffer_resolve(d->spans, d->vertex[s].address, d->vertex[s].size, 0, &buffer, &offset, &available)) {
+            d->vertex[s].size = MINV(d->vertex[s].size, available);
+            d->vertex[s].buffer = buffer; d->vertex[s].offset = offset;
+            VkDescriptorBufferInfo frozen;
+            if (vk_lag_read_record(d->vertex[s].address, d->vertex[s].size, 16, &frozen, &d->vertex[s].lag_reason, VK_LAG_VERTEX)) {
+                d->vertex[s].buffer = frozen.buffer; d->vertex[s].offset = frozen.offset;
             }
         }
     }
+}
+static int record_buffers(vk_shader *sh, const p_draw *dw, const p_draw_idx *di, int prim, uint32_t count, uint32_t instances, uint32_t base_instance) {
+    vk_record_draw *d = g_record_draw;
+    d->vertex_mask |= active_vin_streams(sh->vin_mask);
+    if (totk_vk_load_wb_fast_on()) { for (uint32_t vm = d->vertex_mask & 0xffffu; vm; vm &= vm - 1u) record_one_vstream(d, (uint32_t)__builtin_ctz(vm)); }
+    else for (uint32_t s = 0; s < 16; s++) if (d->vertex_mask >> s & 1) record_one_vstream(d, s);
     if (sh->vin_mask) {
         d->vertex_mask |= 1u << ZERO_BINDING; d->vertex[ZERO_BINDING].address = 0; d->vertex[ZERO_BINDING].size = 64; d->vertex[ZERO_BINDING].stride = 0;
         d->vertex[ZERO_BINDING].buffer = VK_NULL_HANDLE; d->vertex[ZERO_BINDING].offset = 0; d->vertex[ZERO_BINDING].lag_reason = 0;
@@ -7272,6 +7268,7 @@ void vk_draw_exec(uint32_t op, const void *a) {
             if (vk_fg_extract_active && R.open && ch) fg_extract_state_change(1);
             if (vk_record_enabled() && ch) g_record_bind_revision[b->stage]++;
             memcpy(&S.img[b->stage][b->first], b->h, 8 * (size_t)b->n);
+            totk_img_nz_update(&S.img_nz[b->stage], &S.img_nz_ready, b->first, b->h, b->n);
             if (vk_native_ui_enabled() && vk_native_descriptor_revision()) native_bound_update(b->stage,1,b->first,b->n);
         } break; }
         case OP_STENCIL: { const p_stencil *b = a; int ch = 0;

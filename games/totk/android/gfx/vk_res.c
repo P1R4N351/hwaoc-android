@@ -1028,6 +1028,7 @@ static nvn_hmap g_wb_history = {.klen = sizeof(wb_hist_key)};
 typedef struct { uint64_t address, size; } wb_lookup_ent;
 static pthread_mutex_t g_wb_lookup_mu = PTHREAD_MUTEX_INITIALIZER;
 static wb_lookup_ent *g_wb_lookup; static int g_wb_lookup_n, g_wb_lookup_cap;
+static totk_wb_im_tags_t g_wb_im_tags;   /* g_tex_mu */
 static _Atomic uint64_t g_wb_lookup_calls;
 static uint64_t g_wb_lookup_hits;
 static totk_wb_summary g_wb_sum, g_wb_tile_sum;
@@ -1306,14 +1307,27 @@ static void wb_staging_free(wb_ent *e) {
     e->buffer = VK_NULL_HANDLE; e->memory = VK_NULL_HANDLE; e->bytes = NULL; e->allocation = e->fence = 0;
     wb_diag_end(WB_D_FREE, start);
 }
+static int wb_dir_cands_locked(uint64_t a, uint64_t n, uintptr_t extra_im, int out_idx[256]) {
+    if (!totk_vk_load_wb_fast_on() || g_nwb > 256) return -1;
+    if (!g_nwb) return 0;
+    uint64_t cmask[4] = {0};
+    pthread_mutex_lock(&g_wb_lookup_mu);
+    int ok = totk_wb_dir_query(&g_wb_dir, a, n, cmask);
+    pthread_mutex_unlock(&g_wb_lookup_mu);
+    if (!ok) return -1;
+    if (extra_im) totk_wb_im_or_mask(&g_wb_im_tags, extra_im, g_nwb, cmask);
+    return totk_wb_mask_to_indices(cmask, g_nwb, out_idx);
+}
 static void wb_ent_drop_locked(int i) {
     wb_lookup_remove(i);
     nvn_dirty_wb_unwatch(g_wb[i].watch);
     wb_staging_free(&g_wb[i]); wb_unref(g_wb[i].im);
     g_wb[i] = g_wb[--g_nwb];
+    totk_wb_im_remove_swap(&g_wb_im_tags, (uint32_t)i, (uint32_t)g_nwb);
 }
 static void wb_cancel_locked(int i) {
     g_wb[i].cancelled = 1;
+    totk_wb_im_set(&g_wb_im_tags, (uint32_t)i, 0u);
     wb_lookup_set(i, &g_wb[i]);
     nvn_dirty_wb_unwatch(g_wb[i].watch); g_wb[i].watch = NULL;
     /* The GPU may still own the copy destination. Keep cancelled staging and its image only until that fence. */
@@ -1345,29 +1359,40 @@ static void wb_note_locked(vk_tex *x) {
     uint64_t m = (uint64_t)(uintptr_t)t->mem;
     if (m < g_wb_lo) g_wb_lo = m;
     if (m + t->L.size > g_wb_hi) g_wb_hi = m + t->L.size;
-    for (int i = 0; i < g_nwb; ) {
-        wb_ent *e = &g_wb[i];
-        if (e->cancelled || (e->im != x->im && !wb_overlap(e, (uintptr_t)t->mem, t->L.size))) { i++; continue; }
-        if (!e->fence && e->t.mem == t->mem) {
-            if (e->pool != pool || e->im != x->im) e->quiet = wb_quiet_for(t, pool);
-            if (e->im != x->im) { wb_ref(x->im); wb_unref(e->im); e->im = x->im; g_set_superseded++; }
-            /* A hot GPU-only target retains its already-armed range; no per-write allocation/protection walk. */
-            if (e->pool != pool || e->t.L.size != t->L.size || nvn_dirty_wb_written(e->watch)) {
-                nvn_dirty_wb_unwatch(e->watch);
-                e->watch = wb_watch_arm(t, stamp);
+    int cands[256]; int nc = wb_dir_cands_locked((uintptr_t)t->mem, t->L.size, (uintptr_t)x->im, cands);
+    if (nc == 1) {
+        int i = cands[0]; wb_ent *e = &g_wb[i];
+        if (!e->cancelled && (e->im == x->im || wb_overlap(e, (uintptr_t)t->mem, t->L.size))) {
+            if (!e->fence && e->t.mem == t->mem) {
+                if (e->pool != pool || e->im != x->im) e->quiet = wb_quiet_for(t, pool);
+                if (e->im != x->im) { wb_ref(x->im); wb_unref(e->im); e->im = x->im; g_set_superseded++; }
+                if (e->pool != pool || e->t.L.size != t->L.size || nvn_dirty_wb_written(e->watch)) { nvn_dirty_wb_unwatch(e->watch); e->watch = wb_watch_arm(t, stamp); }
+                e->t = *t; e->stamp = stamp; e->sub = sub; e->producer = mtl_last_fence() + 1; e->pool = pool; e->tile_version = tile_version;
+                e->tracked = wb_watch_tracked(t, e->watch); totk_wb_im_set(&g_wb_im_tags, (uint32_t)i, (uintptr_t)e->im); wb_lookup_set(i, e); return;
             }
-            e->t = *t; e->stamp = stamp; e->sub = sub; e->producer = mtl_last_fence() + 1; e->pool = pool; e->tile_version = tile_version;
-            e->tracked = wb_watch_tracked(t, e->watch); wb_lookup_set(i, e); return;
+            wb_tile_event(e->tile_version, "image-superseded", 0, 0); g_set_superseded++; wb_cancel_locked(i);
         }
-        wb_tile_event(e->tile_version, "image-superseded", 0, 0);
-        int before = g_nwb; g_set_superseded++; wb_cancel_locked(i);
-        if (before == g_nwb) i++;
+    } else if (nc != 0) {
+        for (int i = 0; i < g_nwb; ) {
+            wb_ent *e = &g_wb[i];
+            if (e->cancelled || (e->im != x->im && !wb_overlap(e, (uintptr_t)t->mem, t->L.size))) { i++; continue; }
+            if (!e->fence && e->t.mem == t->mem) {
+                if (e->pool != pool || e->im != x->im) e->quiet = wb_quiet_for(t, pool);
+                if (e->im != x->im) { wb_ref(x->im); wb_unref(e->im); e->im = x->im; g_set_superseded++; }
+                if (e->pool != pool || e->t.L.size != t->L.size || nvn_dirty_wb_written(e->watch)) { nvn_dirty_wb_unwatch(e->watch); e->watch = wb_watch_arm(t, stamp); }
+                e->t = *t; e->stamp = stamp; e->sub = sub; e->producer = mtl_last_fence() + 1; e->pool = pool; e->tile_version = tile_version;
+                e->tracked = wb_watch_tracked(t, e->watch); totk_wb_im_set(&g_wb_im_tags, (uint32_t)i, (uintptr_t)e->im); wb_lookup_set(i, e); return;
+            }
+            wb_tile_event(e->tile_version, "image-superseded", 0, 0); int before = g_nwb; g_set_superseded++; wb_cancel_locked(i);
+            if (before == g_nwb) i++;
+        }
     }
     if (g_nwb == g_capwb) { g_capwb = g_capwb ? 2 * g_capwb : 64; g_wb = realloc(g_wb, (size_t)g_capwb * sizeof *g_wb); }
     wb_ref(x->im);
     g_wb[g_nwb++] = (wb_ent){.t = *t, .im = x->im, .stamp = stamp, .sub = sub, .producer = mtl_last_fence() + 1,
         .pool = pool, .quiet = wb_quiet_for(t, pool), .watch = wb_watch_arm(t, stamp), .tile_version = tile_version};
     g_wb[g_nwb - 1].tracked = wb_watch_tracked(t, g_wb[g_nwb - 1].watch);
+    totk_wb_im_set(&g_wb_im_tags, (uint32_t)(g_nwb - 1), (uintptr_t)x->im);
     wb_lookup_set(g_nwb - 1, &g_wb[g_nwb - 1]);
 }
 /* GPU copies into guest storage are newer than any rendering covering it. */
@@ -1375,21 +1400,26 @@ void vk_wb_gpu_wrote(uint64_t a, uint64_t n) {
     if (!n || a >= atomic_load(&g_wb_hi) || a + n <= atomic_load(&g_wb_lo)) return;
     if (totk_vk_bind_wb_fast_on() && !totk_wb_sum_may_overlap(&g_wb_sum, a, n)) return;
     pthread_mutex_lock(&g_tex_mu);
-    for (int i = 0; i < g_nwb; ) {
+    int cands[256]; int nc = wb_dir_cands_locked(a, n, 0u, cands);
+    if (nc >= 0) {
+        for (int k = nc - 1; k >= 0; k--) { int i = cands[k]; if (i < g_nwb && !g_wb[i].cancelled && wb_overlap(&g_wb[i], a, n)) {
+            wb_tile_event(g_wb[i].tile_version, "buffer-write", 0, 0); g_wb_superseded++; g_set_superseded++; wb_cancel_locked(i); } }
+    } else for (int i = 0; i < g_nwb; ) {
         if (!g_wb[i].cancelled && wb_overlap(&g_wb[i], a, n)) {
-            wb_tile_event(g_wb[i].tile_version, "buffer-write", 0, 0);
-            int before = g_nwb; g_wb_superseded++; g_set_superseded++; wb_cancel_locked(i);
-            if (before == g_nwb) i++;
+            wb_tile_event(g_wb[i].tile_version, "buffer-write", 0, 0); int before = g_nwb; g_wb_superseded++; g_set_superseded++; wb_cancel_locked(i); if (before == g_nwb) i++;
         } else i++;
     }
     pthread_mutex_unlock(&g_tex_mu);
 }
 void vk_wb_range_gone(uintptr_t lo, uintptr_t hi) {
     pthread_mutex_lock(&g_tex_mu);
-    for (int i = 0; i < g_nwb; ) {
+    int cands[256]; int nc = hi > lo ? wb_dir_cands_locked(lo, hi - lo, 0u, cands) : 0;
+    if (nc >= 0) {
+        for (int k = nc - 1; k >= 0; k--) { int i = cands[k]; if (i < g_nwb && !g_wb[i].cancelled && wb_overlap(&g_wb[i], lo, hi - lo)) {
+            wb_tile_event(g_wb[i].tile_version, "pool-gone", 0, 0); wb_cancel_locked(i); } }
+    } else for (int i = 0; i < g_nwb; ) {
         if (!g_wb[i].cancelled && wb_overlap(&g_wb[i], lo, hi - lo)) {
-            wb_tile_event(g_wb[i].tile_version, "pool-gone", 0, 0);
-            int before = g_nwb; wb_cancel_locked(i); if (before == g_nwb) i++;
+            wb_tile_event(g_wb[i].tile_version, "pool-gone", 0, 0); int before = g_nwb; wb_cancel_locked(i); if (before == g_nwb) i++;
         } else i++;
     }
     for (uint32_t i = 0; i < g_wb_history.cap; i++) {
@@ -1787,38 +1817,41 @@ static void wb_seal(int full) {
     wb_diag_end(WB_D_SEAL, start);
 }
 typedef struct { uint64_t address, n; int full, count; } wb_invalidate_request;
+static int wb_inv_select_locked(uint64_t address, uint64_t n, int boundary, int full, wb_ent **list_out, int *nl_out) {
+    int cands[256]; int nc = wb_dir_cands_locked(address, n, 0u, cands);
+    if (!boundary && !full) {
+        uint64_t sealed = mtl_last_fence();
+        if (nc >= 0) { for (int k = 0; k < nc; k++) { const wb_ent *e = &g_wb[cands[k]];
+            if (!e->cancelled && wb_overlap(e, address, n) && !e->fence && e->producer > sealed && e->tracked && !wb_cpu_newer(e)) return 0; } }
+        else { for (int i = 0; i < g_nwb; i++) { const wb_ent *e = &g_wb[i];
+            if (!e->cancelled && wb_overlap(e, address, n) && !e->fence && e->producer > sealed && e->tracked && !wb_cpu_newer(e)) return 0; } }
+    }
+    int nl = 0; wb_ent *list = NULL;
+    if (nc == 0) { wb_landing_publish(NULL, 0); *list_out = NULL; *nl_out = 0; return 1; }
+    if (nc > 0) {
+        for (int k = 0; k < nc; k++) { wb_ent *e = &g_wb[cands[k]]; if (e->cancelled || !wb_overlap(e, address, n)) continue;
+            e->fresh_invalidate = !full && vk_submit_serial() - e->sub < settled_subs();
+            if (totk_texcopy_match(&e->t)) totk_texcopy_log(vk_submit_serial(), "phase=res event=invalidate-select ser=%llu mem=%p image=%#llx producer_sub=%llu", (unsigned long long)e->t.serial, (void *)e->t.mem, (unsigned long long)(uintptr_t)e->im->img, (unsigned long long)e->sub);
+            list = realloc(list, (size_t)(nl + 1) * sizeof *list); list[nl++] = *e; }
+        wb_landing_publish(list, nl);
+        for (int k = nc - 1; k >= 0; k--) { int i = cands[k]; if (i < g_nwb && !g_wb[i].cancelled && wb_overlap(&g_wb[i], address, n)) { wb_lookup_remove(i); g_wb[i] = g_wb[--g_nwb]; totk_wb_im_remove_swap(&g_wb_im_tags, (uint32_t)i, (uint32_t)g_nwb); } }
+    } else {
+        for (int i = 0; i < g_nwb; i++) { wb_ent *e = &g_wb[i]; if (e->cancelled || !wb_overlap(e, address, n)) continue;
+            e->fresh_invalidate = !full && vk_submit_serial() - e->sub < settled_subs();
+            if (totk_texcopy_match(&e->t)) totk_texcopy_log(vk_submit_serial(), "phase=res event=invalidate-select ser=%llu mem=%p image=%#llx producer_sub=%llu", (unsigned long long)e->t.serial, (void *)e->t.mem, (unsigned long long)(uintptr_t)e->im->img, (unsigned long long)e->sub);
+            list = realloc(list, (size_t)(nl + 1) * sizeof *list); list[nl++] = *e; }
+        wb_landing_publish(list, nl);
+        for (int i = 0; i < g_nwb; ) { if (g_wb[i].cancelled || !wb_overlap(&g_wb[i], address, n)) { i++; continue; } wb_lookup_remove(i); g_wb[i] = g_wb[--g_nwb]; totk_wb_im_remove_swap(&g_wb_im_tags, (uint32_t)i, (uint32_t)g_nwb); }
+    }
+    *list_out = list; *nl_out = nl; return 1;
+}
 static int wb_invalidate_owner(void *arg, int boundary) {
     wb_invalidate_request *request = arg;
     uint64_t address = request->address, n = request->n, phase; int full = request->full;
     pthread_mutex_lock(&g_tex_mu);
-    if (!boundary && !full) {
-        uint64_t sealed = mtl_last_fence();
-        for (int i = 0; i < g_nwb; i++) {
-            wb_ent *e = &g_wb[i];
-            /* A note at pass begin covers ALL its draws. Do not snapshot an unfinished same-image producer
-               merely to meet a latency target. An unrelated already-sealed producer can be serviced between ops. */
-            if (!e->cancelled && wb_overlap(e, address, n) && !e->fence && e->producer > sealed &&
-                e->tracked && !wb_cpu_newer(e)) { pthread_mutex_unlock(&g_tex_mu); return 0; }
-        }
-    }
-
     int nl = 0; wb_ent *list = NULL;
+    if (!wb_inv_select_locked(address, n, boundary, full, &list, &nl)) { pthread_mutex_unlock(&g_tex_mu); return 0; }
     uint64_t fresh_before = g_set_fresh, fresh_bytes_before = g_set_fresh_bytes;
-    for (int i = 0; i < g_nwb; i++) {
-        wb_ent *e = &g_wb[i];
-        if (e->cancelled || !wb_overlap(e, address, n)) continue;
-        e->fresh_invalidate = !full && vk_submit_serial() - e->sub < settled_subs();
-        if (totk_texcopy_match(&e->t))
-            totk_texcopy_log(vk_submit_serial(), "phase=res event=invalidate-select ser=%llu mem=%p image=%#llx producer_sub=%llu",
-                (unsigned long long)e->t.serial, (void *)e->t.mem, (unsigned long long)(uintptr_t)e->im->img, (unsigned long long)e->sub);
-        list = realloc(list, (size_t)(nl + 1) * sizeof *list); list[nl++] = *e;
-    }
-    wb_landing_publish(list, nl);
-    for (int i = 0; i < g_nwb; ) {
-        if (g_wb[i].cancelled || !wb_overlap(&g_wb[i], address, n)) { i++; continue; }
-        wb_lookup_remove(i);
-        g_wb[i] = g_wb[--g_nwb]; /* transfer reference/staging ownership after publishing the borrowed ranges */
-    }
     uint64_t copy_fence = 0, fresh_wait_ns = 0; int fresh_copy = 0;
     for (int i = 0; i < nl; i++) {
         wb_ent *e = &list[i];

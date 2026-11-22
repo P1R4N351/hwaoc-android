@@ -19,6 +19,7 @@
 #include "vk_fg_wb_fast.h"
 #include "vk_touch_alias_fast.h"
 #include "vk_ub_gw_fast.h"
+#include "vk_load_wb_fast.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>
@@ -730,6 +731,8 @@ typedef struct {
     int tex_hi[6];
     uint64_t tex_nz[6][2];
     uint8_t tex_nz_ready;
+    uint32_t img_nz[6];
+    uint8_t img_nz_ready;
 } vk_state;
 extern vk_state S;
 int vk_prog_predict(const vk_state *state, vk_shader *out[6]);   /* borrowed ready variants only; no loads or active-state/memo changes */

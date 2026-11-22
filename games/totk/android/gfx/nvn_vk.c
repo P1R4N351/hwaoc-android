@@ -3897,7 +3897,7 @@ static int lag_test_owner_bench(void) {
 static uint64_t lag_physical(uint64_t addr, uint64_t size);
 static uint64_t ub_address(uint64_t addr, uint64_t size) { return ub_private_on() ? lag_physical(addr, size) : addr; }
 static void ub_maxhi_from(int i) { for (; i < g_nub; i++) { uint64_t prev = i ? g_ub_maxhi[i - 1] : 0; g_ub_maxhi[i] = g_ub[i].hi > prev ? g_ub[i].hi : prev; } }
-static uint64_t g_prune_floor = UINT64_MAX;
+static uint64_t g_prune_floor = UINT64_MAX, g_ub_max_fence, g_gw_max_fence;
 static void ub_prune_inner(void) {   /* drop entries whose submission the GPU has finished, and that no later snapshot still needs */
     /* Only a finished submission or a changed snapshot floor can drop entries; vk_ub_rename calls this for every uniform
        binding, so without either it returns at once. */
@@ -3905,15 +3905,17 @@ static void ub_prune_inner(void) {   /* drop entries whose submission the GPU ha
     if (done > g_prune_floor) done = g_prune_floor;   /* a submission queued after the one replaying captured no earlier than it */
     if (done == g_ub_pruned_at) return;
     g_ub_pruned_at = done;
-    g_ub_lo = UINT64_MAX; g_ub_hi = 0; g_ub_maxlen = 0;
+    g_ub_lo = UINT64_MAX; g_ub_hi = 0; g_ub_maxlen = 0; uint64_t mf = 0;
     totk_ub_unsealed_reset(&g_ub_unsealed);
     for (int i = 0; i < g_nub; i++) {
         if (g_ub[i].fence && g_ub[i].fence <= done) { free(g_ub[i].data); continue; }
         if (g_ub[i].flushed && !g_ub[i].fence) totk_ub_unsealed_note(&g_ub_unsealed, j);
+        if (g_ub[i].fence > mf) mf = g_ub[i].fence;
         g_ub[j++] = g_ub[i];
         if (g_ub[i].lo < g_ub_lo) g_ub_lo = g_ub[i].lo; if (g_ub[i].hi > g_ub_hi) g_ub_hi = g_ub[i].hi;
         if (g_ub[i].hi - g_ub[i].lo > g_ub_maxlen) g_ub_maxlen = g_ub[i].hi - g_ub[i].lo;
     }
+    g_ub_max_fence = mf;
     if (j != g_nub) { g_nub = j; ub_maxhi_from(0); ub_changed(0, 0); }
 }
 static void ub_prune(void) { VK_REC_DO(VK_REC_S_UNIFORM, ub_prune_inner()); }
@@ -3961,7 +3963,8 @@ static int ub_overlaps(uint64_t lo, uint64_t hi, int only_unflushed, int *idx, i
     int a = 0, b = g_nub; while (a < b) { int m = (a + b) >> 1; if (g_ub[m].lo < hi) a = m + 1; else b = m; }
     int n = 0; uint64_t floor = lo > g_ub_maxlen ? lo - g_ub_maxlen : 0;   /* an entry starting at or below floor ends by lo */
     for (int i = a - 1; i >= 0 && g_ub_maxhi[i] > lo && (g_ub[i].lo > floor || !floor); i--) if (g_ub[i].hi > lo && (!only_unflushed || !g_ub[i].flushed)) { if (n == cap) return -1; idx[n++] = i; }
-    for (int i = 1; i < n; i++) for (int j = i; j > 0 && g_ub[idx[j - 1]].seq > g_ub[idx[j]].seq; j--) { int t = idx[j]; idx[j] = idx[j - 1]; idx[j - 1] = t; }
+    if (totk_vk_load_wb_fast_on() && n > 1) totk_ub_sort_by_seq(idx, n, g_ub, sizeof *g_ub, offsetof(ub_ent, seq));
+    else for (int i = 1; i < n; i++) for (int j = i; j > 0 && g_ub[idx[j - 1]].seq > g_ub[idx[j]].seq; j--) { int t = idx[j]; idx[j] = idx[j - 1]; idx[j - 1] = t; }
     return n;
 }
 static int ub_entry_cmp(const void *x, const void *y) {
@@ -3969,11 +3972,12 @@ static int ub_entry_cmp(const void *x, const void *y) {
     return a->lo < b->lo ? -1 : a->lo > b->lo;
 }
 static void ub_reindex(void) {
-    g_ub_lo = UINT64_MAX; g_ub_hi = g_ub_maxlen = 0; g_ub_unflushed = 0;
+    g_ub_lo = UINT64_MAX; g_ub_hi = g_ub_maxlen = 0; g_ub_unflushed = 0; g_ub_max_fence = 0;
     totk_ub_unsealed_reset(&g_ub_unsealed);
     for (int i = 0; i < g_nub; i++) {
         ub_ent *e = &g_ub[i];
         if (e->flushed && !e->fence) totk_ub_unsealed_note(&g_ub_unsealed, i);
+        if (e->fence > g_ub_max_fence) g_ub_max_fence = e->fence;
         if (e->lo < g_ub_lo) g_ub_lo = e->lo;
         if (e->hi > g_ub_hi) g_ub_hi = e->hi;
         if (e->hi - e->lo > g_ub_maxlen) g_ub_maxlen = e->hi - e->lo;
@@ -4215,26 +4219,27 @@ static void gw_seal(uint64_t fence) {
         if (g_ngw && totk_gw_unsealed_has(&g_gw_unsealed)) {
             int i = gw_lower(g_gw_unsealed.min_lo); uint32_t rem = g_gw_unsealed.count;
             for (; i < g_ngw && g_gw[i].lo <= g_gw_unsealed.max_lo && rem > 0u; i++) if (!g_gw[i].fence) { g_gw[i].fence = fence; rem--; }
+            if (fence > g_gw_max_fence) g_gw_max_fence = fence;
             totk_gw_unsealed_reset(&g_gw_unsealed);
         } else if (!g_ngw) totk_gw_unsealed_reset(&g_gw_unsealed);
     } else {
-        for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence) g_gw[i].fence = fence;
+        for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence) { g_gw[i].fence = fence; if (fence > g_gw_max_fence) g_gw_max_fence = fence; }
         totk_gw_unsealed_reset(&g_gw_unsealed);
     }
     pthread_mutex_unlock(&g_gw_mu);
 }
 static void gw_prune(void) {
-    uint64_t done = atomic_load(&g_done), mlo = 0, mhi = 0, blm = 0; int j = 0;
+    uint64_t done = atomic_load(&g_done), mlo = 0, mhi = 0, blm = 0, mf = 0; int j = 0;
     pthread_mutex_lock(&g_gw_mu);
     totk_gw_unsealed_reset(&g_gw_unsealed);
     for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence || g_gw[i].fence > done) {
         gw_t w = g_gw[i];
-        if (!w.fence) totk_gw_unsealed_add(&g_gw_unsealed, w.lo);
+        if (!w.fence) totk_gw_unsealed_add(&g_gw_unsealed, w.lo); else if (w.fence > mf) mf = w.fence;
         if (!j || w.lo < mlo) mlo = w.lo;
         if (!j || w.hi > mhi) mhi = w.hi;
         blm |= totk_gw_bloom_mask(w.lo, w.hi); g_gw[j++] = w;
     }
-    g_ngw = j; gw_reindex_from(0);
+    g_ngw = j; g_gw_max_fence = mf; gw_reindex_from(0);
     totk_gw_sum_publish(&g_gw_sum, (uint32_t)j, mlo, mhi, blm);
     pthread_mutex_unlock(&g_gw_mu);
 }
@@ -4349,7 +4354,7 @@ static unsigned lag_test_gw_index(unsigned *checks) {
     #undef GW_RAND
     /* Per-query cost at the route's size: ~100 pending writes, 1,308 capture ranges per submission. */
     for (int count = 32; count <= 512; count *= 4) {
-        pthread_mutex_lock(&g_gw_mu); g_ngw = 0; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed);
+        pthread_mutex_lock(&g_gw_mu); g_ngw = 0; g_gw_max_fence = 0; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed);
         for (int i = 0; i < count; i++) gw_add(UINT64_C(0x360000000) + (uint64_t)i * 65536 * 3, UINT64_C(0x360000000) + (uint64_t)i * 65536 * 3 + 4096);
         pthread_mutex_unlock(&g_gw_mu);
         uint64_t ns[2]; unsigned hits[2] = {0};
@@ -4366,7 +4371,7 @@ static unsigned lag_test_gw_index(unsigned *checks) {
         printf("lag-query GPU writes %d pending: linear %.2f indexed %.2f ns/query; 6540 capture ranges/frame %.3f -> %.3f ms\n",
                count, ns[0] / 2e5, ns[1] / 2e5, ns[0] / 2e5 * 6540 / 1e6, ns[1] / 2e5 * 6540 / 1e6);
     }
-    pthread_mutex_lock(&g_gw_mu); g_ngw = 0; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed); pthread_mutex_unlock(&g_gw_mu);
+    pthread_mutex_lock(&g_gw_mu); g_ngw = 0; g_gw_max_fence = 0; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed); pthread_mutex_unlock(&g_gw_mu);
     atomic_store(&g_done, 0);
     free(shadow);
     return errors;
@@ -4407,7 +4412,7 @@ int vk_lag_test_query_bench(void) {
         printf("lag-query pending %d entries: scalar %.2f indexed %.2f ns/query; 20000 queries/frame %.3f -> %.3f ms; hits %u/%u\n",
             count, ns[0] / (double)CALLS, ns[1] / (double)CALLS,
             ns[0] / (double)CALLS * .02, ns[1] / (double)CALLS * .02, hits[0], hits[1]);
-        free(g_ub); free(g_ub_maxhi); g_ub = NULL; g_ub_maxhi = NULL; g_nub = 0;
+        free(g_ub); free(g_ub_maxhi); g_ub = NULL; g_ub_maxhi = NULL; g_nub = 0; g_ub_max_fence = 0;
         totk_ub_unsealed_reset(&g_ub_unsealed);
     }
     setenv("TOTK_FRAME_LAG", "1", 1);
@@ -4983,6 +4988,7 @@ static void snapshot_ubos_inner(const uint64_t *h, int n, void *capv) {   /* the
     if (cap->n > g_capsnap) { g_capsnap = cap->n + 256; g_snap = VK_REALLOC(g_snap, (size_t)g_capsnap * sizeof *g_snap); }
     VkDeviceSize align = V.props.limits.minUniformBufferOffsetAlignment; if (!align) align = 256;
     static int *idx; static int icap;
+    int check_ub = !totk_vk_load_wb_fast_on() || totk_ub_has_after((uint32_t)g_ub_unflushed + (uint32_t)g_ub_unsealed.count, g_ub_max_fence, cap->done);
     for (int i = 0; i < cap->n; i++) {
         uint64_t lo = cap->lo[i], hi = cap->hi[i], sz = hi - lo, shift = lo % align;
         VkBuffer b; VkDeviceSize o; uint8_t *p = arena_alloc(snap_arena(), (size_t)(sz + shift), align, &b, &o);
@@ -4994,7 +5000,8 @@ static void snapshot_ubos_inner(const uint64_t *h, int n, void *capv) {   /* the
             if (cap->bytes) g_rec.snapshot_staged += sz; else g_rec.snapshot_direct += sz;
         }
         /* inline updates of earlier submissions that were not in memory at the capture */
-        int m; for (;;) { m = ub_overlaps(lo, hi, 0, idx, icap); if (m >= 0) break; icap = icap ? 2 * icap : 64; idx = VK_REALLOC(idx, (size_t)icap * sizeof *idx); }
+        int m = 0;
+        if (check_ub) { for (;;) { m = ub_overlaps(lo, hi, 0, idx, icap); if (m >= 0) break; icap = icap ? 2 * icap : 64; idx = VK_REALLOC(idx, (size_t)icap * sizeof *idx); } }
         for (int k = 0; k < m; k++) {
             const ub_ent *e = &g_ub[idx[k]];
             if (e->fence && e->fence <= cap->done) continue;
@@ -5516,31 +5523,29 @@ static int lag_software_exclude_aliases(uint64_t lo, uint64_t hi) {
     for (int i = 0; i < count; i++) if (!lag_software_exclude(aliases[i].lo, aliases[i].hi)) return 0;
     return 1;
 }
+_Static_assert(sizeof(rng_t) == 16 && offsetof(rng_t, lo) == 0 && offsetof(rng_t, hi) == 8, "rng_t layout");
 static int lag_software_build_exclusions(uint64_t done) {
-    g_lag_software_count = 0;
-    int ok = 1;
+    g_lag_software_count = 0; int ok = 1, fast = totk_vk_load_wb_fast_on();
     pthread_mutex_lock(&g_gw_mu);
-    for (int i = 0; ok && i < g_ngw; i++)
-        if (!g_gw[i].fence || g_gw[i].fence > done) ok = lag_software_exclude_aliases(g_gw[i].lo, g_gw[i].hi);
+    if (!fast || totk_ub_has_after(g_gw_unsealed.count, g_gw_max_fence, done)) {
+        for (int i = 0; ok && i < g_ngw; i++) if (!g_gw[i].fence || g_gw[i].fence > done) ok = lag_software_exclude_aliases(g_gw[i].lo, g_gw[i].hi);
+    }
     pthread_mutex_unlock(&g_gw_mu);
-    for (int i = 0; ok && i < g_nub; i++)
-        if (g_ub[i].flushed && (!g_ub[i].fence || g_ub[i].fence > done)) ok = lag_software_exclude_aliases(g_ub[i].lo, g_ub[i].hi);
+    if (!fast || totk_ub_has_after((uint32_t)g_ub_unsealed.count, g_ub_max_fence, done)) {
+        for (int i = 0; ok && i < g_nub; i++) if (g_ub[i].flushed && (!g_ub[i].fence || g_ub[i].fence > done)) ok = lag_software_exclude_aliases(g_ub[i].lo, g_ub[i].hi);
+    }
     for (size_t i = 0; ok && i < g_lag_record_count; i++) {
         const lag_record_pending *r = &g_lag_record_pending[i];
         if (r->reason & (NVN_DIRTY_LAG_GPU | NVN_DIRTY_LAG_WRITABLE)) ok = lag_software_exclude(r->lo, r->hi);
     }
-    if (!ok) return 0;   /* no software registration may proceed with incomplete exclusions */
-    if (g_lag_software_count > 1)
-        qsort(g_lag_software_exclusions, g_lag_software_count, sizeof *g_lag_software_exclusions, rng_cmp);
+    if (!ok) return 0;
+    if (fast) { g_lag_software_count = totk_rng_sort_coalesce((uint64_t *)g_lag_software_exclusions, g_lag_software_count); return 1; }
+    if (g_lag_software_count > 1) qsort(g_lag_software_exclusions, g_lag_software_count, sizeof *g_lag_software_exclusions, rng_cmp);
     size_t count = 0;
-    for (size_t i = 0; i < g_lag_software_count; i++) {
-        rng_t r = g_lag_software_exclusions[i];
-        if (count && r.lo <= g_lag_software_exclusions[count - 1].hi) {
-            if (r.hi > g_lag_software_exclusions[count - 1].hi) g_lag_software_exclusions[count - 1].hi = r.hi;
-        } else g_lag_software_exclusions[count++] = r;
-    }
-    g_lag_software_count = count;
-    return 1;
+    for (size_t i = 0; i < g_lag_software_count; i++) { rng_t r = g_lag_software_exclusions[i];
+        if (count && r.lo <= g_lag_software_exclusions[count - 1].hi) { if (r.hi > g_lag_software_exclusions[count - 1].hi) g_lag_software_exclusions[count - 1].hi = r.hi; }
+        else g_lag_software_exclusions[count++] = r; }
+    g_lag_software_count = count; return 1;
 }
 static int lag_software_excluded(uint64_t lo, uint64_t hi) {
     size_t a = 0, b = g_lag_software_count;
@@ -6346,13 +6351,13 @@ static void ub_seal(uint64_t fence) {
         if (g_ub_unsealed.count > 0) {
             int lo = g_ub_unsealed.lo < 0 ? 0 : g_ub_unsealed.lo;
             int hi = g_ub_unsealed.hi > g_nub ? g_nub : g_ub_unsealed.hi;
-            for (int i = lo; i < hi; i++) if (g_ub[i].flushed && !g_ub[i].fence) g_ub[i].fence = fence;
+            for (int i = lo; i < hi; i++) if (g_ub[i].flushed && !g_ub[i].fence) { g_ub[i].fence = fence; if (fence > g_ub_max_fence) g_ub_max_fence = fence; }
             totk_ub_unsealed_reset(&g_ub_unsealed);
         }
         ub_changed(0, 0);
         return;
     }
-    for (int i = 0; i < g_nub; i++) if (g_ub[i].flushed && !g_ub[i].fence) g_ub[i].fence = fence;
+    for (int i = 0; i < g_nub; i++) if (g_ub[i].flushed && !g_ub[i].fence) { g_ub[i].fence = fence; if (fence > g_ub_max_fence) g_ub_max_fence = fence; }
     totk_ub_unsealed_reset(&g_ub_unsealed);
     ub_changed(0, 0);
 }
