@@ -159,7 +159,7 @@ final class Widgets {
         }
     }
 
-    /** The app emblem (common.js emblem(): an original ring device with ticks, spiral and a floating island). */
+    /** The app emblem (Widgets.Emblem): ring device with 48 ticks framing "island" (TotK), "sheikah_eye" (BotW) or "calamity_crest" (AoC). */
     static final class Emblem extends View {
         private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
         Emblem(Context context) { super(context); setLayerType(LAYER_TYPE_SOFTWARE, null); }
@@ -193,6 +193,7 @@ final class Widgets {
                 c.drawLine(cc + cos * (r - 10), cc + sin * (r - 10), cc + cos * (r - 10 - l), cc + sin * (r - 10 - l), paint);
             }
             if ("sheikah_eye".equals(GameBuild.EMBLEM)) { sheikahEye(c, paint, cc, r / 470f, g); return; }
+            if ("calamity_crest".equals(GameBuild.EMBLEM)) { calamityCrest(c, paint, cc, r / 470f, g); return; }
             Path spiral = new Path();
             for (int t = 0; t <= 220; t++) {
                 double a = t / 220.0 * Math.PI * 5.2, rr = 8 + t * 0.255;
@@ -253,6 +254,37 @@ final class Widgets {
             paint.setColor(Theme.GOLD); paint.setShadowLayer(g, 0, 0, Theme.GOLD);
             c.drawCircle(cc, cc + ey * k, 20 * k, paint);                 // pupil
             paint.clearShadowLayer();
+        }
+        /** AoC Native's emblem inside the ring: the 8-point Calamity star-gear crest of app-assets/icon/make_icon_hwaoc.py
+         *  on its 1024 grid (outer ring radius 470; k converts to this canvas). */
+        private static void calamityCrest(Canvas c, Paint paint, float cc, float k, float g) {
+            paint.setStyle(Paint.Style.STROKE); paint.setStrokeCap(Paint.Cap.ROUND); paint.setStrokeJoin(Paint.Join.ROUND);
+            paint.setColor(Theme.ZONAI); paint.setShadowLayer(g, 0, 0, Theme.ZONAI);
+            paint.setStrokeWidth(16 * k); c.drawPath(star(cc, k, 310, 168, 8, 22.5f), paint);
+            paint.setColor(Theme.GOLD); paint.setShadowLayer(g, 0, 0, Theme.GOLD);
+            paint.setStrokeWidth(14 * k); c.drawPath(star(cc, k, 245, 118, 4, 0f), paint);
+            paint.setColor(Theme.ZONAI); paint.setShadowLayer(g, 0, 0, Theme.ZONAI);
+            paint.setStrokeWidth(14 * k); c.drawCircle(cc, cc, 92 * k, paint);
+            paint.setStrokeWidth(10 * k);
+            for (int deg = 0; deg < 360; deg += 90) {
+                c.drawLine(cc + px(110, deg) * k, cc + py(110, deg) * k, cc + px(344, deg) * k, cc + py(344, deg) * k, paint);
+            }
+            paint.setStyle(Paint.Style.FILL);
+            paint.setColor(Theme.GOLD); paint.setShadowLayer(g, 0, 0, Theme.GOLD);
+            c.drawCircle(cc, cc, 40 * k, paint);
+            paint.clearShadowLayer();
+        }
+        /** Closed radial star path on the 1024 grid (phase clockwise from straight up). */
+        private static Path star(float cc, float k, float outerR, float innerR, int points, float phase) {
+            Path p = new Path();
+            float step = 180f / points;
+            for (int i = 0; i < points * 2; i++) {
+                float r = (i & 1) == 0 ? outerR : innerR, deg = phase + i * step;
+                float x = cc + px(r, deg) * k, y = cc + py(r, deg) * k;
+                if (i == 0) p.moveTo(x, y); else p.lineTo(x, y);
+            }
+            p.close();
+            return p;
         }
         /** x and y of a point at distance d, degrees clockwise from straight up (the icon script's polar()). */
         private static float px(float d, float deg) { return (float) (d * Math.sin(Math.toRadians(deg))); }

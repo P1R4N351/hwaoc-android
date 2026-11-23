@@ -103,7 +103,7 @@ class GameVariables(unittest.TestCase):
                        'TITLE_ID = "01007EF00011E000"', 'MOD_MANAGER = "BCML"', 'ROMFS_SIZE = 15131979952L'):
             self.assertIn(needle, botw)
         hwaoc = games.java('hwaoc', self.data)
-        for needle in ('VERSION = "hwaoc130"', 'TITLE_ID = "01002B00111A2000"', 'ROMFS_SIZE = 11719230892L'):
+        for needle in ('VERSION = "hwaoc130"', 'TITLE_ID = "01002B00111A2000"', 'ROMFS_SIZE = 11719230892L', 'EMBLEM = "calamity_crest"'):
             self.assertIn(needle, hwaoc)
 
     def test_no_per_game_file_overrides(self):
