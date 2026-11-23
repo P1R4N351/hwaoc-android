@@ -4025,7 +4025,8 @@ static void ub_publish(void) {
     if (g_ub_unflushed > cap) { cap = g_ub_unflushed; order = VK_REALLOC(order, (size_t)cap * sizeof *order); }
     int n = 0;
     for (int i = 0; i < g_nub; i++) if (!g_ub[i].flushed) order[n++] = i;
-    for (int i = 1; i < n; i++) for (int j = i; j > 0 && g_ub[order[j - 1]].seq > g_ub[order[j]].seq; j--) {
+    if (totk_vk_ans_widen_fast_on() && n > 1) totk_ub_sort_by_seq(order, n, g_ub, sizeof *g_ub, offsetof(ub_ent, seq));
+    else for (int i = 1; i < n; i++) for (int j = i; j > 0 && g_ub[order[j - 1]].seq > g_ub[order[j]].seq; j--) {
         int t = order[j]; order[j] = order[j - 1]; order[j - 1] = t;
     }
     for (int k = 0; k < n; k++) {

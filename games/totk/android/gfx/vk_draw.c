@@ -187,6 +187,7 @@ static struct {
     uint32_t split_draws;                       /* TOTK_VK_SPLIT_PASS_DRAWS taken when this pass (part) opened */
     uint32_t feedback_pending, feedback_written, feedback_sampled, feedback_continued;
     int feedback_on, feedback_unknown, feedback_armed, feedback_restore;
+    totk_rt_fb_bloom_t fb_bloom;
 } R;
 static VkPipeline g_bound_pipe; static int g_dyn_dirty = 1;
 enum { MAX_INDIRECT_QUADS = 262144 };
@@ -1040,14 +1041,31 @@ static int pass_merge_tex_hazard(int st, int reg) {
     }
     return 0;
 }
+static int pass_merge_tex_hazard_fast(int st, int reg, totk_pm_rt_span_t *sp) {
+    uint64_t handle = S.tex[st][reg]; if (!handle) return 0;
+    if (!S.has_rt) return 0;
+    vk_treg t; if (!vk_treg_get((int)(handle & 0xfffff), &t) || !t.t.mem || !t.t.L.size) return 1;
+    uint64_t lo = (uint64_t)(uintptr_t)t.t.mem, hi = lo + t.t.L.size; if (hi < lo) return 1;
+    if (!sp->built) {
+        for (int a = 0; a < 9; a++) {
+            const tex_t *att = a < 8 ? (a < S.rt.n ? S.rt.color[a] : NULL) : S.rt.depth;
+            if (att) totk_pm_rt_add(sp, (uint64_t)(uintptr_t)att->mem, att->L.size, att->serial);
+        }
+        sp->built = 1u;
+    }
+    if (!totk_pm_rt_may_hit(sp, lo, hi, t.t.serial)) return 0;
+    return pass_merge_tex_hazard(st, reg);
+}
 static int pass_merge_draw_hazard(vk_shader *const sh[6]) {
-    int fast = totk_vk_touch_alias_fast_on();
+    int fast = totk_vk_touch_alias_fast_on(), aw_fast = totk_vk_ans_widen_fast_on();
+    totk_pm_rt_span_t pm_sp = {0};
     for (int st = 0; st < 2; st++) {
         if (!sh[st]) continue;
         if (fast && sh[st]->touch_sum.fast) {
             if (sh[st]->touch_sum.pm_imm_hazard) return 1;
             for (uint64_t m = sh[st]->touch_sum.pm_tex_mask; m; m &= m - 1u) {
-                if (pass_merge_tex_hazard(st, sh[st]->b[(unsigned)__builtin_ctzll(m)].reg)) return 1;
+                int reg = sh[st]->b[(unsigned)__builtin_ctzll(m)].reg;
+                if (aw_fast ? pass_merge_tex_hazard_fast(st, reg, &pm_sp) : pass_merge_tex_hazard(st, reg)) return 1;
             }
             continue;
         }
@@ -1058,7 +1076,7 @@ static int pass_merge_draw_hazard(vk_shader *const sh[6]) {
             if (b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE &&
                 b->dtype != VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER) return 1;
             if (b->reg < 0 || b->reg >= 128) return 1;
-            if (pass_merge_tex_hazard(st, b->reg)) return 1;
+            if (aw_fast ? pass_merge_tex_hazard_fast(st, b->reg, &pm_sp) : pass_merge_tex_hazard(st, b->reg)) return 1;
         }
     }
     return 0;
@@ -1580,7 +1598,7 @@ static int begin_rendering_inner(int draw_tail) {
     VkRenderingAttachmentInfo ca[8], da = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO}, sa = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
     uint32_t w = 16384, h = 16384, nc = 0; int have = 0;
     g_pipe_dirty = 1;
-    memset(R.cfmt, 0, sizeof R.cfmt); R.dfmt = R.sfmt = VK_FORMAT_UNDEFINED; memset(R.ctex, 0, sizeof R.ctex); R.dtex = NULL; R.samples = VK_SAMPLE_COUNT_1_BIT;
+    memset(R.cfmt, 0, sizeof R.cfmt); R.dfmt = R.sfmt = VK_FORMAT_UNDEFINED; memset(R.ctex, 0, sizeof R.ctex); R.dtex = NULL; R.samples = VK_SAMPLE_COUNT_1_BIT; R.fb_bloom.ready = 0u;
     R.native = R.canvas = 0;
     memset(R.caddr, 0, sizeof R.caddr); R.daddr = NULL; R.cleared = 0;
     if (S.has_rt) for (int i = 0; i < S.rt.n && i < 8; i++) {
@@ -1642,9 +1660,9 @@ static int begin_rendering_inner(int draw_tail) {
             unsigned l = view_level(&S.rt.dview, S.rt.has_dview);
             R.dlevel = (uint8_t)l; R.dlayer = S.rt.has_dview && S.rt.dview.set_layers ? S.rt.dview.min_layer : 0;
             w = MINV(w, vk_tex_width(x, l)); h = MINV(h, vk_tex_height(x, l));
-            { uint32_t key = vk_tex_width(x, l) << 16 | vk_tex_height(x, l); int k = 0;   /* the frame's depth target sizes */
-              while (k < g_fr_n && g_fr[k] != key) k++;
-              if (k == g_fr_n && g_fr_n < 16) g_fr[g_fr_n++] = key; }
+            { uint32_t key = vk_tex_width(x, l) << 16 | vk_tex_height(x, l);   /* the frame's depth target sizes */
+              if (totk_vk_ans_widen_fast_on()) totk_fr_record_u32(g_fr, &g_fr_n, key);
+              else { int k = 0; while (k < g_fr_n && g_fr[k] != key) k++; if (k == g_fr_n && g_fr_n < 16) g_fr[g_fr_n++] = key; } }
             VkImageAspectFlags as = vk_tex_aspect(x); R.dtex = x; R.d_serial = t->serial; vk_tex_mark_gpu_written(x); have = 1;
             R.daddr = t->mem; if (R.clear_d || R.clear_s) R.cleared |= 1u << 8;
             if (as & VK_IMAGE_ASPECT_DEPTH_BIT) { da.imageView = v; da.imageLayout = VK_IMAGE_LAYOUT_GENERAL; da.loadOp = R.clear_d ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD; da.storeOp = VK_ATTACHMENT_STORE_OP_STORE; R.dfmt = vk_tex_format(x); da.clearValue.depthStencil.depth = R.dfmt == VK_FORMAT_D16_UNORM ? d16_clear(R.cd) : R.cd; }
@@ -1743,6 +1761,12 @@ static int begin_rendering_inner(int draw_tail) {
     R.open = 1; g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; g_dyn_input_rev++; g_stat_passes++; R.draws0 = g_stat_draws; pass_inputs_reset(); g_pops.disabled_at_start = S.render_disabled;
     pso_life_pass_write(1);
     g_overlay_scene_dirty = 1;
+    totk_rt_fb_reset(&R.fb_bloom);
+    for (unsigned a_ = 0; a_ < 9u; a_++) {
+        vk_tex *t_ = a_ < 8u ? (a_ < R.ncolor ? R.ctex[a_] : NULL) : R.dtex;
+        if (t_) totk_rt_fb_add(&R.fb_bloom, (uintptr_t)vk_tex_image(t_));
+    }
+    R.fb_bloom.ready = 1u;
     if (vk_fg_extract_active) fg_extract_pass_begin((R.cleared & 255u) |
         (da.imageView && da.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1u << 8 : 0) |
         (sa.imageView && sa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? 1u << 9 : 0));
@@ -4938,6 +4962,7 @@ static int record_uniforms_unchanged(vk_shader *sh, int stage, uint64_t revision
    is left alone (counted). Sampled views only; storage images are the game's own explicit read/write. */
 static VkImageView feedback_cut(vk_tex *x, VkImageView view) {
     VkImage image = vk_tex_image(x); int attached = 0;
+    if (totk_vk_ans_widen_fast_on() && R.fb_bloom.ready && !totk_rt_fb_may_contain(&R.fb_bloom, (uintptr_t)image)) return view;
     for (unsigned a = 0; a < 9 && !attached; a++) {
         vk_tex *t = a < 8 ? (a < R.ncolor ? R.ctex[a] : NULL) : R.dtex;
         attached = t && vk_tex_image(t) == image;
@@ -5438,7 +5463,8 @@ static void quad_indices(uint32_t quads) {
     vk_alloc a; if (!vk_mem_alloc(&req, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &a)) DIE("quad index buffer");
     VKCHECK(vkBindBufferMemory(V.dev, b, a.mem, a.off));
     uint32_t *ix; VKCHECK(vkMapMemory(V.dev, a.mem, a.off, (VkDeviceSize)n * 24, 0, (void **)&ix));
-    for (uint32_t q = 0; q < n; q++) { uint32_t v = q * 4, t[6] = {v, v + 1, v + 2, v, v + 2, v + 3}; memcpy(ix + q * 6, t, 24); }
+    if (totk_vk_ans_widen_fast_on()) totk_fill_quad_ib_u32(ix, n);
+    else for (uint32_t q = 0; q < n; q++) { uint32_t v = q * 4, t[6] = {v, v + 1, v + 2, v, v + 2, v + 3}; memcpy(ix + q * 6, t, 24); }
     vkUnmapMemory(V.dev, a.mem);
     g_quad_ib = b; g_quad_max = n;   /* the old buffer (if any) is left alive: it may be in flight */
 }
@@ -5705,10 +5731,25 @@ static void native_bound_update(unsigned st, int image, unsigned first, unsigned
 }
 /* Registration/promotion changes rebuild these tiny masks once, not once per
    draw. Ordinary descriptor changes update only their changed handle slots. */
+static void native_bound_sync_stage_fast(unsigned st) {
+    g_native_bound[st].tex[0] = g_native_bound[st].tex[1] = 0u; g_native_bound[st].img = 0u;
+    for (int w = 0; w < 2; w++) for (uint64_t m = totk_ans_tex_word(S.tex_nz[st][w], w, (unsigned)S.tex_hi[st]); m; m &= m - 1u) {
+        unsigned i = ((unsigned)w << 6) + (unsigned)__builtin_ctzll(m); uint64_t h = S.tex[st][i];
+        if (h && vk_native_descriptor((int)(h & 0xfffff))) g_native_bound[st].tex[w] |= UINT64_C(1) << (i & 63u);
+    }
+    for (uint32_t m = totk_ans_img_word(S.img_nz[st]); m; m &= m - 1u) {
+        unsigned i = (unsigned)__builtin_ctz(m); uint64_t h = S.img[st][i];
+        if (h && vk_native_descriptor((int)(h & 0xfffff))) g_native_bound[st].img |= UINT32_C(1) << i;
+    }
+    if (g_native_bound[st].tex[0] || g_native_bound[st].tex[1] || g_native_bound[st].img) g_native_bound_any |= 1u << st;
+    else g_native_bound_any &= ~(1u << st);
+}
 static void native_bound_sync(void) {
     uint64_t revision=vk_native_descriptor_revision();
     if (revision==g_native_bound_revision) return;
-    for (unsigned st=0;st<6;st++) { native_bound_update(st,0,0,S.tex_hi[st]); native_bound_update(st,1,0,32); }
+    if (totk_vk_ans_widen_fast_on() && S.tex_nz_ready && S.img_nz_ready) {
+        for (unsigned st=0;st<6;st++) native_bound_sync_stage_fast(st);
+    } else for (unsigned st=0;st<6;st++) { native_bound_update(st,0,0,S.tex_hi[st]); native_bound_update(st,1,0,32); }
     g_native_bound_revision=revision;
 }
 /* Resolve reflected reads only when they can touch a promoted backing. In
@@ -6002,7 +6043,8 @@ static uint64_t record_widen_u8(vk_record_draw *d, uint64_t ibuf, uint32_t count
     VkDeviceSize to;
     uint16_t *copy = vk_transient((size_t)count * 2 + 2, 16, &d->index, &to);
     const uint8_t *source = (const uint8_t *)(uintptr_t)ibuf;
-    for (uint32_t i = 0; i < count; i++) copy[i] = source[i] == 0xff ? 0xffff : source[i];
+    if (totk_vk_ans_widen_fast_on()) totk_widen_u8_indices(copy, source, count);
+    else for (uint32_t i = 0; i < count; i++) copy[i] = source[i] == 0xff ? 0xffff : source[i];
     d->index_address = 0; d->index_offset = to; d->index_type = VK_INDEX_TYPE_UINT16;
     return to;
 }
@@ -11165,7 +11207,8 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     probe_frame_end(n);
     pd_frame_end(n);
     if (g_fr_n) {
-        qsort(g_fr, (size_t)g_fr_n, sizeof *g_fr, u32cmp);
+        if (totk_vk_ans_widen_fast_on()) totk_sort_u32_small(g_fr, g_fr_n);
+        else qsort(g_fr, (size_t)g_fr_n, sizeof *g_fr, u32cmp);
         if (g_fr_n != g_prev_n || memcmp(g_fr, g_prev, (size_t)g_fr_n * sizeof *g_fr)) {
             uint64_t c = ++g_stat_rescg;
             if (g_prev_n && (c <= 64 || c % 100 == 0)) { char a[300], b[300]; sizes_str(g_prev, g_prev_n, a, sizeof a); sizes_str(g_fr, g_fr_n, b, sizeof b);

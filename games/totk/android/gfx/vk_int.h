@@ -20,6 +20,7 @@
 #include "vk_touch_alias_fast.h"
 #include "vk_ub_gw_fast.h"
 #include "vk_load_wb_fast.h"
+#include "vk_ans_widen_fast.h"
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdint.h>

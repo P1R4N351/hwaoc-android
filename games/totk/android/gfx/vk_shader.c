@@ -196,16 +196,27 @@ static const char *image_format(int f) {
 }
 static const char *class_name(int f) { int c = vk_fmt_class(f); return c == 1 ? "uint" : c == 2 ? "sint" : "float"; }
 typedef struct { char tex[128][24]; char img[32][48]; char attr[16][8]; char fout[8][8]; uint8_t has_tex[128], has_img[32], has_attr[16], has_fout[8]; } answers_t;
+static inline void answers_tex_slot(int st, int r, answers_t *a) {
+    int f, tg; if (!vk_treg_kind((int)(S.tex[st][r] & 0xfffff), &f, &tg)) return;
+    snprintf(a->tex[r], sizeof a->tex[r], "%s%s", target_name(tg), f >= 0x32 && f <= 0x36 ? "_depth" : ""); a->has_tex[r] = 1;
+}
+static inline void answers_img_slot(int st, int r, answers_t *a) {
+    int f, tg; if (!vk_treg_kind((int)(S.img[st][r] & 0xfffff), &f, &tg)) return;
+    const char *fn = image_format(f);
+    snprintf(a->img[r], sizeof a->img[r], "%s%s%s", target_name(tg), fn ? "/" : "", fn ? fn : ""); a->has_img[r] = 1;
+}
 static void answers_of(int st, answers_t *a) {
     memset(a, 0, sizeof *a);
-    for (int r = 0; r < 128; r++) if (S.tex[st][r]) {
-        int f, tg; if (!vk_treg_kind((int)(S.tex[st][r] & 0xfffff), &f, &tg)) continue;
-        snprintf(a->tex[r], sizeof a->tex[r], "%s%s", target_name(tg), f >= 0x32 && f <= 0x36 ? "_depth" : ""); a->has_tex[r] = 1;
-    }
-    for (int r = 0; r < 32; r++) if (S.img[st][r]) {
-        int f, tg; if (!vk_treg_kind((int)(S.img[st][r] & 0xfffff), &f, &tg)) continue;
-        const char *fn = image_format(f);
-        snprintf(a->img[r], sizeof a->img[r], "%s%s%s", target_name(tg), fn ? "/" : "", fn ? fn : ""); a->has_img[r] = 1;
+    if (totk_vk_ans_widen_fast_on() && S.tex_nz_ready && S.img_nz_ready) {
+        for (int w = 0; w < 2; w++) for (uint64_t m = totk_ans_tex_word(S.tex_nz[st][w], w, 128u); m; m &= m - 1u) {
+            int r = (w << 6) + __builtin_ctzll(m); if (S.tex[st][r]) answers_tex_slot(st, r, a);
+        }
+        for (uint32_t m = totk_ans_img_word(S.img_nz[st]); m; m &= m - 1u) {
+            int r = __builtin_ctz(m); if (S.img[st][r]) answers_img_slot(st, r, a);
+        }
+    } else {
+        for (int r = 0; r < 128; r++) if (S.tex[st][r]) answers_tex_slot(st, r, a);
+        for (int r = 0; r < 32; r++) if (S.img[st][r]) answers_img_slot(st, r, a);
     }
     if (st == 0) for (int i = 0; i < S.nattr && i < 16; i++) { snprintf(a->attr[i], sizeof a->attr[i], "%s", class_name(S.attr[i].fmt)); a->has_attr[i] = 1; }
     if (st == 1 && S.has_rt) for (int i = 0; i < S.rt.n && i < 8; i++) if (S.rt.color[i]) {

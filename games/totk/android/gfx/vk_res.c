@@ -1008,7 +1008,7 @@ typedef struct {
     unsigned land_level, land_layer;
 } wb_ent;
 enum wb_land_mode { WB_SYNC, WB_IDLE, WB_INVALIDATE, WB_INVALIDATE_TRY };
-static wb_ent *g_wb; static int g_nwb, g_capwb;   /* g_tex_mu */
+static wb_ent *g_wb; static int g_nwb, g_capwb; static _Atomic int g_nwb_live;   /* g_tex_mu */
 static _Atomic uint64_t g_wb_lo = UINT64_MAX, g_wb_hi; /* unlocked quick reject, conservative until sweep */
 static uint64_t g_wb_done, g_wb_skip_cpu, g_wb_skip_fmt, g_wb_superseded, g_wb_bytes, g_wb_aged;
 static uint64_t g_set_done, g_set_bytes, g_set_skip_cpu, g_set_superseded, g_set_staging, g_set_copies, g_set_invalidate;
@@ -1322,7 +1322,7 @@ static void wb_ent_drop_locked(int i) {
     wb_lookup_remove(i);
     nvn_dirty_wb_unwatch(g_wb[i].watch);
     wb_staging_free(&g_wb[i]); wb_unref(g_wb[i].im);
-    g_wb[i] = g_wb[--g_nwb];
+    g_wb[i] = g_wb[--g_nwb]; atomic_store_explicit(&g_nwb_live, g_nwb, memory_order_release);
     totk_wb_im_remove_swap(&g_wb_im_tags, (uint32_t)i, (uint32_t)g_nwb);
 }
 static void wb_cancel_locked(int i) {
@@ -1392,6 +1392,7 @@ static void wb_note_locked(vk_tex *x) {
     g_wb[g_nwb++] = (wb_ent){.t = *t, .im = x->im, .stamp = stamp, .sub = sub, .producer = mtl_last_fence() + 1,
         .pool = pool, .quiet = wb_quiet_for(t, pool), .watch = wb_watch_arm(t, stamp), .tile_version = tile_version};
     g_wb[g_nwb - 1].tracked = wb_watch_tracked(t, g_wb[g_nwb - 1].watch);
+    atomic_store_explicit(&g_nwb_live, g_nwb, memory_order_release);
     totk_wb_im_set(&g_wb_im_tags, (uint32_t)(g_nwb - 1), (uintptr_t)x->im);
     wb_lookup_set(g_nwb - 1, &g_wb[g_nwb - 1]);
 }
@@ -1600,6 +1601,7 @@ static int wb_tiny(const tex_t *t) {
 #endif
 void vk_wb_record(void) {
     if (!settled_on()) return;
+    if (totk_vk_ans_widen_fast_on() && !totk_wb_has_live(atomic_load_explicit(&g_nwb_live, memory_order_acquire))) return;
     uint64_t sub = vk_submit_serial();
     pthread_mutex_lock(&g_tex_mu);
     for (int i = 0; i < g_nwb; ) {
@@ -1843,6 +1845,7 @@ static int wb_inv_select_locked(uint64_t address, uint64_t n, int boundary, int 
         wb_landing_publish(list, nl);
         for (int i = 0; i < g_nwb; ) { if (g_wb[i].cancelled || !wb_overlap(&g_wb[i], address, n)) { i++; continue; } wb_lookup_remove(i); g_wb[i] = g_wb[--g_nwb]; totk_wb_im_remove_swap(&g_wb_im_tags, (uint32_t)i, (uint32_t)g_nwb); }
     }
+    atomic_store_explicit(&g_nwb_live, g_nwb, memory_order_release);
     *list_out = list; *nl_out = nl; return 1;
 }
 static int wb_invalidate_owner(void *arg, int boundary) {
