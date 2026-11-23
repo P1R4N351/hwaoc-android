@@ -26,14 +26,15 @@ own dump of the game.
 
 ## Status
 
-Milestones M0–M6 are verified on `1.3.0` (`v327680`), as recorded in [games/hwaoc/README.md](games/hwaoc/README.md):
+Milestones M0–M7 are verified on `1.3.0` (`v327680`), as recorded in [games/hwaoc/README.md](games/hwaoc/README.md):
 
 - All three code modules (`subsdk0`, `sdk`, `main`) pass `patch_nso.py`, `structck.py` and `equiv.py`.
 - Vulkan graphics are verified through VP9 cutscenes and 3D battle rendering, with `0` unimplemented NVN symbols.
 - `53` shader rows are harvested into [games/hwaoc/assets/shader_list.tsv](games/hwaoc/assets/shader_list.tsv), with
   `0` warm misses on the covered scenes.
 - Save management for the game's flat `svdt` save is wired (`SaveManager.FLAT_SAVE`).
-- The `AoC Native` APK flavours (`0.1.0-beta.1` release, `0.1.0-dev` debuggable) build with `tools/build_app.sh`.
+- The `AoC Native` APK flavours (`0.1.0-beta.1` release, `0.1.0-dev` debuggable) build with `tools/build_app.sh`, with procedural Calamity star-gear main-menu emblem (`b5bb6f3`), AYN handheld Controller style detection (`6e6a5c1`, staged upstream on `P1R4N351/totk-android:ayn-controller-style`), and Vulkan fast-path optimizations (Opts 45–60).
+- **Milestone M7 (Second Screen):** Clean-room MIT Warriors companion (`ktgl_companion.h`, shared with [AoI Native](https://github.com/P1R4N351/hwaoi-android) and [`P1R4N351/nx-second-screen` `v0.3.0`](https://github.com/P1R4N351/nx-second-screen/releases/tag/v0.3.0)) verified live on AYN Thor Display 4 (`1240x1080`).
 
 What differs from Tears of the Kingdom in the runtime (heap split, memory reserve, NVN level, shader list, saves):
 [games/hwaoc/ANDROID.md](games/hwaoc/ANDROID.md).
@@ -67,10 +68,15 @@ save manager exports, imports and backs it up through `SaveManager.FLAT_SAVE`.
 
 ## Second screen
 
-No second-screen page is shown. The companion setting is `map`, TotK Native's own map and inventory screen, which is
-compiled into the app but not shown at the moment (`games/games.toml`, `var.companion`). The APK does not carry the
-GPL-3.0 Eden Duo companion (`gpl_companion = false`; the build and `apk/audit_apk.py` refuse it). An Age of Calamity
-Eden Duo module is milestone M7; its design notes: [games/hwaoc/SECOND_SCREEN_NOTES.md](games/hwaoc/SECOND_SCREEN_NOTES.md).
+**AoC Native** ships the converged clean-room **MIT Warriors Second-Screen Companion** (`ktgl_companion.h`, shared with
+[AoI Native](https://github.com/P1R4N351/hwaoi-android) and published standalone in
+[`P1R4N351/nx-second-screen` `v0.3.0`](https://github.com/P1R4N351/nx-second-screen/releases/tag/v0.3.0)). On dual-screen
+handhelds such as the AYN Thor (Display 4, `1240x1080`), it attaches a `FLAG_NOT_FOCUSABLE | FLAG_KEEP_SCREEN_ON`
+`Presentation` with four evenly-spaced tabs (`RADAR`, `ACTIONS`, `COMBOS`, `STATUS`), a 128-point inertial trail with
+8 tactical waypoint pins, fail-closed Sheikah Rune (`R`) / Rod (`L`) / party / combo chords, cutscene auto-dimming,
+AMOLED pixel-orbit burn-in protection, and Bifrost LED sync. The APK continues to exclude GPL-3.0 Eden Duo companion
+assets (`gpl_companion = false`; enforced by `apk/audit_apk.py`). Engine hook notes:
+[games/hwaoc/SECOND_SCREEN_NOTES.md](games/hwaoc/SECOND_SCREEN_NOTES.md).
 
 ## Known limitations
 
@@ -78,7 +84,6 @@ Eden Duo module is milestone M7; its design notes: [games/hwaoc/SECOND_SCREEN_NO
 - **No on-device setup**: the game folder is prepared on a computer and staged by hand.
 - No PC mod manager is supported for imports (`mod_manager = none`).
 - The documented staging route is for the AYN Thor.
-- No second-screen page (see above).
 - Saves are removed with the app: export them first. A developer build cannot be updated in place by a release build:
   they are signed with different keys.
 
