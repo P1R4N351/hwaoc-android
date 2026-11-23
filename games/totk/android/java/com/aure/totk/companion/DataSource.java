@@ -14,4 +14,9 @@ public interface DataSource {
     default boolean state(long[] out) { return false; }
     /** The page the screen shows now, for that state's page field. Any thread. */
     default void page(int page) { }
+    /** Detailed Warriors companion snapshot (ints[32], flts[416]); null when unavailable. */
+    default String warriorsDetail(int[] ints, float[] flts) { return null; }
+    default boolean warriorsFire(int actionId) { return false; }
+    default void warriorsAbort() { }
+    default int warriorsPin(int op, int slot, String label) { return -1; }
 }

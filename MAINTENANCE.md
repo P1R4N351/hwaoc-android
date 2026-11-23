@@ -35,11 +35,22 @@ Generated from `games/games.toml` (`python3 tools/games.py table`; the test chec
 | `launcher_background` | Adaptive launcher icon background colour, RGB (build_apk.launcher_override, render_launcher.py) | `[11, 20, 22]` | `[7, 13, 24]` | `[20, 8, 10]` |
 | `menu_emblem` | The emblem the menu draws (Widgets.Emblem; the launcher art is launcher_art): 'island' = the sky island above twin peaks, 'sheikah_eye' = the Sheikah eye (app-assets/icon/make_icon_botw.py drawn in Java), 'calamity_crest' = the 8-point Calamity star-gear crest (app-assets/icon/make_icon_hwaoc.py drawn in Java) | `island` | `sheikah_eye` | `calamity_crest` |
 | `mod_manager` | The PC mod manager the Mods import texts name (its merge is what the import takes) | `TKMM` | `BCML` | `none` |
-| `companion` | Second screen (CompanionContent): 'map' = TotK Native's own map and inventory (CompanionView, MIT, drawn from the art the setup generates; compiled into every app, shown by none at the moment), 'duo' = the Eden Duo page drawn by libduo_host.so (DuoSurfaceView). Both sit behind CompanionScreen. With 'duo' the setup does not offer or update the second-screen art (ArtPolicy.used) | `duo` | `duo` | `map` |
+| `companion` | Second screen (CompanionContent): 'map' = CompanionView (MIT, generated art), 'warriors' = WarriorsCompanionView (MIT procedural Canvas for Age of Calamity), 'duo' = Eden Duo page via libduo_host.so (DuoSurfaceView). With 'duo' or 'warriors' the setup skips second-screen art (ArtPolicy.used) | `duo` | `duo` | `warriors` |
 | `gpl_companion` | Whether the APK carries the GPL-3.0 Eden Duo companion (libduo_host.so, its package under assets/duo/, Eden licence texts), which makes the APK as a whole GPL-3.0-or-later (duo/NOTICE.txt; build_release.py then refuses a release from a commit with uncommitted changes or without a source repository). false: the build and audit_apk.py refuse all of it | `true` | `true` | `false` |
 | `duo` | The Eden Duo companion of a gpl_companion game: package = the folder under duo/vendor/companions/packages that the APK carries as assets/duo/<package>/dualscreen (build_release.py; audit_apk.py compares it byte for byte), module = the title module's main source under duo/vendor/companions (android/Makefile passes it with title_id to duo/CMakeLists.txt, which adds the sources that module needs) | `{"package": "TearsOfTheKingdom", "module": "native/modules/0100F2C0115B6000.cpp"}` | `{"package": "BreathOfTheWild", "module": "native/modules/01007EF00011E000.cpp"}` | `{"package": "AgeOfCalamity", "module": "native/modules/01002B00111A2000.cpp"}` |
 | `tablet_can_be_missing` | Whether the game starts without its tablet (BotW's Sheikah Slate; the stick LEDs have a look for that) | `false` | `true` | `false` |
-| `bifrost_looks` | Row of BifrostLooks.LOOKS the stick-LED bridge uses (colour table) | `TOTK` | `BOTW` | `TOTK` |
+| `bifrost_looks` | Row of BifrostLooks.LOOKS the stick-LED bridge uses (colour table) | `TOTK` | `BOTW` | `BOTW` |
+
+Flavours (`build_release.py --game <game> --flavour <flavour>`):
+
+| Game | Flavour | Package | Launcher label | Version | Code | Key | Repository | Release tag, asset |
+|---|---|---|---|---|---|---|---|---|
+| `totk` | `fork` | `io.github.p1r4n351.totk` | TotK Native (fork) | `1.0.1-fork.4` | 10004 | `fork-release.p12` | P1R4N351/totk-android | `v<version>`, `TotK-Native-<version>.apk` |
+| `totk` | `dev` | `io.github.p1r4n351.totk.dev` | TotK Native (dev) | `1.0.1-dev` | clock | `totk-dev.pem` | P1R4N351/totk-android | `v<version>`, `TotK-Native-<version>.apk` |
+| `botw` | `release` | `io.github.p1r4n351.botw` | BotW Native | `0.2.0-pre.1` | 200 | `botw-release.pem` | P1R4N351/botw-android | `botw-v<version>`, `BotW-Native-<version>.apk` |
+| `botw` | `dev` | `io.github.p1r4n351.botw` | BotW Native | `0.2.0-dev` | clock | `botw-dev.pem` | P1R4N351/botw-android | `botw-v<version>`, `BotW-Native-<version>.apk` |
+| `hwaoc` | `release` | `io.github.p1r4n351.hwaoc` | AoC Native | `0.1.0-beta.1` | 101 | `hwaoc-release.pem` | P1R4N351/hwaoc-android | `hwaoc-v<version>`, `AoC-Native-<version>.apk` |
+| `hwaoc` | `dev` | `io.github.p1r4n351.hwaoc.dev` | AoC Native (dev) | `0.1.0-dev` | clock | `hwaoc-dev.pem` | P1R4N351/hwaoc-android | `hwaoc-v<version>`, `AoC-Native-<version>.apk` |
 
 Flavours (`build_release.py --game <game> --flavour <flavour>`):
 

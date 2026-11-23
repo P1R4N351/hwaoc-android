@@ -28,7 +28,7 @@ public final class ArtPolicyProbe {
         check(ArtPolicy.state(false, false, false, false) == ArtPolicy.State.ABSENT, "missing files, even with stale done flag");
         check(ArtPolicy.state(true, true, true, true) == ArtPolicy.State.DONE, "actual assets outrank stale stage flags");
         check(ArtPolicy.state(false, true, true, false) == ArtPolicy.State.OUTDATED, "failed update retains usable old art");
-        check(ArtPolicy.used("map") && !ArtPolicy.used("duo"), "only CompanionView draws from the art; the Eden Duo page needs none");
+        check(ArtPolicy.used("map") && !ArtPolicy.used("duo") && !ArtPolicy.used("warriors"), "only CompanionView draws from the art; Duo and Warriors pages need none");
         System.out.println(combinations + " combinations; asset-state precedence passed");
     }
 }

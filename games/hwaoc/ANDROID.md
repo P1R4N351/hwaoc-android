@@ -16,7 +16,7 @@ This branch adds a third Switch 1 game to the Android port: **Hyrule Warriors: A
 | NVN level & graphics | `hle_nvn.c` / `vk_draw.c`: NVN `53.312` (`main+0x9f94..0x9f9c`), `NEAR_IS_MINUS_W`, `nvnQueueAcquireTexture`, separable `nvnCommandBufferBindProgram`, `nvnCommandBufferSetCopyImageStride`, `nvnTexturePoolRegisterImage`, `nvnCommandBufferDrawArraysIndirect` (incl. `QUADS` rewrite via `quad_indirect_spv`), `nvnCommandBufferDrawElementsIndirect` |
 | Shader list | `games/hwaoc/assets/shader_list.tsv` (`53` harvested `V` rows against `11,054` KTGL RomFS shader keys; `0` warm misses on covered scenes) |
 | Saves | Flat single-file layout under `user-data/save/<uid>/svdt` (`1,048,576` B; `save_slots = { dir = "", file = "svdt", picture = "", names = "svdt" }`, `SaveManager.FLAT_SAVE`) |
-| Companion | `gpl_companion = false`, `companion = "none"` until M7 authors an Age of Calamity Duo module |
+| Companion | `gpl_companion = false`, `companion = "warriors"`: MIT procedural Canvas second screen (`WarriorsCompanionView`) + `ktgl_companion.h` 3D radar/chord engine + `BOTW` Bifrost stick LEDs |
 
 ## Staging layout on Thor (developer probe route)
 

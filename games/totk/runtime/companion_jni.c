@@ -215,14 +215,30 @@ static jstring JNICALL native_snapshot(JNIEnv *env, jclass cls, jint detail) {
 }
 
 /* The common state. The page is the Java screen's unless the game side filled one in. */
+
+__attribute__((weak)) int hwaoc_companion_state(CompanionState *out, int64_t *age_ms);
+__attribute__((weak)) void hwaoc_companion_page(int page);
+__attribute__((weak)) int hwaoc_companion_detail(int32_t *ints, int max_ints, float *flts, int max_flts, char *txt, int max_txt);
+__attribute__((weak)) int hwaoc_companion_fire(int action_id);
+__attribute__((weak)) void hwaoc_companion_abort(void);
+__attribute__((weak)) int hwaoc_companion_pin(int op, int slot, const char *label);
 static _Atomic int shown_page = -1;
 static void JNICALL native_page(JNIEnv *env, jclass cls, jint page) {
     (void)env; (void)cls;
     atomic_store(&shown_page, page);
+    if (hwaoc_companion_page) hwaoc_companion_page(page);
 }
 static jboolean JNICALL native_state(JNIEnv *env, jclass cls, jlongArray out) {
     if (!out || (*env)->GetArrayLength(env, out) < COMPANION_STATE_FIELDS || !native_enabled(env, cls)) return JNI_FALSE;
     CompanionState s; int64_t age = 0, words[COMPANION_STATE_FIELDS];
+    if (hwaoc_companion_state && hwaoc_companion_state(&s, &age)) {
+        if (s.page < 0) s.page = atomic_load(&shown_page);
+        companion_state_words(&s, age, words);
+        jlong copy[COMPANION_STATE_FIELDS];
+        for (int i = 0; i < COMPANION_STATE_FIELDS; i++) copy[i] = words[i];
+        (*env)->SetLongArrayRegion(env, out, 0, COMPANION_STATE_FIELDS, copy);
+        return JNI_TRUE;
+    }
     int hosted = runtime_duo_state(&s, &age);
 #if defined(GAME_BOTW) || defined(GAME_HWAOC)
     if (!hosted) return JNI_FALSE;   /* runtime has no companion reader for this game */
@@ -275,6 +291,30 @@ static jboolean JNICALL native_action(JNIEnv *env, jclass cls, jint kind, jint a
     return JNI_TRUE;
 }
 
+
+static jstring JNICALL native_warriors_detail(JNIEnv *env, jclass cls, jintArray ints, jfloatArray flts) {
+    if (!native_enabled(env, cls) || !ints || !flts || !hwaoc_companion_detail) return NULL;
+    if ((*env)->GetArrayLength(env, ints) < 32 || (*env)->GetArrayLength(env, flts) < 416) return NULL;
+    jint ibuf[32] = {0}; jfloat fbuf[416] = {0}; char txt[512] = "";
+    if (!hwaoc_companion_detail((int32_t *)ibuf, 32, (float *)fbuf, 416, txt, sizeof txt)) return NULL;
+    (*env)->SetIntArrayRegion(env, ints, 0, 32, ibuf);
+    (*env)->SetFloatArrayRegion(env, flts, 0, 416, fbuf);
+    return (*env)->NewStringUTF(env, txt);
+}
+static jboolean JNICALL native_warriors_fire(JNIEnv *env, jclass cls, jint id) {
+    return (native_enabled(env, cls) && hwaoc_companion_fire && hwaoc_companion_fire((int)id)) ? JNI_TRUE : JNI_FALSE;
+}
+static void JNICALL native_warriors_abort(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls; if (hwaoc_companion_abort) hwaoc_companion_abort();
+}
+static jint JNICALL native_warriors_pin(JNIEnv *env, jclass cls, jint op, jint slot, jstring label) {
+    if (!native_enabled(env, cls) || !hwaoc_companion_pin) return -1;
+    const char *s = label ? (*env)->GetStringUTFChars(env, label, NULL) : NULL;
+    int r = hwaoc_companion_pin((int)op, (int)slot, s);
+    if (s) (*env)->ReleaseStringUTFChars(env, label, s);
+    return (jint)r;
+}
+
 __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
     JNIEnv *env;
@@ -294,6 +334,10 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
         {"result", "(I)Ljava/lang/String;", (void *)native_result},
         {"nativeState", "([J)Z", (void *)native_state},
         {"nativePage", "(I)V", (void *)native_page},
+        {"warriorsDetailNative", "([I[F)Ljava/lang/String;", (void *)native_warriors_detail},
+        {"warriorsFireNative", "(I)Z", (void *)native_warriors_fire},
+        {"warriorsAbortNative", "()V", (void *)native_warriors_abort},
+        {"warriorsPinNative", "(IILjava/lang/String;)I", (void *)native_warriors_pin},
     };
     if ((*env)->RegisterNatives(env, cls, methods, sizeof methods / sizeof *methods)) {
         (*env)->ExceptionClear(env); fprintf(stderr, "[companion] RegisterNatives failed\n");

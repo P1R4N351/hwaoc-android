@@ -145,10 +145,10 @@ botw = "BCML"
 hwaoc = "none"
 
 [var.companion]
-meaning = "Second screen (CompanionContent): 'map' = TotK Native's own map and inventory (CompanionView, MIT, drawn from the art the setup generates; compiled into every app, shown by none at the moment), 'duo' = the Eden Duo page drawn by libduo_host.so (DuoSurfaceView). Both sit behind CompanionScreen. With 'duo' the setup does not offer or update the second-screen art (ArtPolicy.used)"
+meaning = "Second screen (CompanionContent): 'map' = CompanionView (MIT, generated art), 'warriors' = WarriorsCompanionView (MIT procedural Canvas for Age of Calamity), 'duo' = Eden Duo page via libduo_host.so (DuoSurfaceView). With 'duo' or 'warriors' the setup skips second-screen art (ArtPolicy.used)"
 totk = "duo"
 botw = "duo"
-hwaoc = "map"
+hwaoc = "warriors"
 
 [var.gpl_companion]
 meaning = "Whether the APK carries the GPL-3.0 Eden Duo companion (libduo_host.so, its package under assets/duo/, Eden licence texts), which makes the APK as a whole GPL-3.0-or-later (duo/NOTICE.txt; build_release.py then refuses a release from a commit with uncommitted changes or without a source repository). false: the build and audit_apk.py refuse all of it"
@@ -172,7 +172,7 @@ hwaoc = false
 meaning = "Row of BifrostLooks.LOOKS the stick-LED bridge uses (colour table)"
 totk = "TOTK"
 botw = "BOTW"
-hwaoc = "TOTK"
+hwaoc = "BOTW"
 
 # ---------------------------------------------------------------- app flavours: identity, version and signing key
 # key / key_pass_file are file names in the build machine's key folder (TOTK_KEYS_DIR, default /root/totk-work/keys).
@@ -259,7 +259,7 @@ release_asset = "AoC-Native-"
 "games/totk/android/gfx/vk_res.c" = { n = 2, vars = ["runtime_code"] }
 "games/totk/android/gfx/vk_shader.c" = { n = 2, vars = ["runtime_code"] }
 "games/totk/android/java/com/aure/totk/BifrostState.java" = { n = 1, vars = ["bifrost_looks"] }
-"games/totk/android/java/com/aure/totk/companion/CompanionContent.java" = { n = 1, vars = ["companion"] }
+"games/totk/android/java/com/aure/totk/companion/CompanionContent.java" = { n = 2, vars = ["companion"] }
 "games/totk/android/java/com/aure/totk/setup/ArtPolicy.java" = { n = 1, vars = ["companion"] }
 "games/totk/android/setup/setup.c" = { n = 1, vars = ["ondevice_setup"] }
 "games/totk/app/launcher.m" = { n = 1, vars = ["runtime_code"] }

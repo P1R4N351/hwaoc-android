@@ -8,6 +8,11 @@
 #include "game_patches.h"
 #include "game_version.h"
 #include "mod_ips.h"
+#include "android_pause.h"
+#include "fs_host.h"
+#include "movie_host.h"
+#include "hwaoc_companion.h"
+#include <pthread.h>
 
 enum {
     KTSL_ENGINE_OFF = 0x8d9610u,
@@ -72,7 +77,135 @@ void runtime_game_patches(Module *m) {
     patch_ktsl_heap(m);
 }
 
+
+static pthread_mutex_t g_comp_mu = PTHREAD_MUTEX_INITIALIZER;
+static KtglCompanionCtx g_comp_ctx;
+static int g_comp_inited;
+static uint64_t g_comp_win_t0, g_comp_win_frames, g_comp_prev_btn;
+static float g_comp_fps;
+
+static void comp_ensure_locked(void) {
+    if (g_comp_inited) return;
+    const char *rot = getenv("TOTK_DUO_MAP_ROTATE");
+    const char *left = getenv("TOTK_DUO_LEFT_PANEL");
+    int heading = (rot && !strcmp(rot, "1")) ? 1 : 0;
+    int init_pg = (left && !strcmp(left, "powers")) ? 1 : 0;
+    ktgl_companion_init(&g_comp_ctx, KTGL_GAME_AOC, heading, init_pg);
+    g_comp_inited = 1;
+}
+
+static int comp_enabled(void) {
+    const char *e = getenv("TOTK_COMPANION");
+    return !(e && !strcmp(e, "0"));
+}
+
+static float comp_sample_fps(uint64_t now_ns) {
+    if (!g_comp_win_t0 || now_ns <= g_comp_win_t0) {
+        g_comp_win_t0 = now_ns;
+        g_comp_win_frames = 1;
+        return g_comp_fps;
+    }
+    g_comp_win_frames++;
+    uint64_t dt = now_ns - g_comp_win_t0;
+    if (dt >= 500000000ULL) {
+        g_comp_fps = (float)((double)g_comp_win_frames * 1e9 / (double)dt);
+        g_comp_win_t0 = now_ns;
+        g_comp_win_frames = 0;
+    }
+    return g_comp_fps;
+}
+
+static void comp_present(uint64_t now_ns) {
+    int32_t lx = 0, ly = 0, rx = 0, ry = 0;
+    uint64_t phys = 0ULL;
+    runtime_input_peek_pad(&lx, &ly, &rx, &ry, &phys);
+    int loaded = runtime_module_base("main") != NULL;
+    KtglHostSample s = {
+        .enabled = comp_enabled(), .game_kind = KTGL_GAME_AOC, .main_loaded = loaded, .build_ok = loaded,
+        .host_paused = runtime_android_game_paused(), .movie_playing = movie_host_active(),
+        .save_busy = runtime_fs_save_busy(), .save_commits = runtime_fs_save_commits(),
+        .now_ns = now_ns, .fps = comp_sample_fps(now_ns),
+        .lx = lx, .ly = ly, .rx = rx, .ry = ry, .phys_buttons = phys,
+    };
+    uint64_t seq_btn = 0ULL;
+    int push = 0;
+    pthread_mutex_lock(&g_comp_mu);
+    comp_ensure_locked();
+    ktgl_companion_present(&g_comp_ctx, &s);
+    seq_btn = g_comp_ctx.seq_buttons;
+    if (seq_btn != g_comp_prev_btn) { g_comp_prev_btn = seq_btn; push = 1; }
+    pthread_mutex_unlock(&g_comp_mu);
+    if (push) runtime_input_companion_buttons(seq_btn);
+}
+
+int hwaoc_companion_state(CompanionState *out, int64_t *age_ms) {
+    if (!out || !comp_enabled()) return 0;
+    pthread_mutex_lock(&g_comp_mu);
+    comp_ensure_locked();
+    *out = g_comp_ctx.state;
+    uint64_t st_ns = g_comp_ctx.state_ns;
+    pthread_mutex_unlock(&g_comp_mu);
+    if (out->status == COMPANION_STATE_NONE || !st_ns) return 0;
+    if (age_ms) {
+        uint64_t now = runtime_now_ns();
+        *age_ms = (now >= st_ns) ? (int64_t)((now - st_ns) / 1000000ULL) : 0;
+    }
+    return 1;
+}
+
+void hwaoc_companion_page(int page) {
+    pthread_mutex_lock(&g_comp_mu);
+    comp_ensure_locked();
+    g_comp_ctx.user_page = (int32_t)page;
+    pthread_mutex_unlock(&g_comp_mu);
+}
+
+int hwaoc_companion_detail(int32_t *ints, int max_ints, float *flts, int max_flts, char *txt, int max_txt) {
+    if (!comp_enabled()) return 0;
+    int ok = 0;
+    pthread_mutex_lock(&g_comp_mu);
+    comp_ensure_locked();
+    if (g_comp_ctx.state.status != COMPANION_STATE_NONE && g_comp_ctx.state_ns > 0ULL) {
+        ok = ktgl_companion_pack_detail(&g_comp_ctx, ints, max_ints, flts, max_flts, txt, max_txt);
+    }
+    pthread_mutex_unlock(&g_comp_mu);
+    return ok;
+}
+
+int hwaoc_companion_fire(int action_id) {
+    if (!comp_enabled()) return 0;
+    uint64_t now = runtime_now_ns(), seq_btn = 0ULL;
+    int ok = 0;
+    pthread_mutex_lock(&g_comp_mu);
+    comp_ensure_locked();
+    ok = ktgl_companion_fire(&g_comp_ctx, action_id, now);
+    seq_btn = g_comp_ctx.seq_buttons;
+    if (ok) g_comp_prev_btn = seq_btn;
+    pthread_mutex_unlock(&g_comp_mu);
+    if (ok) runtime_input_companion_buttons(seq_btn);
+    return ok;
+}
+
+void hwaoc_companion_abort(void) {
+    pthread_mutex_lock(&g_comp_mu);
+    comp_ensure_locked();
+    ktgl_companion_abort(&g_comp_ctx);
+    g_comp_prev_btn = 0ULL;
+    pthread_mutex_unlock(&g_comp_mu);
+    runtime_input_companion_buttons(0ULL);
+}
+
+int hwaoc_companion_pin(int op, int slot, const char *label) {
+    if (!comp_enabled()) return -1;
+    pthread_mutex_lock(&g_comp_mu);
+    comp_ensure_locked();
+    int rc = ktgl_companion_pin(&g_comp_ctx, op, slot, label);
+    pthread_mutex_unlock(&g_comp_mu);
+    return rc;
+}
+
 void runtime_frame_step_update(uint64_t now_ns) {
+    comp_present(now_ns);
 #if DUO_LINK_WEAK
     if (runtime_duo_frame) runtime_duo_frame();
 #endif

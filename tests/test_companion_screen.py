@@ -51,7 +51,7 @@ public class AssetManager {
     'android/graphics/ColorFilter.java': 'package android.graphics; public class ColorFilter { }',
     'android/graphics/PorterDuff.java': 'package android.graphics; public class PorterDuff { public enum Mode { SRC_IN } }',
     'android/graphics/PorterDuffColorFilter.java': 'package android.graphics; public class PorterDuffColorFilter extends ColorFilter { public PorterDuffColorFilter(int color, PorterDuff.Mode mode) { } }',
-    'android/graphics/Typeface.java': 'package android.graphics; public class Typeface { }',
+    'android/graphics/Typeface.java': 'package android.graphics; public class Typeface { public static final Typeface DEFAULT = new Typeface(), DEFAULT_BOLD = new Typeface(); }',
     'android/graphics/Path.java': '''package android.graphics;
 public class Path {
     public void reset() { } public void moveTo(float x, float y) { } public void cubicTo(float a, float b, float c, float d, float e, float f) { }
@@ -74,7 +74,7 @@ public class RectF {
     'android/graphics/Paint.java': '''package android.graphics;
 public class Paint {
     public static final int ANTI_ALIAS_FLAG = 1, FILTER_BITMAP_FLAG = 2;
-    public enum Style { FILL, STROKE } public enum Align { LEFT, CENTER } public enum Cap { ROUND, BUTT }
+    public enum Style { FILL, STROKE } public enum Align { LEFT, CENTER, RIGHT } public enum Cap { ROUND, BUTT }
     public Paint(int flags) { }
     public void setColor(int c) { } public void setStrokeWidth(float w) { } public void setStyle(Style s) { } public void setTextAlign(Align a) { }
     public void setStrokeCap(Cap c) { } public void setTextSize(float s) { } public Typeface setTypeface(Typeface t) { return t; }
@@ -89,7 +89,8 @@ public class Canvas {
     public int save() { return 0; } public void restore() { } public void restoreToCount(int n) { }
     public int saveLayerAlpha(RectF b, int a) { return 0; } public int saveLayerAlpha(float l, float t, float r, float b, int a) { return 0; }
     public boolean clipRect(RectF r) { return true; } public boolean clipRect(float l, float t, float r, float b) { return true; }
-    public void translate(float x, float y) { } public void scale(float x, float y, float px, float py) { }
+    public void translate(float x, float y) { } public void scale(float x, float y, float px, float py) { } public void rotate(float d, float px, float py) { }
+    public void drawColor(int c) { } public void drawRoundRect(RectF r, float rx, float ry, Paint p) { }
     public void drawRect(RectF r, Paint p) { } public void drawRect(float l, float t, float r, float b, Paint p) { }
     public void drawLine(float a, float b, float c, float d, Paint p) { } public void drawText(String s, float x, float y, Paint p) { }
     public void drawBitmap(Bitmap b, android.graphics.Rect s, RectF d, Paint p) { } public void drawCircle(float x, float y, float r, Paint p) { }
@@ -216,12 +217,13 @@ public final class ScreenProbe {
             @Override public String read(int detail) { return null; }
             @Override public boolean send(int kind, int arg) { return false; }
         };
-        boolean botw = args[0].equals("botw"), duo = args[1].equals("duo");
+        boolean botw = args[0].equals("botw"), duo = args[1].equals("duo"), warriors = args[1].equals("warriors");
         require(CompanionContent.TABLET_CAN_BE_MISSING == botw, "the build says whether its tablet can be missing");
         for (int initial = 0; initial < 3; initial++) {
             CompanionScreen screen = CompanionContent.create(context, source, initial);
             require(screen.view() == screen, "the screen is its own view");
-            require(screen.getClass().getSimpleName().equals(duo ? "DuoSurfaceView" : "CompanionView"), "this build's screen");
+            String wantClass = duo ? "DuoSurfaceView" : warriors ? "WarriorsCompanionView" : "CompanionView";
+            require(screen.getClass().getSimpleName().equals(wantClass), "this build's screen");
             CompanionState state = new CompanionState();
             screen.onGameState(state);                                    // no state at all is a state a screen takes
             require(state.set(new long[]{CompanionState.READY, 1, 1, 1, 12, 12, initial, 0}), "state");
@@ -234,11 +236,13 @@ public final class ScreenProbe {
             }
             require(screen.page() == initial, "created on the page asked for");
             for (int page = 0; page < 3; page++) { screen.setPage(page); require(screen.page() == page, "page round trip " + page); }
-            screen.setPage(7); require(screen.page() == 2, "beyond the last page: the last");
+            int lastPage = warriors ? 3 : 2;
+            screen.setPage(7); require(screen.page() == lastPage, "beyond the last page: the last");
             screen.setPage(-3); require(screen.page() == 0, "before the first: the first");
             int redraws = android.view.View.invalidated, fulls = fullRequests();
             screen.setPage(1);
-            require(android.view.View.invalidated == redraws + 1 && fullRequests() == fulls + 1, "a page change redraws once and asks for the whole snapshot");
+            int expectFull = warriors ? fulls : fulls + 1;
+            require(android.view.View.invalidated == redraws + 1 && fullRequests() == expectFull, "a page change redraws once");
             // A loading screen named by the common state is a change of view: one redraw; the same state again: none.
             state.set(new long[]{CompanionState.LOADING, 0, 0, 1, -1, -1, 1, 0});
             redraws = android.view.View.invalidated;
@@ -417,6 +421,7 @@ class CompanionScreenTests(unittest.TestCase):
         """Both screens and the one CompanionContent, compiled with this game's generated GameBuild (with another
         companion value when given: the MIT page is chosen by no game today, but stays compiled and working)."""
         shared = [JAVA / n for n in ('CompanionScreen.java', 'CompanionState.java', 'DataSource.java', 'ItemActions.java', 'Motion.java',
+                                     'WarriorsCompanionModel.java', 'WarriorsCompanionDraw.java', 'WarriorsCompanionView.java',
                                      'CompanionView.java', 'DuoSurfaceView.java', 'CompanionContent.java')]
         build = games.java(game)
         if companion:
@@ -445,6 +450,10 @@ class CompanionScreenTests(unittest.TestCase):
                               capture_output=True, text=True)
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertIn('pass: ready rules', self.run_probe(classes, 'com.aure.totk.companion.ReadyProbe'))
+
+    def test_hwaoc_screen_is_warriors_view(self):
+        classes = self.screen_classes('hwaoc')
+        self.assertIn('pass: companion screen hwaoc warriors', self.run_probe(classes, 'com.aure.totk.companion.ScreenProbe', 'hwaoc', 'warriors'))
 
     def test_botw_screen_keeps_no_page_and_needs_no_library(self):
         # No libduo_host.so on the host: the class still loads and the screen still stands behind the interface.

@@ -205,8 +205,8 @@ PATTERNS = {
              re.compile(r'-D(?:GAME_BOTW\w*|GAME_HWAOC\w*|TOTK_GAME_V143)\b')],
     'py': [re.compile(r'(?:==|!=|\bin\b)\s*\(?\s*[\'"]' + TAGS + r'[\'"]'), re.compile(r'[\'"]' + TAGS + r'[\'"]\s*(?:==|!=)')],
     'sh': [re.compile(r'\b(?:botw160|hwaoc130|v143)\b')],
-    'java': [re.compile(r'"(?:' + TAGS[3:-1] + r'|map|duo|TOTK|BOTW|HWAOC)"\s*\.equals\('),
-             re.compile(r'\.equals\(\s*"(?:' + TAGS[3:-1] + r'|map|duo|TOTK|BOTW|HWAOC)"'), re.compile(r'GameBuild\.(?:GAME|VERSION)\s*[!=]=')],
+    'java': [re.compile(r'"(?:' + TAGS[3:-1] + r'|map|duo|warriors|TOTK|BOTW|HWAOC)"\s*\.equals\('),
+             re.compile(r'\.equals\(\s*"(?:' + TAGS[3:-1] + r'|map|duo|warriors|TOTK|BOTW|HWAOC)"'), re.compile(r'GameBuild\.(?:GAME|VERSION)\s*[!=]=')],
 }
 EXCLUDED = (re.compile(r'^(?:tests/|games/totk/tests/|games/totk/duo/vendor/|games/games\.toml$|tools/games\.py$)'),
             re.compile(r'\.md$'))

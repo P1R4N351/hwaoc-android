@@ -19,6 +19,23 @@ static totk_kb_tracker g_kb_fast;
 static _Atomic uint32_t styles_a=1;
 static _Atomic int enabled_a,allowed_a=1,holdType_a,touchReady_a,mouseReady_a,keyboardReady_a;
 static _Atomic int64_t sample;static _Atomic uint64_t padSeen;
+static _Atomic uint64_t g_companion_btns, g_peek_btns;
+static _Atomic int32_t g_peek_lx, g_peek_ly, g_peek_rx, g_peek_ry;
+static void companion_peek_record(const NpadState *st, int paused) {
+ if (paused) {
+  atomic_store_explicit(&g_peek_btns, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_peek_lx, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_peek_ly, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_peek_rx, 0, memory_order_relaxed);
+  atomic_store_explicit(&g_peek_ry, 0, memory_order_relaxed);
+  return;
+ }
+ atomic_store_explicit(&g_peek_btns, st->buttons, memory_order_relaxed);
+ atomic_store_explicit(&g_peek_lx, st->lx, memory_order_relaxed);
+ atomic_store_explicit(&g_peek_ly, st->ly, memory_order_relaxed);
+ atomic_store_explicit(&g_peek_rx, st->rx, memory_order_relaxed);
+ atomic_store_explicit(&g_peek_ry, st->ry, memory_order_relaxed);
+}
 static inline int64_t next_sample(void){return atomic_fetch_add_explicit(&sample,1,memory_order_relaxed)+1;}
 static void user_input(const char *what);
 static int32_t stick_max(int32_t a,int32_t b){return abs(b)>abs(a)?b:a;}
@@ -56,7 +73,15 @@ void runtime_input_key_synthetic(unsigned code,int down){if(code>=128)return;pth
  if(press&&code==KEY_ASPECT_TOGGLE)runtime_aspect_toggle();
  if(press&&code==KEY_TAA_TOGGLE){extern void taa_toggle(void);taa_toggle();}}
 void runtime_input_key(unsigned code,int down){if(down&&code<128)user_input("keyboard");runtime_input_key_synthetic(code,down);}
-void runtime_input_clear(void){pthread_mutex_lock(&inputLock);totk_kb_clear(&g_kb_fast);pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
+void runtime_input_companion_buttons(uint64_t buttons){atomic_store_explicit(&g_companion_btns,buttons&0xFFFFULL,memory_order_release);}
+void runtime_input_peek_pad(int32_t *lx,int32_t *ly,int32_t *rx,int32_t *ry,uint64_t *buttons){
+ if(lx)*lx=atomic_load_explicit(&g_peek_lx,memory_order_relaxed);
+ if(ly)*ly=atomic_load_explicit(&g_peek_ly,memory_order_relaxed);
+ if(rx)*rx=atomic_load_explicit(&g_peek_rx,memory_order_relaxed);
+ if(ry)*ry=atomic_load_explicit(&g_peek_ry,memory_order_relaxed);
+ if(buttons)*buttons=atomic_load_explicit(&g_peek_btns,memory_order_relaxed);
+}
+void runtime_input_clear(void){atomic_store_explicit(&g_companion_btns,0,memory_order_release);pthread_mutex_lock(&inputLock);totk_kb_clear(&g_kb_fast);pthread_mutex_unlock(&inputLock);runtime_gamepad_clear();}
 static void initialize(void){pthread_mutex_lock(&inputLock);atomic_store_explicit(&enabled_a,1,memory_order_release);pthread_mutex_unlock(&inputLock);fprintf(stderr,"[totk] native keyboard controller initialized\n");}
 /* Docked: one full-key controller as player 1 (id 0, style bit 0). Handheld (TOTK_OPERATION_MODE=handheld, the iPhone):
    the same input is the handheld controller (id 0x20, style bit 1, joy-cons attached) and player 1 is not connected;
@@ -86,6 +111,8 @@ static int pad_states_fast(NpadState *out,const uint32_t *id,uint32_t want_style
  NpadState state={.sampling=samp,.attributes=1};int paused=runtime_android_game_paused();
  if(paused||atomic_load_explicit(&g_kb_fast.nonzero,memory_order_acquire)){pthread_mutex_lock(&inputLock);if(paused)totk_kb_clear(&g_kb_fast);else totk_kb_consume(&g_kb_fast,&state.buttons,&state.lx,&state.ly,&state.rx,&state.ry);pthread_mutex_unlock(&inputLock);}
  RuntimeGamepadState pad={0};runtime_gamepad_read(&pad);apply_pad_merge(&state,&pad);
+ companion_peek_record(&state,paused);
+ if(!paused)state.buttons|=atomic_load_explicit(&g_companion_btns,memory_order_acquire);
  if(paused){state.buttons=0;state.lx=state.ly=state.rx=state.ry=0;}
  *out=state;
  if(state.attributes&&totk_ft_on())totk_ft_input_read(totk_ft_current(),totk_ft_now(),runtime_thread_current_handle(),(uint64_t)state.sampling);
@@ -96,7 +123,10 @@ static int pad_states(NpadState *out,int max,const uint32_t *id,uint32_t want_st
  if(en&&al&&*id==pad_id()&&want_style==pad_style()&&(st&want_style)){
  state.attributes=1;totk_kb_consume(&g_kb_fast,&state.buttons,&state.lx,&state.ly,&state.rx,&state.ry);
  RuntimeGamepadState pad={0};runtime_gamepad_read(&pad);apply_pad_merge(&state,&pad);
- if(runtime_android_game_paused()){state.buttons=0;state.lx=state.ly=state.rx=state.ry=0;totk_kb_clear(&g_kb_fast);}
+ int hp=runtime_android_game_paused();
+ companion_peek_record(&state,hp);
+ if(!hp)state.buttons|=atomic_load_explicit(&g_companion_btns,memory_order_acquire);
+ if(hp){state.buttons=0;state.lx=state.ly=state.rx=state.ry=0;totk_kb_clear(&g_kb_fast);}
  }*out=state;
  uint64_t ft_frame=0,ft_now=0;
  if(state.attributes&&totk_ft_on()){ft_frame=totk_ft_current();ft_now=totk_ft_now();}

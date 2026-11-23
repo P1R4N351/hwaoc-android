@@ -10,7 +10,7 @@ final class ArtPolicy {
      *  it. The Eden Duo page ("duo") reads the game's files itself, so the setup neither offers, builds nor updates the
      *  art (the stage and its code stay for CompanionView, which stays compiled). */
     static boolean used(String companion) {
-        return !"duo".equals(companion);
+        return "map".equals(companion);
     }
 
     static State state(boolean skipped, boolean failed, boolean present, boolean current) {

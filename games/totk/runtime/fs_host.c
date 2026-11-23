@@ -70,6 +70,7 @@ static void need(int c, const char *m) { if (!c) runtime_fail(m); }
 /* Save in progress: a save-data file open for writing, or save data changed in the last 3 s and not committed yet (TOTK
    writes a slot's files back to back and then commits; between the files nothing is open for a moment). */
 static _Atomic int save_writers, save_dirty;
+static _Atomic uint64_t g_save_commits;
 static _Atomic uint64_t save_changed_ns;
 /* TOTK_SAVE_BUSY (Android: <private>/state/save-busy) exists from the first change to save data until the Commit that
    completes the save, which removes it just before it publishes the next save generation: the launcher's mirror, in
@@ -99,6 +100,7 @@ int runtime_fs_save_busy(void) {
 }
 /* Unlike the UI's short busy heuristic, suspension must wait through Commit,
    however long the gap between files. No locks or I/O on the acquire path. */
+uint64_t runtime_fs_save_commits(void) { return atomic_load_explicit(&g_save_commits, memory_order_relaxed); }
 int runtime_fs_save_pending(void) {
     return atomic_load(&save_marked) || atomic_load(&save_writers) > 0 || atomic_load(&save_dirty);
 }
@@ -285,6 +287,7 @@ static unsigned commit(const char *name) {
         save_unmark();
         if (atomic_load(&save_dirty)) save_mark();   /* the next save began while this one ended */
         save_generation_bump();
+        atomic_fetch_add_explicit(&g_save_commits, 1, memory_order_relaxed);
     }
     return 0;
 }

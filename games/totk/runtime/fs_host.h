@@ -15,6 +15,7 @@ unsigned runtime_romfs_entry_type(int *out, const char *path);
 
 /* account.c: the local user identity */
 void runtime_account_uid(uint64_t out[2]);
+uint64_t runtime_fs_save_commits(void);
 
 #ifdef GAME_BOTW
 /* aoc_romfs.c (Breath of the Wild only): the add-on content volumes. fs_host.c and services.c call them through these

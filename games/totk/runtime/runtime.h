@@ -132,6 +132,8 @@ void runtime_memory_probe(void);
 
 void runtime_input_key(unsigned code,int down);
 void runtime_input_clear(void);
+void runtime_input_companion_buttons(uint64_t buttons);
+void runtime_input_peek_pad(int32_t *lx, int32_t *ly, int32_t *rx, int32_t *ry, uint64_t *buttons);
 int runtime_handheld_mode(void);   /* TOTK_OPERATION_MODE=handheld (runtime/services.c) */
 void *runtime_input_override(const char *name);
 typedef struct { uint64_t buttons; int32_t lx,ly,rx,ry; int connected; } RuntimeGamepadState;
