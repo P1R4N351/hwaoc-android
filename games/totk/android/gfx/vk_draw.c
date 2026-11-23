@@ -7170,7 +7170,8 @@ static void exec_bind_tex(const p_bind_handles *b) {
         signature_changed = !sfast ? 1 : ((oh ? draw_tid_is_depth((int)(oh & 0xfffff), rev) : 0) !=
                                           (nh ? draw_tid_is_depth((int)(nh & 0xfffff), rev) : 0));
     }
-    for (int i = 0; i < b->n; i++) if ((uint32_t)S.tex[b->stage][b->first + i] != (uint32_t)b->h[i]) { g_driver_revision[1][b->stage]++; break; }
+    if (totk_vk_copy_span_fast_on()) { if (totk_u64_low32_changed(&S.tex[b->stage][b->first], b->h, b->n)) g_driver_revision[1][b->stage]++; }
+    else for (int i = 0; i < b->n; i++) if ((uint32_t)S.tex[b->stage][b->first + i] != (uint32_t)b->h[i]) { g_driver_revision[1][b->stage]++; break; }
     memcpy(&S.tex[b->stage][b->first], b->h, 8 * (size_t)b->n);
     totk_tex_nz_update(S.tex_nz[b->stage], &S.tex_nz_ready, b->first, b->h, b->n);
     if (b->first + b->n > S.tex_hi[b->stage]) S.tex_hi[b->stage] = b->first + b->n;
@@ -7301,7 +7302,8 @@ void vk_draw_exec(uint32_t op, const void *a) {
             int ch = memcmp(&S.samp[b->stage][b->first], b->h, 8 * (size_t)b->n) != 0;
             if (totk_vk_state_fast_on() && !ch) break;
             if (vk_record_enabled() && ch) g_record_bind_revision[b->stage]++;
-            for (int i = 0; i < b->n; i++) if ((uint32_t)S.samp[b->stage][b->first + i] != (uint32_t)b->h[i]) { g_driver_revision[1][b->stage]++; break; }
+            if (totk_vk_copy_span_fast_on()) { if (totk_u64_low32_changed(&S.samp[b->stage][b->first], b->h, b->n)) g_driver_revision[1][b->stage]++; }
+            else for (int i = 0; i < b->n; i++) if ((uint32_t)S.samp[b->stage][b->first + i] != (uint32_t)b->h[i]) { g_driver_revision[1][b->stage]++; break; }
             memcpy(&S.samp[b->stage][b->first], b->h, 8 * (size_t)b->n);
         } break; }
         case OP_BIND_IMG: { const p_bind_handles *b = a; if (b->stage >= 0 && b->stage < 6 && b->first >= 0 && b->first + b->n <= 32) {

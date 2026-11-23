@@ -812,7 +812,7 @@ static void upload_staged(vk_tex *x, VkCommandBuffer cb, int is3d, int linear, i
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
         for (unsigned y = 0; y < (is3d ? 1u : im->layers); y++) {
             int bad = 0;
-            if (linear) { size_t stride = nvn_tex_linear_stride(&t->d); for (size_t r = 0; r < rows * z; r++) memcpy(stg + off + r * pitch, t->mem + r * stride, pitch); }
+            if (linear) { size_t stride = nvn_tex_linear_stride(&t->d); if (totk_vk_copy_span_fast_on()) totk_memcpy_2d(stg + off, pitch, t->mem, stride, pitch, rows * z); else for (size_t r = 0; r < rows * z; r++) memcpy(stg + off + r * pitch, t->mem + r * stride, pitch); }
             else if (pooled) { subs[ns++] = (upload_sub){l, y, stg + off, pitch}; }
             else bad = nvn_deswizzle(&t->d, l, y, t->mem, stg + off, pitch);
             if (bad) { RED(8, "deswizzle failed: format %#x target %d", t->d.format, t->d.target); if (subs && subs != stack_subs) free(subs); if (regions && regions != stack_reg) free(regions); return; }
@@ -3237,6 +3237,28 @@ static int pool_texels(const tex_t *t, unsigned level, unsigned layer0, const NV
     }
     free(lin); return 1;
 }
+static void texel_copy_slices_cmd(VkCommandBuffer cb, VkImage img, VkBuffer sb, VkDeviceSize so, VkImageAspectFlags asp,
+                                  unsigned level, unsigned layer0, const NVNcopyRegion *r, size_t slice_b, int nz, int is3d, int to_img) {
+    if (totk_vk_copy_span_fast_on()) {
+        VkBufferImageCopy batch[64]; int nb = 0;
+        for (int z = 0; z < nz; z++) {
+            batch[nb++] = (VkBufferImageCopy){.bufferOffset = so + (VkDeviceSize)z * slice_b, .imageSubresource = {asp, level, is3d ? 0 : layer0 + r->zoffset + z, 1},
+                .imageOffset = {r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
+            if (nb == 64 || z == nz - 1) {
+                if (to_img) vkCmdCopyBufferToImage(cb, sb, img, VK_IMAGE_LAYOUT_GENERAL, (uint32_t)nb, batch);
+                else vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_GENERAL, sb, (uint32_t)nb, batch);
+                nb = 0;
+            }
+        }
+        return;
+    }
+    for (int z = 0; z < nz; z++) {
+        VkBufferImageCopy c = {.bufferOffset = so + (VkDeviceSize)z * slice_b, .imageSubresource = {asp, level, is3d ? 0 : layer0 + r->zoffset + z, 1},
+            .imageOffset = {r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
+        if (to_img) vkCmdCopyBufferToImage(cb, sb, img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        else vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &c);
+    }
+}
 static void read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img, texel_sample *s) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
     if (!bpb || !r->width || !r->height) return;
@@ -3259,15 +3281,13 @@ static void read_texels(const tex_t *t, unsigned level, unsigned layer0, const N
     VkBuffer sb; VkDeviceSize so; uint8_t *stg = vk_transient(wb * hb * nz, 16, &sb, &so);
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "transfer");
     vk_barrier_all(cb);
-    for (int z = 0; z < nz; z++) {
-        VkBufferImageCopy c = {.bufferOffset = so + (VkDeviceSize)z * wb * hb, .imageSubresource = {x->im->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : x->im->aspect, level, is3d ? 0 : layer0 + r->zoffset + z, 1},
-            .imageOffset = {r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
-        vkCmdCopyImageToBuffer(cb, x->im->img, VK_IMAGE_LAYOUT_GENERAL, sb, 1, &c);
-        vk_pso_life_external_read(MAXV(x->im->w >> level, 1u), MAXV(x->im->h >> level, 1u), "cpu-texel-read");
-    }
+    VkImageAspectFlags asp = x->im->aspect == (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT) ? VK_IMAGE_ASPECT_DEPTH_BIT : x->im->aspect;
+    texel_copy_slices_cmd(cb, x->im->img, sb, so, asp, level, layer0, r, wb * hb, nz, is3d, 0);
+    for (int z = 0; z < nz; z++) vk_pso_life_external_read(MAXV(x->im->w >> level, 1u), MAXV(x->im->h >> level, 1u), "cpu-texel-read");
     if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     texel_flush(s);
-    for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(dst + z * img + y * row, stg + (size_t)z * wb * hb + y * wb, wb);
+    if (totk_vk_copy_span_fast_on()) totk_memcpy_3d(dst, row, img, stg, wb, wb * hb, wb, hb, (size_t)nz);
+    else for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(dst + z * img + y * row, stg + (size_t)z * wb * hb + y * wb, wb);
 }
 static void write_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img, texel_sample *s) {
     int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
@@ -3290,16 +3310,12 @@ static void write_texels(const tex_t *t, unsigned level, unsigned layer0, const 
     vk_tex_native_read(x);
     VkCommandBuffer cb = vk_cb();
     VkBuffer sb; VkDeviceSize so; uint8_t *stg = vk_transient(wb * hb * nz, 16, &sb, &so);
-    for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(stg + (size_t)z * wb * hb + y * wb, src + z * img + y * row, wb);
+    if (totk_vk_copy_span_fast_on()) totk_memcpy_3d(stg, wb, wb * hb, src, row, img, wb, hb, (size_t)nz);
+    else for (int z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memcpy(stg + (size_t)z * wb * hb + y * wb, src + z * img + y * row, wb);
     if (vk_gpuprof_on) vk_gpuprof_scope_begin(cb, "upload");
     vk_barrier_all(cb);
-    for (int z = 0; z < nz; z++) {
-        VkBufferImageCopy c = {.bufferOffset = so + (VkDeviceSize)z * wb * hb, .imageSubresource = {x->im->aspect, level, is3d ? 0 : layer0 + r->zoffset + z, 1},
-            .imageOffset = {r->xoffset, r->yoffset, is3d ? r->zoffset + z : 0}, .imageExtent = {(uint32_t)r->width, (uint32_t)r->height, 1}};
-        vkCmdCopyBufferToImage(cb, sb, x->im->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
-        vk_pso_life_external_write(x, level, is3d ? 0 : layer0 + r->zoffset + z, 1, "cpu-texel-upload");
-        totk_ft_count(FT_COUNT_TEX_UPLOADS, 1);
-    }
+    texel_copy_slices_cmd(cb, x->im->img, sb, so, x->im->aspect, level, layer0, r, wb * hb, nz, is3d, 1);
+    for (int z = 0; z < nz; z++) { vk_pso_life_external_write(x, level, is3d ? 0 : layer0 + r->zoffset + z, 1, "cpu-texel-upload"); totk_ft_count(FT_COUNT_TEX_UPLOADS, 1); }
     if (vk_gpuprof_on) vk_gpuprof_scope_end(cb);
     vk_tex_native_patch(x, level, layer0, r);
     texel_flush(s);

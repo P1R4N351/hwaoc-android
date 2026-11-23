@@ -1318,11 +1318,18 @@ static void span_rebuild(void) {   /* caller holds g_pool_mu */
         if (p->kind == K_OWN) g_span[g_nspan++] = (span_t){p->base, p->end, p->buf, 0};
         else if (p->kind == K_VIEW) g_span[g_nspan++] = (span_t){p->base, p->end, p->owner->buf, p->off};
     }
-    qsort(g_span, (size_t)g_nspan, sizeof *g_span, span_cmp);
-    for (int i = 0; i < g_nspan; i++) { g_span_seg[2 * i] = (span_seg_t){g_span[i].lo, -1}; g_span_seg[2 * i + 1] = (span_seg_t){g_span[i].end, -1}; }
-    qsort(g_span_seg, (size_t)g_nspan * 2, sizeof *g_span_seg, span_seg_cmp);
-    g_nseg = 0;
-    for (int i = 0; i < 2 * g_nspan; i++) if (!g_nseg || g_span_seg[i].lo != g_span_seg[g_nseg - 1].lo) g_span_seg[g_nseg++].lo = g_span_seg[i].lo;
+    _Static_assert(sizeof(span_t) == sizeof(totk_span32_t) && offsetof(span_t, lo) == 0 && sizeof(span_seg_t) == sizeof(totk_span_ep_t) && offsetof(span_seg_t, lo) == offsetof(totk_span_ep_t, lo) && offsetof(span_seg_t, best) == offsetof(totk_span_ep_t, best), "span layout");
+    if (totk_vk_copy_span_fast_on()) {
+        totk_sort_spans_stable(g_span, g_span_seg, g_nspan);
+        for (int i = 0; i < g_nspan; i++) { g_span_seg[2 * i] = (span_seg_t){g_span[i].lo, -1}; g_span_seg[2 * i + 1] = (span_seg_t){g_span[i].end, -1}; }
+        g_nseg = totk_sort_dedup_ep(g_span_seg, 2 * g_nspan);
+    } else {
+        qsort(g_span, (size_t)g_nspan, sizeof *g_span, span_cmp);
+        for (int i = 0; i < g_nspan; i++) { g_span_seg[2 * i] = (span_seg_t){g_span[i].lo, -1}; g_span_seg[2 * i + 1] = (span_seg_t){g_span[i].end, -1}; }
+        qsort(g_span_seg, (size_t)g_nspan * 2, sizeof *g_span_seg, span_seg_cmp);
+        g_nseg = 0;
+        for (int i = 0; i < 2 * g_nspan; i++) if (!g_nseg || g_span_seg[i].lo != g_span_seg[g_nseg - 1].lo) g_span_seg[g_nseg++].lo = g_span_seg[i].lo;
+    }
     /* Heap order matches the old backward scan exactly: largest end, then highest sorted span index. */
     int next = 0, nh = 0;
     for (int i = 0; i < g_nseg; i++) {
@@ -1359,6 +1366,7 @@ static int span_hint_matches(const span_seg_t *seg, int nseg, uintptr_t a, int h
     return hint > 0 && hint < nseg && seg[hint - 1].lo <= a && a < seg[hint].lo;
 }
 static int span_bsearch(const span_seg_t *seg, int nseg, uintptr_t a) {
+    if (totk_vk_copy_span_fast_on()) return totk_span_bsearch_ep(seg, nseg, a);
     int lo = 0, hi = nseg;
     while (lo < hi) { int m = (lo + hi) >> 1; if (seg[m].lo <= a) lo = m + 1; else hi = m; }
     return lo;
@@ -3898,6 +3906,7 @@ static uint64_t lag_physical(uint64_t addr, uint64_t size);
 static uint64_t ub_address(uint64_t addr, uint64_t size) { return ub_private_on() ? lag_physical(addr, size) : addr; }
 static void ub_maxhi_from(int i) { for (; i < g_nub; i++) { uint64_t prev = i ? g_ub_maxhi[i - 1] : 0; g_ub_maxhi[i] = g_ub[i].hi > prev ? g_ub[i].hi : prev; } }
 static uint64_t g_prune_floor = UINT64_MAX, g_ub_max_fence, g_gw_max_fence;
+static uint64_t g_ub_min_fence = UINT64_MAX, g_gw_min_fence = UINT64_MAX;
 static void ub_prune_inner(void) {   /* drop entries whose submission the GPU has finished, and that no later snapshot still needs */
     /* Only a finished submission or a changed snapshot floor can drop entries; vk_ub_rename calls this for every uniform
        binding, so without either it returns at once. */
@@ -3905,17 +3914,19 @@ static void ub_prune_inner(void) {   /* drop entries whose submission the GPU ha
     if (done > g_prune_floor) done = g_prune_floor;   /* a submission queued after the one replaying captured no earlier than it */
     if (done == g_ub_pruned_at) return;
     g_ub_pruned_at = done;
-    g_ub_lo = UINT64_MAX; g_ub_hi = 0; g_ub_maxlen = 0; uint64_t mf = 0;
+    if (totk_vk_copy_span_fast_on() && !totk_fence_can_prune(g_nub, g_ub_min_fence, done)) return;
+    g_ub_lo = UINT64_MAX; g_ub_hi = 0; g_ub_maxlen = 0; uint64_t mf = 0, minf = UINT64_MAX;
     totk_ub_unsealed_reset(&g_ub_unsealed);
     for (int i = 0; i < g_nub; i++) {
         if (g_ub[i].fence && g_ub[i].fence <= done) { free(g_ub[i].data); continue; }
         if (g_ub[i].flushed && !g_ub[i].fence) totk_ub_unsealed_note(&g_ub_unsealed, j);
         if (g_ub[i].fence > mf) mf = g_ub[i].fence;
+        totk_fence_min_note(&minf, g_ub[i].fence);
         g_ub[j++] = g_ub[i];
         if (g_ub[i].lo < g_ub_lo) g_ub_lo = g_ub[i].lo; if (g_ub[i].hi > g_ub_hi) g_ub_hi = g_ub[i].hi;
         if (g_ub[i].hi - g_ub[i].lo > g_ub_maxlen) g_ub_maxlen = g_ub[i].hi - g_ub[i].lo;
     }
-    g_ub_max_fence = mf;
+    g_ub_max_fence = mf; g_ub_min_fence = minf;
     if (j != g_nub) { g_nub = j; ub_maxhi_from(0); ub_changed(0, 0); }
 }
 static void ub_prune(void) { VK_REC_DO(VK_REC_S_UNIFORM, ub_prune_inner()); }
@@ -3972,12 +3983,13 @@ static int ub_entry_cmp(const void *x, const void *y) {
     return a->lo < b->lo ? -1 : a->lo > b->lo;
 }
 static void ub_reindex(void) {
-    g_ub_lo = UINT64_MAX; g_ub_hi = g_ub_maxlen = 0; g_ub_unflushed = 0; g_ub_max_fence = 0;
+    g_ub_lo = UINT64_MAX; g_ub_hi = g_ub_maxlen = 0; g_ub_unflushed = 0; g_ub_max_fence = 0; g_ub_min_fence = UINT64_MAX;
     totk_ub_unsealed_reset(&g_ub_unsealed);
     for (int i = 0; i < g_nub; i++) {
         ub_ent *e = &g_ub[i];
         if (e->flushed && !e->fence) totk_ub_unsealed_note(&g_ub_unsealed, i);
         if (e->fence > g_ub_max_fence) g_ub_max_fence = e->fence;
+        totk_fence_min_note(&g_ub_min_fence, e->fence);
         if (e->lo < g_ub_lo) g_ub_lo = e->lo;
         if (e->hi > g_ub_hi) g_ub_hi = e->hi;
         if (e->hi - e->lo > g_ub_maxlen) g_ub_maxlen = e->hi - e->lo;
@@ -4218,29 +4230,30 @@ static void gw_seal(uint64_t fence) {
     pthread_mutex_lock(&g_gw_mu);
     if (totk_vk_ub_gw_fast_on()) {
         if (g_ngw && totk_gw_unsealed_has(&g_gw_unsealed)) {
-            int i = gw_lower(g_gw_unsealed.min_lo); uint32_t rem = g_gw_unsealed.count;
-            for (; i < g_ngw && g_gw[i].lo <= g_gw_unsealed.max_lo && rem > 0u; i++) if (!g_gw[i].fence) { g_gw[i].fence = fence; rem--; }
-            if (fence > g_gw_max_fence) g_gw_max_fence = fence;
+            int i = gw_lower(g_gw_unsealed.min_lo); uint32_t rem = g_gw_unsealed.count, sealed = 0;
+            for (; i < g_ngw && g_gw[i].lo <= g_gw_unsealed.max_lo && rem > 0u; i++) if (!g_gw[i].fence) { g_gw[i].fence = fence; rem--; sealed = 1; }
+            if (sealed) { if (fence > g_gw_max_fence) g_gw_max_fence = fence; totk_fence_min_note(&g_gw_min_fence, fence); }
             totk_gw_unsealed_reset(&g_gw_unsealed);
         } else if (!g_ngw) totk_gw_unsealed_reset(&g_gw_unsealed);
     } else {
-        for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence) { g_gw[i].fence = fence; if (fence > g_gw_max_fence) g_gw_max_fence = fence; }
+        for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence) { g_gw[i].fence = fence; if (fence > g_gw_max_fence) g_gw_max_fence = fence; totk_fence_min_note(&g_gw_min_fence, fence); }
         totk_gw_unsealed_reset(&g_gw_unsealed);
     }
     pthread_mutex_unlock(&g_gw_mu);
 }
 static void gw_prune(void) {
-    uint64_t done = atomic_load(&g_done), mlo = 0, mhi = 0, blm = 0, mf = 0; int j = 0;
+    uint64_t done = atomic_load(&g_done), mlo = 0, mhi = 0, blm = 0, mf = 0, minf = UINT64_MAX; int j = 0;
     pthread_mutex_lock(&g_gw_mu);
+    if (totk_vk_copy_span_fast_on() && !totk_fence_can_prune(g_ngw, g_gw_min_fence, done)) { pthread_mutex_unlock(&g_gw_mu); return; }
     totk_gw_unsealed_reset(&g_gw_unsealed);
     for (int i = 0; i < g_ngw; i++) if (!g_gw[i].fence || g_gw[i].fence > done) {
         gw_t w = g_gw[i];
-        if (!w.fence) totk_gw_unsealed_add(&g_gw_unsealed, w.lo); else if (w.fence > mf) mf = w.fence;
+        if (!w.fence) totk_gw_unsealed_add(&g_gw_unsealed, w.lo); else { if (w.fence > mf) mf = w.fence; totk_fence_min_note(&minf, w.fence); }
         if (!j || w.lo < mlo) mlo = w.lo;
         if (!j || w.hi > mhi) mhi = w.hi;
         blm |= totk_gw_bloom_mask(w.lo, w.hi); g_gw[j++] = w;
     }
-    g_ngw = j; g_gw_max_fence = mf; gw_reindex_from(0);
+    g_ngw = j; g_gw_max_fence = mf; g_gw_min_fence = minf; gw_reindex_from(0);
     totk_gw_sum_publish(&g_gw_sum, (uint32_t)j, mlo, mhi, blm);
     pthread_mutex_unlock(&g_gw_mu);
 }
@@ -4355,7 +4368,7 @@ static unsigned lag_test_gw_index(unsigned *checks) {
     #undef GW_RAND
     /* Per-query cost at the route's size: ~100 pending writes, 1,308 capture ranges per submission. */
     for (int count = 32; count <= 512; count *= 4) {
-        pthread_mutex_lock(&g_gw_mu); g_ngw = 0; g_gw_max_fence = 0; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed);
+        pthread_mutex_lock(&g_gw_mu); g_ngw = 0; g_gw_max_fence = 0; g_gw_min_fence = UINT64_MAX; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed);
         for (int i = 0; i < count; i++) gw_add(UINT64_C(0x360000000) + (uint64_t)i * 65536 * 3, UINT64_C(0x360000000) + (uint64_t)i * 65536 * 3 + 4096);
         pthread_mutex_unlock(&g_gw_mu);
         uint64_t ns[2]; unsigned hits[2] = {0};
@@ -4372,7 +4385,7 @@ static unsigned lag_test_gw_index(unsigned *checks) {
         printf("lag-query GPU writes %d pending: linear %.2f indexed %.2f ns/query; 6540 capture ranges/frame %.3f -> %.3f ms\n",
                count, ns[0] / 2e5, ns[1] / 2e5, ns[0] / 2e5 * 6540 / 1e6, ns[1] / 2e5 * 6540 / 1e6);
     }
-    pthread_mutex_lock(&g_gw_mu); g_ngw = 0; g_gw_max_fence = 0; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed); pthread_mutex_unlock(&g_gw_mu);
+    pthread_mutex_lock(&g_gw_mu); g_ngw = 0; g_gw_max_fence = 0; g_gw_min_fence = UINT64_MAX; totk_gw_sum_clear(&g_gw_sum); totk_gw_unsealed_reset(&g_gw_unsealed); pthread_mutex_unlock(&g_gw_mu);
     atomic_store(&g_done, 0);
     free(shadow);
     return errors;
@@ -4413,7 +4426,7 @@ int vk_lag_test_query_bench(void) {
         printf("lag-query pending %d entries: scalar %.2f indexed %.2f ns/query; 20000 queries/frame %.3f -> %.3f ms; hits %u/%u\n",
             count, ns[0] / (double)CALLS, ns[1] / (double)CALLS,
             ns[0] / (double)CALLS * .02, ns[1] / (double)CALLS * .02, hits[0], hits[1]);
-        free(g_ub); free(g_ub_maxhi); g_ub = NULL; g_ub_maxhi = NULL; g_nub = 0; g_ub_max_fence = 0;
+        free(g_ub); free(g_ub_maxhi); g_ub = NULL; g_ub_maxhi = NULL; g_nub = 0; g_ub_max_fence = 0; g_ub_min_fence = UINT64_MAX;
         totk_ub_unsealed_reset(&g_ub_unsealed);
     }
     setenv("TOTK_FRAME_LAG", "1", 1);
@@ -6352,13 +6365,13 @@ static void ub_seal(uint64_t fence) {
         if (g_ub_unsealed.count > 0) {
             int lo = g_ub_unsealed.lo < 0 ? 0 : g_ub_unsealed.lo;
             int hi = g_ub_unsealed.hi > g_nub ? g_nub : g_ub_unsealed.hi;
-            for (int i = lo; i < hi; i++) if (g_ub[i].flushed && !g_ub[i].fence) { g_ub[i].fence = fence; if (fence > g_ub_max_fence) g_ub_max_fence = fence; }
+            for (int i = lo; i < hi; i++) if (g_ub[i].flushed && !g_ub[i].fence) { g_ub[i].fence = fence; if (fence > g_ub_max_fence) g_ub_max_fence = fence; totk_fence_min_note(&g_ub_min_fence, fence); }
             totk_ub_unsealed_reset(&g_ub_unsealed);
         }
         ub_changed(0, 0);
         return;
     }
-    for (int i = 0; i < g_nub; i++) if (g_ub[i].flushed && !g_ub[i].fence) { g_ub[i].fence = fence; if (fence > g_ub_max_fence) g_ub_max_fence = fence; }
+    for (int i = 0; i < g_nub; i++) if (g_ub[i].flushed && !g_ub[i].fence) { g_ub[i].fence = fence; if (fence > g_ub_max_fence) g_ub_max_fence = fence; totk_fence_min_note(&g_ub_min_fence, fence); }
     totk_ub_unsealed_reset(&g_ub_unsealed);
     ub_changed(0, 0);
 }
