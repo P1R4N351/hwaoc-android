@@ -49,6 +49,7 @@ public final class CompanionNative implements DataSource {
     private static native boolean warriorsFireNative(int actionId);
     private static native void warriorsAbortNative();
     private static native int warriorsPinNative(int op, int slot, String label);
+    private static native int overlaySetModeNative(int mode);
 
     @Override public String read(int detail) {
         if (!loaded) return "{\"schema\":1,\"seq\":0,\"status\":\"unsupported\"}";
@@ -99,5 +100,11 @@ public final class CompanionNative implements DataSource {
         if (!loaded) return -1;
         try { return warriorsPinNative(op, slot, label); }
         catch (UnsatisfiedLinkError unavailable) { loaded = false; return -1; }
+    }
+    /** Queries (<0) or sets (0 off, 1 fps, 2 full) Display 0 Vulkan corner overlay mode. */
+    public static int setOverlayMode(int mode) {
+        if (!loaded) return mode < 0 ? 0 : mode;
+        try { return overlaySetModeNative(mode); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; return mode < 0 ? 0 : mode; }
     }
 }

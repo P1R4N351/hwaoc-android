@@ -53,6 +53,11 @@ void runtime_android_game_input_focus(JNIEnv *env, jclass cls, jboolean top);
 void runtime_android_motion(JNIEnv *env, jclass cls, jfloat ax, jfloat ay, jfloat az, jfloat gx, jfloat gy, jfloat gz);
 void runtime_android_motion_live(JNIEnv *env, jclass cls, jboolean on, jstring source);
 jint runtime_android_feedback_enabled(JNIEnv *env, jclass cls);
+#if defined(__GNUC__)
+extern int vk_overlay_set_mode(int mode) __attribute__((weak));
+#else
+extern int vk_overlay_set_mode(int mode);
+#endif
 
 /* Do not cache this in JNI_OnLoad: NativeActivity's start_game reads totk.env
    synchronously during super.onCreate, before Java constructs its controller. */
@@ -314,6 +319,10 @@ static jint JNICALL native_warriors_pin(JNIEnv *env, jclass cls, jint op, jint s
     if (s) (*env)->ReleaseStringUTFChars(env, label, s);
     return (jint)r;
 }
+static jint JNICALL native_overlay_set_mode(JNIEnv *env, jclass cls, jint mode) {
+    (void)env; (void)cls;
+    return vk_overlay_set_mode ? (jint)vk_overlay_set_mode((int)mode) : 0;
+}
 
 __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
@@ -338,6 +347,7 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
         {"warriorsFireNative", "(I)Z", (void *)native_warriors_fire},
         {"warriorsAbortNative", "()V", (void *)native_warriors_abort},
         {"warriorsPinNative", "(IILjava/lang/String;)I", (void *)native_warriors_pin},
+        {"overlaySetModeNative", "(I)I", (void *)native_overlay_set_mode},
     };
     if ((*env)->RegisterNatives(env, cls, methods, sizeof methods / sizeof *methods)) {
         (*env)->ExceptionClear(env); fprintf(stderr, "[companion] RegisterNatives failed\n");

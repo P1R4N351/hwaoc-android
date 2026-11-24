@@ -389,6 +389,28 @@ public final class BifrostProbe {
         classic.poll(t += 400, state(true, false, true, 2, 12));
         equal(classic.poll(t += 400, state(true, false, true, 2, 12)).get(0).extras.get("effect"), "PULSE");
         equal(classic.touch(t += 400).size(), 0);
+
+        // Screen brightness -> stick intensity scaling + 4% hysteresis (intensityScale stays 255).
+        equal(BifrostLooks.scaleIntensity(200, 0.0f), 0);
+        equal(BifrostLooks.scaleIntensity(200, 1.0f), 200);
+        equal(BifrostLooks.scaleIntensity(200, -1.0f), 200);
+        int s20 = BifrostLooks.scaleIntensity(200, 0.20f), s60 = BifrostLooks.scaleIntensity(200, 0.60f);
+        require(s20 > 0 && s20 < s60 && s60 < 200, "screen brightness scales monotonically");
+
+        Feed bri = new Feed(BifrostLooks.BOTW, false);
+        int baseInt = BifrostLooks.LOOKS[BifrostLooks.BOTW][BifrostLooks.BASE].intensity;
+        bri.setScreenBrightness(0.25f);
+        bri.poll(t += 125, world);
+        out = bri.poll(t += 125, world);
+        equal(out.size(), 1);
+        equal(out.get(0).extras.get("intensityScale"), 255);
+        equal(out.get(0).extras.get("intensity"), BifrostLooks.scaleIntensity(baseInt, 0.25f));
+        bri.setScreenBrightness(0.27f);                                               // < 4% delta suppressed before heartbeat
+        equal(bri.poll(t += 350, world).size(), 0);
+        bri.setScreenBrightness(0.75f);                                               // >= 4% delta triggers dirty (>= 300ms gap)
+        out = bri.poll(t, world);
+        equal(out.size(), 1);
+        equal(out.get(0).extras.get("intensity"), BifrostLooks.scaleIntensity(baseInt, 0.75f));
     }
 
     /** Leaving the foreground clears at once, exactly once; Bifrost's refusals are respected. */

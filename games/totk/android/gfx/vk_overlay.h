@@ -135,6 +135,8 @@ int vk_overlay_available(void);
 /* Advance off -> fps -> full -> off for this session (not persisted); returns the new mode.
    Any thread; a no-op returning 0 when the overlay is unavailable. */
 int vk_overlay_cycle(void);
+/* Query (<0) or set live overlay mode directly (0 off, 1 fps, 2 full); returns resulting mode. */
+int vk_overlay_set_mode(int mode);
 void vk_overlay_target(double period_s);
 void vk_overlay_presented(uint64_t now_ns, int generated);
 /* Best-effort relaxed publications; no initialisation, allocation, locking, or clock reads.

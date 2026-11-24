@@ -724,6 +724,15 @@ int vk_overlay_cycle(void) {
     if (next) power_start();
     return next;
 }
+int vk_overlay_set_mode(int mode) {
+    pthread_once(&once, init);
+    if (!available) return 0;
+    if (mode < 0) return atomic_load_explicit(&live_mode, memory_order_relaxed);
+    int next = mode == 0 ? 0 : (mode >= 2 ? 2 : 1);
+    atomic_store_explicit(&live_mode, next, memory_order_relaxed);
+    if (next) power_start();
+    return next;
+}
 void vk_overlay_target(double period_s) {
     if (!available || !isfinite(period_s) || period_s <= 0 || period_s > 1) return;
     atomic_store_explicit(&target_ns, (uint64_t)(period_s * 1e9), memory_order_relaxed);

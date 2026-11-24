@@ -23,11 +23,30 @@ import games  # noqa: E402
 ANDROID_STUBS = {
     'android/content/Context.java': '''package android.content;
 public class Context {
+    public static final int MODE_PRIVATE = 0;
+    public static final String BATTERY_SERVICE = "batterymanager";
     public Context getApplicationContext() { return this; }
     public java.io.File getFilesDir() { return new java.io.File("."); }
+    public java.io.File getExternalFilesDir(String type) { return null; }
+    public SharedPreferences getSharedPreferences(String name, int mode) { return new SharedPreferences(); }
+    public Object getSystemService(String name) { return null; }
     public android.content.res.AssetManager getAssets() { return new android.content.res.AssetManager(); }
     public android.content.pm.PackageManager getPackageManager() { return new android.content.pm.PackageManager(); }
     public String getPackageName() { return "probe"; }
+}''',
+    'android/content/SharedPreferences.java': '''package android.content;
+public class SharedPreferences {
+    public static class Editor {
+        public Editor putBoolean(String k, boolean v) { return this; }
+        public void apply() { }
+    }
+    public boolean getBoolean(String k, boolean d) { return d; }
+    public Editor edit() { return new Editor(); }
+}''',
+    'android/os/BatteryManager.java': '''package android.os;
+public class BatteryManager {
+    public static final int BATTERY_PROPERTY_CAPACITY = 4;
+    public int getIntProperty(int id) { return -1; }
 }''',
     'android/content/pm/PackageInfo.java': 'package android.content.pm; public class PackageInfo { public long lastUpdateTime; public long getLongVersionCode() { return 1; } }',
     'android/content/pm/PackageManager.java': '''package android.content.pm;
@@ -46,7 +65,7 @@ public class AssetManager {
     'android/util/Log.java': 'package android.util; public final class Log { public static int w(String t, String m) { return 0; } public static int w(String t, String m, Throwable e) { return 0; } }',
     'android/os/SystemClock.java': 'package android.os; public final class SystemClock { public static long now = 1_000_000; public static long uptimeMillis() { return now; } }',
     'android/graphics/PixelFormat.java': 'package android.graphics; public class PixelFormat { public static final int RGBA_8888 = 1; }',
-    'android/graphics/Bitmap.java': 'package android.graphics; public class Bitmap { public int getWidth() { return 1; } public int getHeight() { return 1; } }',
+    'android/graphics/Bitmap.java': 'package android.graphics; public class Bitmap { public int getWidth() { return 1; } public int getHeight() { return 1; } public boolean isRecycled() { return false; } }',
     'android/graphics/Color.java': 'package android.graphics; public class Color { public static final int WHITE = -1; }',
     'android/graphics/ColorFilter.java': 'package android.graphics; public class ColorFilter { }',
     'android/graphics/PorterDuff.java': 'package android.graphics; public class PorterDuff { public enum Mode { SRC_IN } }',
@@ -54,8 +73,11 @@ public class AssetManager {
     'android/graphics/Typeface.java': 'package android.graphics; public class Typeface { public static final Typeface DEFAULT = new Typeface(), DEFAULT_BOLD = new Typeface(); }',
     'android/graphics/Path.java': '''package android.graphics;
 public class Path {
+    public enum Direction { CW, CCW }
     public void reset() { } public void moveTo(float x, float y) { } public void cubicTo(float a, float b, float c, float d, float e, float f) { }
     public void lineTo(float x, float y) { } public void close() { }
+    public void addRoundRect(RectF r, float rx, float ry, Direction d) { }
+    public void addCircle(float x, float y, float r, Direction d) { }
 }''',
     'android/graphics/RectF.java': '''package android.graphics;
 public class RectF {
@@ -76,7 +98,7 @@ public class Paint {
     public static final int ANTI_ALIAS_FLAG = 1, FILTER_BITMAP_FLAG = 2;
     public enum Style { FILL, STROKE } public enum Align { LEFT, CENTER, RIGHT } public enum Cap { ROUND, BUTT }
     public Paint(int flags) { }
-    public void setColor(int c) { } public void setStrokeWidth(float w) { } public void setStyle(Style s) { } public void setTextAlign(Align a) { }
+    public void setColor(int c) { } public void setAlpha(int a) { } public void setStrokeWidth(float w) { } public void setStyle(Style s) { } public void setTextAlign(Align a) { }
     public void setStrokeCap(Cap c) { } public void setTextSize(float s) { } public Typeface setTypeface(Typeface t) { return t; }
     public ColorFilter setColorFilter(ColorFilter f) { return f; }
     public float measureText(String text) { return text.length(); }
@@ -89,15 +111,17 @@ public class Canvas {
     public int save() { return 0; } public void restore() { } public void restoreToCount(int n) { }
     public int saveLayerAlpha(RectF b, int a) { return 0; } public int saveLayerAlpha(float l, float t, float r, float b, int a) { return 0; }
     public boolean clipRect(RectF r) { return true; } public boolean clipRect(float l, float t, float r, float b) { return true; }
+    public boolean clipPath(Path path) { return true; }
     public void translate(float x, float y) { } public void scale(float x, float y, float px, float py) { } public void rotate(float d, float px, float py) { }
     public void drawColor(int c) { } public void drawRoundRect(RectF r, float rx, float ry, Paint p) { }
     public void drawRect(RectF r, Paint p) { } public void drawRect(float l, float t, float r, float b, Paint p) { }
     public void drawLine(float a, float b, float c, float d, Paint p) { } public void drawText(String s, float x, float y, Paint p) { }
-    public void drawBitmap(Bitmap b, android.graphics.Rect s, RectF d, Paint p) { } public void drawCircle(float x, float y, float r, Paint p) { }
+    public void drawBitmap(Bitmap b, Rect s, RectF d, Paint p) { } public void drawBitmap(Bitmap b, Rect s, Rect d, Paint p) { } public void drawCircle(float x, float y, float r, Paint p) { }
     public void drawOval(RectF r, Paint p) { } public void drawArc(RectF r, float a, float b, boolean c, Paint p) { }
     public void drawPath(Path path, Paint p) { } public void drawPicture(Picture p) { }
 }''',
-    'android/graphics/Rect.java': 'package android.graphics; public class Rect { }',
+    'android/graphics/Rect.java': 'package android.graphics; public class Rect { public Rect() { } public Rect(int l, int t, int r, int b) { } public void set(int l, int t, int r, int b) { } }',
+    'android/view/Window.java': 'package android.view; public class Window { }',
     'android/view/MotionEvent.java': '''package android.view;
 public class MotionEvent {
     public static final int ACTION_DOWN = 0, ACTION_UP = 1, ACTION_MOVE = 2, ACTION_CANCEL = 3, ACTION_POINTER_DOWN = 5, ACTION_POINTER_UP = 6;
@@ -191,8 +215,25 @@ public final class Snapshot {
     public JSONArray items(int category) { return new JSONArray(); } public String itemCategory(int category, int index) { return CATEGORIES[category]; }
     public double coordinate(int axis) { return Double.NaN; }
 }''',
+    'com/aure/totk/BifrostBridge.java':
+        'package com.aure.totk; public final class BifrostBridge { public static volatile boolean syncScreenBrightness = true; public static volatile int lastScreenPct = -1; }',
     'com/aure/totk/companion/CompanionNative.java':
-        'package com.aure.totk.companion; public final class CompanionNative { public static boolean isEnabled() { return true; } }',
+        'package com.aure.totk.companion; public final class CompanionNative { public static boolean isEnabled() { return true; } public static int setOverlayMode(int mode) { return mode < 0 ? 0 : mode; } }',
+    'com/aure/totk/companion/WarriorsAssetHarvester.java': '''package com.aure.totk.companion;
+import android.content.Context; import android.graphics.Bitmap; import android.view.Window; import java.io.File;
+public final class WarriorsAssetHarvester {
+    public static volatile Window gameWindow;
+    public void loadCached(Context c) { }
+    public void harvestFromGameDirsAsync(Context c, File[] r, int k, Runnable u) { }
+    public void captureLiveBackdropWindow(Context c, Window w, int k, Runnable u) { }
+    public void captureLiveMinimapWindow(Window w, int m, Runnable u) { }
+    public void clearCache(Context c) { }
+    public Bitmap backdrop() { return null; }
+    public Bitmap emblem() { return null; }
+    public Bitmap minimap() { return null; }
+    public String source() { return "NONE"; }
+    public void shutdown() { }
+}''',
     'com/aure/totk/companion/SnapshotPoller.java': '''package com.aure.totk.companion;
 public final class SnapshotPoller {
     public interface Listener { void changed(Snapshot snapshot, boolean stale); }
