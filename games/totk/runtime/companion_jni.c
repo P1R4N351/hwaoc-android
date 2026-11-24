@@ -58,11 +58,15 @@ extern int vk_overlay_set_mode(int mode) __attribute__((weak));
 extern int vk_minimap_read(uint8_t *rgba_out, int max_bytes, int32_t meta[5]) __attribute__((weak));
 extern int vk_minimap_cycle(void) __attribute__((weak));
 extern void vk_minimap_enable(int on) __attribute__((weak));
+extern int vk_minimap_objective_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]) __attribute__((weak));
+extern int vk_minimap_ui_tex_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request) __attribute__((weak));
 #else
 extern int vk_overlay_set_mode(int mode);
 extern int vk_minimap_read(uint8_t *rgba_out, int max_bytes, int32_t meta[5]);
 extern int vk_minimap_cycle(void);
 extern void vk_minimap_enable(int on);
+extern int vk_minimap_objective_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
+extern int vk_minimap_ui_tex_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request);
 #endif
 
 /* Do not cache this in JNI_OnLoad: NativeActivity's start_game reads totk.env
@@ -352,6 +356,32 @@ static void JNICALL native_warriors_minimap_enable(JNIEnv *env, jclass cls, jboo
     if (vk_minimap_enable) vk_minimap_enable(on ? 1 : 0);
 }
 
+static jint jni_read_rgba_buf(
+        JNIEnv *env, jclass cls, jbyteArray rgbaOut, jintArray metaOut, int nmeta,
+        int (*fn4)(uint8_t *, int, int32_t *),
+        int (*fn_req)(uint8_t *, int, int32_t *, int), int req) {
+    if (!native_enabled(env, cls) || !rgbaOut || !metaOut || (*env)->GetArrayLength(env, metaOut) < nmeta || nmeta > 8) return 0;
+    jint jm[8] = {0}; int32_t m[8] = {0};
+    (*env)->GetIntArrayRegion(env, metaOut, 0, nmeta, jm);
+    for (int i = 0; i < nmeta; i++) m[i] = (int32_t)jm[i];
+    jsize cap = (*env)->GetArrayLength(env, rgbaOut);
+    jbyte *buf = cap > 0 ? (*env)->GetByteArrayElements(env, rgbaOut, NULL) : NULL;
+    int updated = 0;
+    if (buf) updated = fn_req ? fn_req((uint8_t *)buf, (int)cap, m, req) : (fn4 ? fn4((uint8_t *)buf, (int)cap, m) : 0);
+    if (buf) (*env)->ReleaseByteArrayElements(env, rgbaOut, buf, updated ? 0 : JNI_ABORT);
+    for (int i = 0; i < nmeta; i++) jm[i] = (jint)m[i];
+    (*env)->SetIntArrayRegion(env, metaOut, 0, nmeta, jm);
+    return updated ? 1 : 0;
+}
+
+static jint JNICALL native_warriors_objective(JNIEnv *env, jclass cls, jbyteArray rgbaOut, jintArray metaOut) {
+    return vk_minimap_objective_read ? jni_read_rgba_buf(env, cls, rgbaOut, metaOut, 4, vk_minimap_objective_read, NULL, 0) : 0;
+}
+
+static jint JNICALL native_warriors_ui_tex(JNIEnv *env, jclass cls, jbyteArray rgbaOut, jintArray metaOut, jboolean request) {
+    return vk_minimap_ui_tex_read ? jni_read_rgba_buf(env, cls, rgbaOut, metaOut, 4, NULL, vk_minimap_ui_tex_read, request ? 1 : 0) : 0;
+}
+
 __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
     JNIEnv *env;
@@ -379,6 +409,8 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
         {"warriorsMinimapNative", "([B[I)I", (void *)native_warriors_minimap},
         {"warriorsMinimapCycleNative", "()I", (void *)native_warriors_minimap_cycle},
         {"warriorsMinimapEnableNative", "(Z)V", (void *)native_warriors_minimap_enable},
+        {"warriorsObjectiveNative", "([B[I)I", (void *)native_warriors_objective},
+        {"warriorsUiTexNative", "([B[IZ)I", (void *)native_warriors_ui_tex},
     };
     if ((*env)->RegisterNatives(env, cls, methods, sizeof methods / sizeof *methods)) {
         (*env)->ExceptionClear(env); fprintf(stderr, "[companion] RegisterNatives failed\n");

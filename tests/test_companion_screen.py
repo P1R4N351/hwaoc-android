@@ -69,6 +69,8 @@ public class AssetManager {
 public class Bitmap {
     public enum Config { ARGB_8888 }
     public static Bitmap createBitmap(int w, int h, Config c) { return new Bitmap(); }
+    public static Bitmap createScaledBitmap(Bitmap b, int w, int h, boolean f) { return new Bitmap(); }
+    public void recycle() { }
     public int getWidth() { return 1; } public int getHeight() { return 1; } public boolean isRecycled() { return false; }
     public void copyPixelsFromBuffer(java.nio.Buffer src) { }
 }''',
@@ -76,7 +78,9 @@ public class Bitmap {
     'android/graphics/ColorFilter.java': 'package android.graphics; public class ColorFilter { }',
     'android/graphics/PorterDuff.java': 'package android.graphics; public class PorterDuff { public enum Mode { SRC_IN } }',
     'android/graphics/PorterDuffColorFilter.java': 'package android.graphics; public class PorterDuffColorFilter extends ColorFilter { public PorterDuffColorFilter(int color, PorterDuff.Mode mode) { } }',
-    'android/graphics/Typeface.java': 'package android.graphics; public class Typeface { public static final Typeface DEFAULT = new Typeface(), DEFAULT_BOLD = new Typeface(); }',
+    'android/graphics/Shader.java': 'package android.graphics; public class Shader { public enum TileMode { CLAMP, REPEAT, MIRROR } }',
+    'android/graphics/BitmapShader.java': 'package android.graphics; public class BitmapShader extends Shader { public BitmapShader(Bitmap b, TileMode tx, TileMode ty) { } }',
+    'android/graphics/Typeface.java': 'package android.graphics; public class Typeface { public static final int BOLD = 1; public static final Typeface DEFAULT = new Typeface(), DEFAULT_BOLD = new Typeface(), SANS_SERIF = new Typeface(); public static Typeface create(Typeface f, int s) { return f; } }',
     'android/graphics/Path.java': '''package android.graphics;
 public class Path {
     public enum Direction { CW, CCW }
@@ -103,7 +107,7 @@ public class RectF {
 public class Paint {
     public static final int ANTI_ALIAS_FLAG = 1, FILTER_BITMAP_FLAG = 2;
     public enum Style { FILL, STROKE } public enum Align { LEFT, CENTER, RIGHT } public enum Cap { ROUND, BUTT }
-    public Paint(int flags) { }
+    public Paint() { } public Paint(int flags) { } public Shader setShader(Shader s) { return s; }
     public void setColor(int c) { } public void setAlpha(int a) { } public void setStrokeWidth(float w) { } public void setStyle(Style s) { } public void setTextAlign(Align a) { }
     public void setStrokeCap(Cap c) { } public void setTextSize(float s) { } public Typeface setTypeface(Typeface t) { return t; }
     public ColorFilter setColorFilter(ColorFilter f) { return f; }
@@ -231,6 +235,8 @@ public final class CompanionNative {
     public static int warriorsMinimap(byte[] rgbaOut, int[] meta) { return 0; }
     public static int warriorsMinimapCycle() { return ++cycleCount; }
     public static void warriorsMinimapEnable(boolean on) { enabledRt = on; }
+    public static int warriorsObjective(byte[] rgbaOut, int[] meta) { return 0; }
+    public static int warriorsUiTex(byte[] rgbaOut, int[] meta, boolean request) { return 0; }
 }''',
     'com/aure/totk/companion/WarriorsAssetHarvester.java': '''package com.aure.totk.companion;
 import android.content.Context; import android.graphics.Bitmap; import java.io.File;
@@ -242,6 +248,12 @@ public final class WarriorsAssetHarvester {
     public Bitmap backdrop() { return null; }
     public Bitmap emblem() { return null; }
     public Bitmap minimap() { return null; }
+    public Bitmap objective() { return null; }
+    public void setObjective(Bitmap bmp) { }
+    public Bitmap purahTex() { return null; }
+    public boolean isSuppressed() { return false; }
+    public void setSuppressed(boolean s) { }
+    public boolean ingestGpuUiTex(Context c, byte[] r, int w, int h, int k) { return false; }
     public String source() { return "NONE"; }
 }''',
     'com/aure/totk/companion/SnapshotPoller.java': '''package com.aure.totk.companion;
@@ -276,6 +288,7 @@ public final class ScreenProbe {
             if (warriors) {
                 WarriorsCompanionModel wm = new WarriorsCompanionModel();
                 require(wm.stickLights && wm.stickSync, "stick lights and sync default ON");
+                require(wm.bgColor() == 0xFF000000 && wm.borderColor() == 0x00000000, "pure black borderless Purah theme");
             }
             String wantClass = duo ? "DuoSurfaceView" : warriors ? "WarriorsCompanionView" : "CompanionView";
             require(screen.getClass().getSimpleName().equals(wantClass), "this build's screen");
@@ -511,6 +524,8 @@ class CompanionScreenTests(unittest.TestCase):
         self.assertIn('pass: companion screen hwaoc warriors', self.run_probe(classes, 'com.aure.totk.companion.ScreenProbe', 'hwaoc', 'warriors'))
         self.assertIn('CYCLE RT', (JAVA / 'WarriorsCompanionDraw.java').read_text())
         self.assertNotIn('PixelCopy', (JAVA / 'WarriorsAssetHarvester.java').read_text())
+        self.assertNotIn('BATTLE TIMER', (JAVA / 'WarriorsCompanionDraw.java').read_text())
+        self.assertNotIn('KEEPS / KOs', (JAVA / 'WarriorsCompanionDraw.java').read_text())
 
     def test_botw_screen_keeps_no_page_and_needs_no_library(self):
         # No libduo_host.so on the host: the class still loads and the screen still stands behind the interface.

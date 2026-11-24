@@ -53,6 +53,8 @@ public final class CompanionNative implements DataSource {
     private static native int warriorsMinimapNative(byte[] rgbaOut, int[] meta);
     private static native int warriorsMinimapCycleNative();
     private static native void warriorsMinimapEnableNative(boolean on);
+    private static native int warriorsObjectiveNative(byte[] rgbaOut, int[] meta);
+    private static native int warriorsUiTexNative(byte[] rgbaOut, int[] meta, boolean request);
 
     @Override public String read(int detail) {
         if (!loaded) return "{\"schema\":1,\"seq\":0,\"status\":\"unsupported\"}";
@@ -124,5 +126,15 @@ public final class CompanionNative implements DataSource {
         if (!loaded) return;
         try { warriorsMinimapEnableNative(on); }
         catch (UnsatisfiedLinkError unavailable) { loaded = false; }
+    }
+    public static int warriorsObjective(byte[] rgbaOut, int[] meta) {
+        if (!loaded || rgbaOut == null || meta == null || meta.length < 4) return 0;
+        try { return warriorsObjectiveNative(rgbaOut, meta); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; return 0; }
+    }
+    public static int warriorsUiTex(byte[] rgbaOut, int[] meta, boolean request) {
+        if (!loaded || rgbaOut == null || meta == null || meta.length < 4) return 0;
+        try { return warriorsUiTexNative(rgbaOut, meta, request); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; return 0; }
     }
 }

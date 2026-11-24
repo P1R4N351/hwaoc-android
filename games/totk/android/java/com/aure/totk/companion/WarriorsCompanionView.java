@@ -25,6 +25,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     private static final long POLL_MS = 50L;
     private static final long DEV_STAT_MS = 1000L;
     private static final int MINIMAP_MAX_BYTES = 768 * 768 * 4;
+    private static final int OBJ_MAX_BYTES = 768 * 224 * 4, UI_TEX_BYTES = 512 * 512 * 4;
     private static final String PREFS = "warriors_companion";
 
     private final DataSource source;
@@ -35,7 +36,12 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     private final float[] flts = new float[WarriorsCompanionModel.DETAIL_FLOATS];
     private final byte[] minimapBytes = new byte[MINIMAP_MAX_BYTES];
     private final int[] minimapMeta = new int[5];
-    private Bitmap minimapBmp;
+    private final byte[] objBytes = new byte[OBJ_MAX_BYTES];
+    private final int[] objMeta = new int[4];
+    private final byte[] uiBytes = new byte[UI_TEX_BYTES];
+    private final int[] uiMeta = new int[4];
+    private Bitmap minimapBmp, objBmp;
+    private int uiTexTick, uiTexTries;
     private long lastStateKey = -1L, lastDevMs;
     private int priorOverlayMode = -1;
     private boolean attached;
@@ -76,7 +82,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         this.art.loadCached(context);
         syncArtFlags();
         triggerArtRescan();
-        setBackgroundColor(0xFF060709);
+        setBackgroundColor(0xFF000000);
         setFocusable(false);
     }
 
@@ -89,15 +95,41 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             model.minimapH = rh;
             model.minimapCandCount = minimapMeta[3];
             model.minimapCandIdx = minimapMeta[4];
-            if (got == 1 && rw > 0 && rw <= 512 && rh > 0 && rh <= 512 && rw * rh * 4 <= minimapBytes.length) {
+            if (got == 1 && rw > 0 && rw <= 768 && rh > 0 && rh <= 768 && rw * rh * 4 <= minimapBytes.length) {
                 if (minimapBmp == null || minimapBmp.getWidth() != rw || minimapBmp.getHeight() != rh) {
                     minimapBmp = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888);
                 }
                 minimapBmp.copyPixelsFromBuffer(ByteBuffer.wrap(minimapBytes, 0, rw * rh * 4));
                 art.setMinimap(minimapBmp);
             }
+            pollObjectiveAndUiTex();
         } else {
             CompanionNative.warriorsMinimapEnable(false);
+            art.setObjective(null);
+        }
+    }
+
+    private void pollObjectiveAndUiTex() {
+        int got = CompanionNative.warriorsObjective(objBytes, objMeta);
+        int ow = objMeta[0], oh = objMeta[1], active = objMeta[3];
+        model.objectiveW = ow;
+        model.objectiveH = oh;
+        if (active == 0) {
+            art.setObjective(null);
+        } else if (got == 1 && ow > 0 && ow <= 768 && oh > 0 && oh <= 224 && ow * oh * 4 <= objBytes.length) {
+            if (objBmp == null || objBmp.getWidth() != ow || objBmp.getHeight() != oh) {
+                objBmp = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888);
+            }
+            objBmp.copyPixelsFromBuffer(ByteBuffer.wrap(objBytes, 0, ow * oh * 4));
+            art.setObjective(objBmp);
+        }
+        if (art.purahTex() == null && !art.isSuppressed() && uiTexTries < 8) {
+            boolean req = (uiTexTick % 30) == 0 && uiMeta[3] == 0;
+            uiTexTick++;
+            if (CompanionNative.warriorsUiTex(uiBytes, uiMeta, req) == 1) {
+                uiTexTries++;
+                art.ingestGpuUiTex(getContext(), uiBytes, uiMeta[0], uiMeta[1], model.gameKind);
+            }
         }
     }
 
@@ -105,6 +137,8 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         model.hasBackdrop = art.backdrop() != null;
         model.hasEmblem = art.emblem() != null;
         model.hasLiveMinimap = art.minimap() != null;
+        model.hasLiveObjective = art.objective() != null;
+        model.hasPurahTex = art.purahTex() != null;
         model.assetSource = art.source();
     }
 
@@ -186,7 +220,9 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         removeCallbacks(pollTask);
         CompanionNative.warriorsMinimapEnable(false);
         art.setMinimap(null);
+        art.setObjective(null);
         minimapBmp = null;
+        objBmp = null;
         if (model.devOnStatus && priorOverlayMode > 0) CompanionNative.setOverlayMode(priorOverlayMode);
         if (source != null) source.warriorsAbort();
         super.onDetachedFromWindow();
@@ -195,7 +231,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
         draw.drawAll(canvas, model, art.backdrop(), art.emblem(), art.minimap(),
-                getWidth(), getHeight(), SystemClock.uptimeMillis());
+                art.objective(), art.purahTex(), getWidth(), getHeight(), SystemClock.uptimeMillis());
     }
 
     @Override public boolean performClick() { return super.performClick(); }
@@ -246,27 +282,15 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     }
 
     private boolean handleMapTap(float lx, float ly) {
-        if (lx >= 24f && lx <= 756f && ly >= 108f && ly <= 1048f) { cycleRt(); return true; }
-        if (lx < 774f) return false;
-        if (ly >= 170f && ly <= 250f) { cycleRt(); return true; }
-        if (ly >= 268f && ly <= 348f && source != null) { source.warriorsFire(WarriorsCompanionModel.ACT_LOCKON); return true; }
-        if (ly >= 366f && ly <= 496f && source != null) {
-            source.warriorsFire(lx <= 995f ? (WarriorsCompanionModel.ACT_R_BASE + 1) : WarriorsCompanionModel.ACT_SPECIAL);
+        if (lx >= 24f && lx <= 748f && ly >= 108f && ly <= 1048f) { cycleRt(); return true; }
+        if (lx < 784f || lx > 1200f) return false;
+        if (ly >= 404f && ly <= 496f && source != null) { source.warriorsFire(WarriorsCompanionModel.ACT_LOCKON); return true; }
+        if (ly >= 512f && ly <= 604f) { cycleRt(); return true; }
+        if (ly >= 620f && ly <= 716f && source != null) {
+            source.warriorsFire(lx <= 992f ? (WarriorsCompanionModel.ACT_R_BASE + 1) : WarriorsCompanionModel.ACT_SPECIAL);
             return true;
         }
-        if (ly >= 676f && ly <= 750f) {
-            if (lx <= 995f) model.toggleTimer(SystemClock.uptimeMillis());
-            else model.resetTimer(SystemClock.uptimeMillis());
-            return true;
-        }
-        if (ly >= 838f && ly <= 924f) {
-            if (lx <= 893f) model.adjustKeep(-1);
-            else if (lx <= 995f) model.adjustKeep(1);
-            else if (lx <= 1097f) model.adjustKeep(10);
-            else model.resetKeep();
-            return true;
-        }
-        if (ly >= 944f && ly <= 1024f) { triggerArtRescan(); return true; }
+        if (ly >= 740f && ly <= 828f) { triggerArtRescan(); return true; }
         return false;
     }
 
@@ -356,6 +380,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     }
 
     private void triggerArtRescan() {
+        uiTexTries = 0; uiTexTick = 0;
         String dataDir = System.getenv("TOTK_DATA_DIR");
         File dd = dataDir != null && !dataDir.isEmpty() ? new File(dataDir) : null;
         File[] roots = new File[] {

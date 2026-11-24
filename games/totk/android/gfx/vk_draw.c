@@ -1764,6 +1764,11 @@ static int begin_rendering_inner(int draw_tail) {
             (sa.imageView && sa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     }
     vkCmdBeginRendering(cb, &ri);
+    { VkClearAttachment mm_ca[2]; VkClearRect mm_cr[2]; int mm_nc = vk_minimap_pass_preclear(mm_ca, mm_cr, 2);
+      for (int mm_i = 0; mm_i < mm_nc; mm_i++) {
+          if (R.secondary) vk_record_clear(&mm_ca[mm_i], &mm_cr[mm_i]);
+          else vkCmdClearAttachments(cb, 1, &mm_ca[mm_i], 1, &mm_cr[mm_i]);
+      } }
     totk_ft_count(FT_COUNT_PASSES, 1);
     R.open = 1; g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; g_dyn_input_rev++; g_stat_passes++; R.draws0 = g_stat_draws; pass_inputs_reset(); g_pops.disabled_at_start = S.render_disabled;
     pso_life_pass_write(1);
@@ -6550,7 +6555,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     {
         uint32_t mm_st = S.nattr > 0 ? (uint32_t)(S.attr[0].stream & 15) : 0u;
         VkFormat mm_vfmt = S.nattr > 0 ? vk_vertex_fmt(S.attr[0].fmt) : VK_FORMAT_UNDEFINED;
-        vk_minimap_note_draw(g_indirect.on, S.ds.st, S.ds.dt, (uint32_t)(S.chmask.mask & 0xfu),
+        vk_minimap_note_draw(g_indirect.on, S.ds.st, S.ds.dt, (uint32_t)(S.chmask.mask & 0xfu), (S.color.blend_en & 1u),
                              mm_vfmt, S.nattr > 0 ? (uint32_t)S.attr[0].offset : 0u,
                              S.nattr > 0 ? (uint32_t)S.stream[mm_st].stride : 0u,
                              S.nattr > 0 ? S.vbuf[mm_st].address : 0ull,
@@ -6560,6 +6565,17 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
                              g_ui_aspect_on ? g_ui_aspect.sy : 1.0f,
                              g_ui_aspect_on ? g_ui_aspect.cx : 0.0f,
                              g_ui_aspect_on ? g_ui_aspect.cy : 0.0f);
+        if (sh[1] && vk_minimap_want_ui_tex()) {
+            int n_ = sh[1]->nb < 16 ? sh[1]->nb : 16;
+            for (int i_ = 0; i_ < n_; i_++) {
+                const vk_bind *b_ = &sh[1]->b[i_];
+                if ((b_->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b_->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+                        || b_->reg < 0 || b_->reg >= 128 || !S.tex[1][b_->reg]) continue;
+                int want_ = b_->target; vk_tex *x_ = NULL;
+                vk_tex_by_id((int)(S.tex[1][b_->reg] & 0xfffff), &want_, &x_);
+                if (x_) vk_minimap_note_fs_tex(x_, S.ds.dt);
+            }
+        }
     }
     uint32_t inst = dw ? (dw->instances > 1 ? (uint32_t)dw->instances : 1) : (di->instances > 1 ? (uint32_t)di->instances : 1);
     uint32_t base_inst = dw ? (uint32_t)dw->base_instance : (uint32_t)di->base_instance;
