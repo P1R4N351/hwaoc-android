@@ -11,14 +11,8 @@ import android.graphics.Rect;
 import android.graphics.Shader;
 import android.media.MediaMetadataRetriever;
 import android.os.Handler;
-import android.os.HandlerThread;
 import android.os.Looper;
-import android.os.Process;
 import android.util.Log;
-import android.view.PixelCopy;
-import android.view.SurfaceView;
-import android.view.View;
-import android.view.Window;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -31,8 +25,7 @@ import java.util.List;
  * BYOG runtime asset harvester for the Warriors second-screen companion.
  * Zero game assets ship in the repository or APK: backgrounds and crests are
  * harvested at runtime from the user's own installed game files (pack icons,
- * RomFS WebM/EBML attract movies) or captured live from Display 0 via PixelCopy,
- * then cached under app-private filesDir/companion_art/.
+ * RomFS WebM/EBML attract movies) and cached under filesDir/companion_art/.
  */
 public final class WarriorsAssetHarvester {
     private static final String TAG = "WarriorsArt";
@@ -43,121 +36,14 @@ public final class WarriorsAssetHarvester {
     private static final int BG_W = 620, BG_H = 540, EMBLEM_SZ = 192;
     private static final int MAX_FILES_SCAN = 96;
 
-    public static volatile Window gameWindow;
-
-    private void ensureCopyHandler() {
-        if (copyHandler != null) return;
-        copyThread = new HandlerThread("warriors-minimap-copy", Process.THREAD_PRIORITY_BACKGROUND);
-        copyThread.start();
-        copyHandler = new Handler(copyThread.getLooper());
-    }
-
-    private void applyLiveBackdrop(Context app, Bitmap raw, int result, int gameKind, Runnable onUpdated) {
-        if (result != PixelCopy.SUCCESS) { raw.recycle(); return; }
-        Bitmap styled = styleBackdrop(raw, gameKind);
-        raw.recycle();
-        if (styled == null) return;
-        saveBitmap(new File(artDir(app), BG_FILE), styled);
-        writeSmallText(new File(artDir(app), SRC_FILE), "LIVE");
-        backdrop = styled;
-        source = "LIVE";
-        if (onUpdated != null) onUpdated.run();
-    }
-
-    private void finishMinimapCopy(int result, Bitmap dst, Handler main, Runnable onUpdated) {
-        minimapInFlight = false;
-        if (result == PixelCopy.SUCCESS) {
-            minimap = dst;
-            if (onUpdated != null) main.post(onUpdated);
-        } else {
-            dst.recycle();
-        }
-    }
-
-    void captureLiveBackdropWindow(Context ctx, Window win, int gameKind, Runnable onUpdated) {
-        if (win == null) return;
-        View dv = win.peekDecorView();
-        if (dv == null || dv.getWidth() < 128 || dv.getHeight() < 128) return;
-        final Bitmap raw = Bitmap.createBitmap(BG_W, BG_H, Bitmap.Config.ARGB_8888);
-        final Context app = ctx.getApplicationContext();
-        final Handler main = new Handler(Looper.getMainLooper());
-        try {
-            PixelCopy.request(win, raw, result -> applyLiveBackdrop(app, raw, result, gameKind, onUpdated), main);
-        } catch (RuntimeException e) {
-            raw.recycle();
-        }
-    }
-
-    void captureLiveMinimapWindow(Window win, int cropMode, Runnable onUpdated) {
-        if (minimapInFlight || win == null) return;
-        View dv = win.peekDecorView();
-        if (dv == null) return;
-        int sw = dv.getWidth(), sh = dv.getHeight();
-        if (sw < 320 || sh < 240) return;
-        ensureCopyHandler();
-        Rect src = minimapSrcRect(sw, sh, cropMode);
-        if (src.width() < 32 || src.height() < 32) return;
-        minimapInFlight = true;
-        final Bitmap dst = Bitmap.createBitmap(384, 384, Bitmap.Config.ARGB_8888);
-        final Handler main = new Handler(Looper.getMainLooper());
-        try {
-            PixelCopy.request(win, src, dst, r -> finishMinimapCopy(r, dst, main, onUpdated), copyHandler);
-        } catch (RuntimeException e) {
-            minimapInFlight = false;
-            dst.recycle();
-        }
-    }
-
     private volatile Bitmap backdrop;
     private volatile Bitmap emblem;
     private volatile String source = "NONE";
     private volatile boolean scanning;
     private volatile Bitmap minimap;
-    private volatile boolean minimapInFlight;
-    private HandlerThread copyThread;
-    private Handler copyHandler;
 
     Bitmap minimap() { return minimap; }
-    void clearMinimap() { minimap = null; }
-
-    void shutdown() {
-        if (copyThread != null) {
-            copyThread.quitSafely();
-            copyThread = null;
-            copyHandler = null;
-        }
-    }
-
-    /** Captures the target game's own top-right circular minimap from Display 0 without blocking UI. */
-    void captureLiveMinimap(SurfaceView surface, int cropMode, Runnable onUpdated) {
-        if (minimapInFlight || surface == null || !surface.getHolder().getSurface().isValid()) return;
-        int sw = surface.getWidth(), sh = surface.getHeight();
-        if (sw < 320 || sh < 240) return;
-        ensureCopyHandler();
-        Rect src = minimapSrcRect(sw, sh, cropMode);
-        if (src.width() < 32 || src.height() < 32) return;
-        minimapInFlight = true;
-        final Bitmap dst = Bitmap.createBitmap(384, 384, Bitmap.Config.ARGB_8888);
-        final Handler main = new Handler(Looper.getMainLooper());
-        try {
-            PixelCopy.request(surface, src, dst, r -> finishMinimapCopy(r, dst, main, onUpdated), copyHandler);
-        } catch (RuntimeException e) {
-            minimapInFlight = false;
-            dst.recycle();
-        }
-    }
-
-    static Rect minimapSrcRect(int sw, int sh, int cropMode) {
-        float fx, fy, fw, fh;
-        if (cropMode == 0) { fx = 0.79f; fy = 0.045f; fw = 0.185f; fh = 0.33f; }       // TIGHT
-        else if (cropMode == 2) { fx = 0.73f; fy = 0.015f; fw = 0.255f; fh = 0.45f; }  // WIDE
-        else { fx = 0.77f; fy = 0.03f; fw = 0.21f; fh = 0.37f; }                       // NORMAL
-        int l = Math.max(0, Math.round(sw * fx));
-        int t = Math.max(0, Math.round(sh * fy));
-        int r = Math.min(sw, l + Math.round(sw * fw));
-        int b = Math.min(sh, t + Math.round(sh * fh));
-        return new Rect(l, t, r, b);
-    }
+    void setMinimap(Bitmap bmp) { minimap = bmp; }
 
     Bitmap backdrop() { return backdrop; }
     Bitmap emblem() { return emblem; }
@@ -200,21 +86,6 @@ public final class WarriorsAssetHarvester {
         }, "warriors-art-harvest");
         t.setDaemon(true);
         t.start();
-    }
-
-    void captureLiveBackdrop(Context ctx, SurfaceView surface, int gameKind, Runnable onUpdated) {
-        if (surface == null || !surface.getHolder().getSurface().isValid()) return;
-        int sw = surface.getWidth(), sh = surface.getHeight();
-        if (sw < 128 || sh < 128) return;
-        final Bitmap raw = Bitmap.createBitmap(BG_W, BG_H, Bitmap.Config.ARGB_8888);
-        final Context app = ctx.getApplicationContext();
-        final Handler main = new Handler(Looper.getMainLooper());
-        try {
-            PixelCopy.request(surface, raw, r -> applyLiveBackdrop(app, raw, r, gameKind, onUpdated), main);
-        } catch (RuntimeException e) {
-            raw.recycle();
-            Log.w(TAG, "PixelCopy capture failed", e);
-        }
     }
 
     void clearCache(Context ctx) {

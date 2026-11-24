@@ -12,6 +12,7 @@
 #include "vk_framegen_qcom.h"
 #include "vk_framegen_lsfg.h"
 #include "vk_overlay.h"
+#include "vk_minimap.h"
 #include "framegen_math.h"
 #include "framegen_dependencies.h"
 #include "framegen_passes.h"
@@ -1208,6 +1209,7 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
     pso_life_pass_write(0);
     R.open = 0; g_bound_pipe = VK_NULL_HANDLE;
     if (vk_native_ui_enabled()) for (unsigned i = 0; i < R.ncolor; i++) if (R.ctex[i]) vk_tex_native_written(R.ctex[i], R.native);
+    if (R.ncolor > 0 && R.ctex[0]) vk_minimap_pass_end(cb, R.ctex[0], R.clevel[0], R.clayer[0], R.cfmt[0], R.c_serial[0]);
     pd_pass_end(cb);
     if (vk_fg_extract_active) fg_extract_pass_end();
     fg_extract_authority_span_end(cb); /* rejected frames must consume/poison pending authority */
@@ -11245,7 +11247,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     }
     if (__builtin_expect(vk_rec_profile_on, 0)) vk_rec_profile_begin(VK_REC_O_PRESENT);
     if (every > 0 && t && n % (uint64_t)every == 0) shot(t, n, crop);
-    pp_present(n); pd_present(n);
+    pp_present(n); vk_minimap_present(); pd_present(n);
     if (vk_canvas_on && t) {
         vk_canvas_image window=vk_tex_canvas_identity(vk_tex_get(t),0,0);
         vk_canvas_present(&window);

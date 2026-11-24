@@ -3,6 +3,7 @@ package com.aure.totk.companion;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.os.BatteryManager;
 import android.os.SystemClock;
@@ -13,17 +14,17 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
-import java.util.Locale;
+import java.nio.ByteBuffer;
 
 /**
  * Interactive Canvas CompanionScreen for Hyrule Warriors: Age of Calamity.
- * Mirrors the game's top-right circular minimap onto Display 4, harvests target-game
+ * Mirrors the game's offscreen Vulkan minimap RT onto Display 4, harvests target-game
  * background/emblem art at runtime, streams dev telemetry on STATUS, and syncs Bifrost stick LEDs.
  */
 public final class WarriorsCompanionView extends View implements CompanionScreen {
     private static final long POLL_MS = 50L;
-    private static final long MINIMAP_INTERVAL_MS = 125L;
     private static final long DEV_STAT_MS = 1000L;
+    private static final int MINIMAP_MAX_BYTES = 512 * 512 * 4;
     private static final String PREFS = "warriors_companion";
 
     private final DataSource source;
@@ -32,9 +33,12 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     private final WarriorsAssetHarvester art = new WarriorsAssetHarvester();
     private final int[] ints = new int[WarriorsCompanionModel.DETAIL_INTS];
     private final float[] flts = new float[WarriorsCompanionModel.DETAIL_FLOATS];
-    private long lastStateKey = -1L, lastMinimapMs, lastDevMs;
+    private final byte[] minimapBytes = new byte[MINIMAP_MAX_BYTES];
+    private final int[] minimapMeta = new int[5];
+    private Bitmap minimapBmp;
+    private long lastStateKey = -1L, lastDevMs;
     private int priorOverlayMode = -1;
-    private boolean attached, autoHarvestedLive;
+    private boolean attached;
 
     private final Runnable pollTask = new Runnable() {
         @Override public void run() {
@@ -45,26 +49,12 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             else model.updateOrbit(now);
             model.stickSync = BifrostBridge.syncScreenBrightness;
             model.screenBrightnessPct = BifrostBridge.lastScreenPct;
+            pollNativeMinimap();
             if ((now - lastDevMs) >= DEV_STAT_MS) {
                 lastDevMs = now;
                 updateLocalDevStats();
             }
             syncArtFlags();
-            if (!autoHarvestedLive && !model.hasBackdrop && model.inGame && model.presents >= 120 && !model.moviePlaying) {
-                autoHarvestedLive = true;
-                art.captureLiveBackdropWindow(getContext(), WarriorsAssetHarvester.gameWindow, model.gameKind, () -> {
-                    syncArtFlags();
-                    invalidate();
-                });
-            }
-            if (model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL && model.inGame
-                    && !model.moviePlaying && !model.hostPaused && (now - lastMinimapMs) >= MINIMAP_INTERVAL_MS) {
-                lastMinimapMs = now;
-                art.captureLiveMinimapWindow(WarriorsAssetHarvester.gameWindow, model.mapCropMode, () -> {
-                    syncArtFlags();
-                    invalidate();
-                });
-            }
             invalidate();
             postDelayed(this, POLL_MS);
         }
@@ -81,13 +71,31 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         BifrostBridge.syncScreenBrightness = sync;
         this.art.loadCached(context);
         syncArtFlags();
-        File[] roots = new File[] { context.getFilesDir(), context.getExternalFilesDir(null) };
-        this.art.harvestFromGameDirsAsync(context, roots, model.gameKind, () -> {
-            syncArtFlags();
-            invalidate();
-        });
+        triggerArtRescan();
         setBackgroundColor(0xFF060709);
         setFocusable(false);
+    }
+
+    private void pollNativeMinimap() {
+        if (model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL && model.inGame
+                && !model.moviePlaying && !model.hostPaused) {
+            CompanionNative.warriorsMinimapEnable(true);
+            int got = CompanionNative.warriorsMinimap(minimapBytes, minimapMeta);
+            int rw = minimapMeta[0], rh = minimapMeta[1];
+            model.minimapW = rw;
+            model.minimapH = rh;
+            model.minimapCandCount = minimapMeta[3];
+            model.minimapCandIdx = minimapMeta[4];
+            if (got == 1 && rw > 0 && rw <= 512 && rh > 0 && rh <= 512 && rw * rh * 4 <= minimapBytes.length) {
+                if (minimapBmp == null || minimapBmp.getWidth() != rw || minimapBmp.getHeight() != rh) {
+                    minimapBmp = Bitmap.createBitmap(rw, rh, Bitmap.Config.ARGB_8888);
+                }
+                minimapBmp.copyPixelsFromBuffer(ByteBuffer.wrap(minimapBytes, 0, rw * rh * 4));
+                art.setMinimap(minimapBmp);
+            }
+        } else {
+            CompanionNative.warriorsMinimapEnable(false);
+        }
     }
 
     private void syncArtFlags() {
@@ -107,7 +115,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         if (BifrostBridge.lastScreenPct >= 0) {
             sb.append("SCR  ").append(BifrostBridge.lastScreenPct).append("% -> STICKS\n");
         }
-        sb.append("MAP  ").append(model.hasLiveMinimap ? "LIVE MIRROR" : "STANDBY");
+        sb.append("MAP  ").append(model.minimapLabel()).append(" (").append(model.rtCandLabel()).append(")");
         model.devOverlayText = sb.toString();
     }
 
@@ -139,6 +147,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         int clamped = Math.max(0, Math.min(WarriorsCompanionModel.TAB_COUNT - 1, page));
         if (clamped != model.activeTab()) {
             model.selectTab(clamped);
+            CompanionNative.warriorsMinimapEnable(clamped == WarriorsCompanionModel.TAB_TACTICAL);
             invalidate();
         }
     }
@@ -162,6 +171,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         attached = true;
         priorOverlayMode = CompanionNative.setOverlayMode(-1);
         if (model.devOnStatus && priorOverlayMode > 0) CompanionNative.setOverlayMode(0);
+        CompanionNative.warriorsMinimapEnable(model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL);
         if (source != null && source.enabled()) {
             removeCallbacks(pollTask);
             postDelayed(pollTask, POLL_MS);
@@ -171,8 +181,10 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     @Override protected void onDetachedFromWindow() {
         attached = false;
         removeCallbacks(pollTask);
+        CompanionNative.warriorsMinimapEnable(false);
+        art.setMinimap(null);
+        minimapBmp = null;
         if (model.devOnStatus && priorOverlayMode > 0) CompanionNative.setOverlayMode(priorOverlayMode);
-        art.shutdown();
         if (source != null) source.warriorsAbort();
         super.onDetachedFromWindow();
     }
@@ -196,9 +208,9 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         if (lx < 0f || ly < 0f || lx > WarriorsCompanionDraw.LOGIC_W || ly > WarriorsCompanionDraw.LOGIC_H) {
             return true;
         }
-        if (handleHeaderTap(lx, ly)) { invalidate(); return true; }
+        if (handleHeaderTap(lx, ly)) { performClick(); invalidate(); return true; }
         if (model.touchBlocked()) return true;
-        if (dispatchTabTap(lx, ly)) invalidate();
+        if (dispatchTabTap(lx, ly)) { performClick(); invalidate(); }
         return true;
     }
 
@@ -208,6 +220,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             float left = 24f + i * 302f;
             if (lx >= left && lx <= left + 286f) {
                 model.selectTab(i);
+                CompanionNative.warriorsMinimapEnable(i == WarriorsCompanionModel.TAB_TACTICAL);
                 if (source != null) source.page(i);
                 return true;
             }
@@ -223,10 +236,16 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         return handleStatusTap(lx, ly);
     }
 
+    private void cycleRt() {
+        model.minimapCandIdx = CompanionNative.warriorsMinimapCycle();
+        minimapMeta[2] = 0;
+        pollNativeMinimap();
+    }
+
     private boolean handleMapTap(float lx, float ly) {
-        if (lx >= 24f && lx <= 756f && ly >= 108f && ly <= 1048f) { model.cycleMapCrop(); return true; }
+        if (lx >= 24f && lx <= 756f && ly >= 108f && ly <= 1048f) { cycleRt(); return true; }
         if (lx < 774f) return false;
-        if (ly >= 170f && ly <= 250f) { model.cycleMapCrop(); return true; }
+        if (ly >= 170f && ly <= 250f) { cycleRt(); return true; }
         if (ly >= 268f && ly <= 348f && source != null) { source.warriorsFire(WarriorsCompanionModel.ACT_LOCKON); return true; }
         if (ly >= 366f && ly <= 496f && source != null) {
             source.warriorsFire(lx <= 995f ? (WarriorsCompanionModel.ACT_R_BASE + 1) : WarriorsCompanionModel.ACT_SPECIAL);
@@ -244,7 +263,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             else model.resetKeep();
             return true;
         }
-        if (ly >= 944f && ly <= 1024f) { triggerLiveHarvest(); return true; }
+        if (ly >= 944f && ly <= 1024f) { triggerArtRescan(); return true; }
         return false;
     }
 
@@ -318,18 +337,18 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             return true;
         }
         if (ly >= 448f && ly <= 558f) { model.toggleAutoDim(); return true; }
-        if (ly >= 728f && ly <= 838f) { triggerLiveHarvest(); return true; }
+        if (ly >= 728f && ly <= 838f) { triggerArtRescan(); return true; }
         if (ly >= 862f && ly <= 960f) {
             art.clearCache(getContext());
-            autoHarvestedLive = true;
             syncArtFlags();
             return true;
         }
         return false;
     }
 
-    private void triggerLiveHarvest() {
-        art.captureLiveBackdropWindow(getContext(), WarriorsAssetHarvester.gameWindow, model.gameKind, () -> {
+    private void triggerArtRescan() {
+        File[] roots = new File[] { getContext().getFilesDir(), getContext().getExternalFilesDir(null) };
+        art.harvestFromGameDirsAsync(getContext(), roots, model.gameKind, () -> {
             syncArtFlags();
             invalidate();
         });

@@ -50,6 +50,9 @@ public final class CompanionNative implements DataSource {
     private static native void warriorsAbortNative();
     private static native int warriorsPinNative(int op, int slot, String label);
     private static native int overlaySetModeNative(int mode);
+    private static native int warriorsMinimapNative(byte[] rgbaOut, int[] meta);
+    private static native int warriorsMinimapCycleNative();
+    private static native void warriorsMinimapEnableNative(boolean on);
 
     @Override public String read(int detail) {
         if (!loaded) return "{\"schema\":1,\"seq\":0,\"status\":\"unsupported\"}";
@@ -106,5 +109,20 @@ public final class CompanionNative implements DataSource {
         if (!loaded) return mode < 0 ? 0 : mode;
         try { return overlaySetModeNative(mode); }
         catch (UnsatisfiedLinkError unavailable) { loaded = false; return mode < 0 ? 0 : mode; }
+    }
+    public static int warriorsMinimap(byte[] rgbaOut, int[] meta) {
+        if (!loaded || rgbaOut == null || meta == null || meta.length < 5) return 0;
+        try { return warriorsMinimapNative(rgbaOut, meta); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; return 0; }
+    }
+    public static int warriorsMinimapCycle() {
+        if (!loaded) return 0;
+        try { return warriorsMinimapCycleNative(); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; return 0; }
+    }
+    public static void warriorsMinimapEnable(boolean on) {
+        if (!loaded) return;
+        try { warriorsMinimapEnableNative(on); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; }
     }
 }

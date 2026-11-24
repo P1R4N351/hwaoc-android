@@ -13,7 +13,6 @@ import com.aure.totk.companion.CompanionContent;
 import com.aure.totk.companion.CompanionNative;
 import com.aure.totk.companion.DisplayClass;
 import com.aure.totk.companion.PresentationController;
-import com.aure.totk.companion.WarriorsAssetHarvester;
 import com.aure.totk.setup.SetupActivity;   // compile-time constants only: the game process never loads setup classes
 import com.aure.totk.setup.SaveMirror;
 import java.nio.charset.StandardCharsets;
@@ -149,7 +148,6 @@ public final class TotkActivity extends NativeActivity {
     }
     @Override protected void onCreate(Bundle state) {
         super.onCreate(state);
-        WarriorsAssetHarvester.gameWindow = getWindow();
         // NativeActivity synchronously loads totk.env in ANativeActivity_onCreate.
         // Query only after super, before constructing a controller or display listener.
         // The companion art is generated on the device by the optional setup stage; without it the companion stays off.
@@ -240,7 +238,6 @@ public final class TotkActivity extends NativeActivity {
         super.onStop();
     }
     @Override protected void onDestroy() {
-        if (WarriorsAssetHarvester.gameWindow == getWindow()) WarriorsAssetHarvester.gameWindow = null;
         updatePresentPrerotate(0);
         if (companion != null) { companion.close(); companion = null; }
         if (saves != null) { saves.close(1500); saves = null; }

@@ -65,7 +65,13 @@ public class AssetManager {
     'android/util/Log.java': 'package android.util; public final class Log { public static int w(String t, String m) { return 0; } public static int w(String t, String m, Throwable e) { return 0; } }',
     'android/os/SystemClock.java': 'package android.os; public final class SystemClock { public static long now = 1_000_000; public static long uptimeMillis() { return now; } }',
     'android/graphics/PixelFormat.java': 'package android.graphics; public class PixelFormat { public static final int RGBA_8888 = 1; }',
-    'android/graphics/Bitmap.java': 'package android.graphics; public class Bitmap { public int getWidth() { return 1; } public int getHeight() { return 1; } public boolean isRecycled() { return false; } }',
+    'android/graphics/Bitmap.java': '''package android.graphics;
+public class Bitmap {
+    public enum Config { ARGB_8888 }
+    public static Bitmap createBitmap(int w, int h, Config c) { return new Bitmap(); }
+    public int getWidth() { return 1; } public int getHeight() { return 1; } public boolean isRecycled() { return false; }
+    public void copyPixelsFromBuffer(java.nio.Buffer src) { }
+}''',
     'android/graphics/Color.java': 'package android.graphics; public class Color { public static final int WHITE = -1; }',
     'android/graphics/ColorFilter.java': 'package android.graphics; public class ColorFilter { }',
     'android/graphics/PorterDuff.java': 'package android.graphics; public class PorterDuff { public enum Mode { SRC_IN } }',
@@ -121,7 +127,6 @@ public class Canvas {
     public void drawPath(Path path, Paint p) { } public void drawPicture(Picture p) { }
 }''',
     'android/graphics/Rect.java': 'package android.graphics; public class Rect { public Rect() { } public Rect(int l, int t, int r, int b) { } public void set(int l, int t, int r, int b) { } }',
-    'android/view/Window.java': 'package android.view; public class Window { }',
     'android/view/MotionEvent.java': '''package android.view;
 public class MotionEvent {
     public static final int ACTION_DOWN = 0, ACTION_UP = 1, ACTION_MOVE = 2, ACTION_CANCEL = 3, ACTION_POINTER_DOWN = 5, ACTION_POINTER_UP = 6;
@@ -217,22 +222,27 @@ public final class Snapshot {
 }''',
     'com/aure/totk/BifrostBridge.java':
         'package com.aure.totk; public final class BifrostBridge { public static volatile boolean syncScreenBrightness = true; public static volatile int lastScreenPct = -1; }',
-    'com/aure/totk/companion/CompanionNative.java':
-        'package com.aure.totk.companion; public final class CompanionNative { public static boolean isEnabled() { return true; } public static int setOverlayMode(int mode) { return mode < 0 ? 0 : mode; } }',
+    'com/aure/totk/companion/CompanionNative.java': '''package com.aure.totk.companion;
+public final class CompanionNative {
+    public static boolean enabledRt;
+    public static int cycleCount;
+    public static boolean isEnabled() { return true; }
+    public static int setOverlayMode(int mode) { return mode < 0 ? 0 : mode; }
+    public static int warriorsMinimap(byte[] rgbaOut, int[] meta) { return 0; }
+    public static int warriorsMinimapCycle() { return ++cycleCount; }
+    public static void warriorsMinimapEnable(boolean on) { enabledRt = on; }
+}''',
     'com/aure/totk/companion/WarriorsAssetHarvester.java': '''package com.aure.totk.companion;
-import android.content.Context; import android.graphics.Bitmap; import android.view.Window; import java.io.File;
+import android.content.Context; import android.graphics.Bitmap; import java.io.File;
 public final class WarriorsAssetHarvester {
-    public static volatile Window gameWindow;
     public void loadCached(Context c) { }
     public void harvestFromGameDirsAsync(Context c, File[] r, int k, Runnable u) { }
-    public void captureLiveBackdropWindow(Context c, Window w, int k, Runnable u) { }
-    public void captureLiveMinimapWindow(Window w, int m, Runnable u) { }
     public void clearCache(Context c) { }
+    public void setMinimap(Bitmap bmp) { }
     public Bitmap backdrop() { return null; }
     public Bitmap emblem() { return null; }
     public Bitmap minimap() { return null; }
     public String source() { return "NONE"; }
-    public void shutdown() { }
 }''',
     'com/aure/totk/companion/SnapshotPoller.java': '''package com.aure.totk.companion;
 public final class SnapshotPoller {
@@ -495,6 +505,8 @@ class CompanionScreenTests(unittest.TestCase):
     def test_hwaoc_screen_is_warriors_view(self):
         classes = self.screen_classes('hwaoc')
         self.assertIn('pass: companion screen hwaoc warriors', self.run_probe(classes, 'com.aure.totk.companion.ScreenProbe', 'hwaoc', 'warriors'))
+        self.assertIn('CYCLE RT', (JAVA / 'WarriorsCompanionDraw.java').read_text())
+        self.assertNotIn('PixelCopy', (JAVA / 'WarriorsAssetHarvester.java').read_text())
 
     def test_botw_screen_keeps_no_page_and_needs_no_library(self):
         # No libduo_host.so on the host: the class still loads and the screen still stands behind the interface.

@@ -55,8 +55,14 @@ void runtime_android_motion_live(JNIEnv *env, jclass cls, jboolean on, jstring s
 jint runtime_android_feedback_enabled(JNIEnv *env, jclass cls);
 #if defined(__GNUC__)
 extern int vk_overlay_set_mode(int mode) __attribute__((weak));
+extern int vk_minimap_read(uint8_t *rgba_out, int max_bytes, int32_t meta[5]) __attribute__((weak));
+extern int vk_minimap_cycle(void) __attribute__((weak));
+extern void vk_minimap_enable(int on) __attribute__((weak));
 #else
 extern int vk_overlay_set_mode(int mode);
+extern int vk_minimap_read(uint8_t *rgba_out, int max_bytes, int32_t meta[5]);
+extern int vk_minimap_cycle(void);
+extern void vk_minimap_enable(int on);
 #endif
 
 /* Do not cache this in JNI_OnLoad: NativeActivity's start_game reads totk.env
@@ -323,6 +329,28 @@ static jint JNICALL native_overlay_set_mode(JNIEnv *env, jclass cls, jint mode) 
     (void)env; (void)cls;
     return vk_overlay_set_mode ? (jint)vk_overlay_set_mode((int)mode) : 0;
 }
+static jint JNICALL native_warriors_minimap(JNIEnv *env, jclass cls, jbyteArray rgbaOut, jintArray metaOut) {
+    if (!native_enabled(env, cls) || !rgbaOut || !metaOut || !vk_minimap_read) return 0;
+    if ((*env)->GetArrayLength(env, metaOut) < 5) return 0;
+    jint jm[5] = {0};
+    (*env)->GetIntArrayRegion(env, metaOut, 0, 5, jm);
+    int32_t m[5] = {(int32_t)jm[0], (int32_t)jm[1], (int32_t)jm[2], (int32_t)jm[3], (int32_t)jm[4]};
+    jsize cap = (*env)->GetArrayLength(env, rgbaOut);
+    jbyte *buf = cap > 0 ? (*env)->GetByteArrayElements(env, rgbaOut, NULL) : NULL;
+    int updated = buf ? vk_minimap_read((uint8_t *)buf, (int)cap, m) : 0;
+    if (buf) (*env)->ReleaseByteArrayElements(env, rgbaOut, buf, updated ? 0 : JNI_ABORT);
+    for (int i = 0; i < 5; i++) jm[i] = (jint)m[i];
+    (*env)->SetIntArrayRegion(env, metaOut, 0, 5, jm);
+    return updated ? 1 : 0;
+}
+static jint JNICALL native_warriors_minimap_cycle(JNIEnv *env, jclass cls) {
+    (void)env; (void)cls;
+    return vk_minimap_cycle ? (jint)vk_minimap_cycle() : 0;
+}
+static void JNICALL native_warriors_minimap_enable(JNIEnv *env, jclass cls, jboolean on) {
+    (void)env; (void)cls;
+    if (vk_minimap_enable) vk_minimap_enable(on ? 1 : 0);
+}
 
 __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserved) {
     (void)reserved;
@@ -348,6 +376,9 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
         {"warriorsAbortNative", "()V", (void *)native_warriors_abort},
         {"warriorsPinNative", "(IILjava/lang/String;)I", (void *)native_warriors_pin},
         {"overlaySetModeNative", "(I)I", (void *)native_overlay_set_mode},
+        {"warriorsMinimapNative", "([B[I)I", (void *)native_warriors_minimap},
+        {"warriorsMinimapCycleNative", "()I", (void *)native_warriors_minimap_cycle},
+        {"warriorsMinimapEnableNative", "(Z)V", (void *)native_warriors_minimap_enable},
     };
     if ((*env)->RegisterNatives(env, cls, methods, sizeof methods / sizeof *methods)) {
         (*env)->ExceptionClear(env); fprintf(stderr, "[companion] RegisterNatives failed\n");
