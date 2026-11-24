@@ -59,6 +59,7 @@ extern int vk_minimap_read(uint8_t *rgba_out, int max_bytes, int32_t meta[5]) __
 extern int vk_minimap_cycle(void) __attribute__((weak));
 extern void vk_minimap_enable(int on) __attribute__((weak));
 extern int vk_minimap_objective_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]) __attribute__((weak));
+extern int vk_minimap_lhud_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]) __attribute__((weak));
 extern int vk_minimap_ui_tex_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request) __attribute__((weak));
 #else
 extern int vk_overlay_set_mode(int mode);
@@ -66,6 +67,7 @@ extern int vk_minimap_read(uint8_t *rgba_out, int max_bytes, int32_t meta[5]);
 extern int vk_minimap_cycle(void);
 extern void vk_minimap_enable(int on);
 extern int vk_minimap_objective_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
+extern int vk_minimap_lhud_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
 extern int vk_minimap_ui_tex_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request);
 #endif
 
@@ -378,6 +380,10 @@ static jint JNICALL native_warriors_objective(JNIEnv *env, jclass cls, jbyteArra
     return vk_minimap_objective_read ? jni_read_rgba_buf(env, cls, rgbaOut, metaOut, 4, vk_minimap_objective_read, NULL, 0) : 0;
 }
 
+static jint JNICALL native_warriors_lhud(JNIEnv *env, jclass cls, jbyteArray rgbaOut, jintArray metaOut) {
+    return vk_minimap_lhud_read ? jni_read_rgba_buf(env, cls, rgbaOut, metaOut, 4, vk_minimap_lhud_read, NULL, 0) : 0;
+}
+
 static jint JNICALL native_warriors_ui_tex(JNIEnv *env, jclass cls, jbyteArray rgbaOut, jintArray metaOut, jboolean request) {
     return vk_minimap_ui_tex_read ? jni_read_rgba_buf(env, cls, rgbaOut, metaOut, 4, NULL, vk_minimap_ui_tex_read, request ? 1 : 0) : 0;
 }
@@ -410,6 +416,7 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
         {"warriorsMinimapCycleNative", "()I", (void *)native_warriors_minimap_cycle},
         {"warriorsMinimapEnableNative", "(Z)V", (void *)native_warriors_minimap_enable},
         {"warriorsObjectiveNative", "([B[I)I", (void *)native_warriors_objective},
+        {"warriorsLeftHudNative", "([B[I)I", (void *)native_warriors_lhud},
         {"warriorsUiTexNative", "([B[IZ)I", (void *)native_warriors_ui_tex},
     };
     if ((*env)->RegisterNatives(env, cls, methods, sizeof methods / sizeof *methods)) {

@@ -172,7 +172,7 @@ hwaoc = false
 meaning = "Row of BifrostLooks.LOOKS the stick-LED bridge uses (colour table)"
 totk = "TOTK"
 botw = "BOTW"
-hwaoc = "BOTW"
+hwaoc = "HWAOC"
 
 [var.direct_boot]
 meaning = "Whether the app boots straight into the game by default when playable, moving setup and warm launches onto the main display on dual-screen handhelds"
@@ -264,7 +264,7 @@ release_asset = "AoC-Native-"
 "games/totk/android/gfx/vk_post.c" = { n = 2, vars = ["runtime_code"] }
 "games/totk/android/gfx/vk_res.c" = { n = 2, vars = ["runtime_code"] }
 "games/totk/android/gfx/vk_shader.c" = { n = 2, vars = ["runtime_code"] }
-"games/totk/android/java/com/aure/totk/BifrostState.java" = { n = 1, vars = ["bifrost_looks"] }
+"games/totk/android/java/com/aure/totk/BifrostState.java" = { n = 2, vars = ["bifrost_looks"] }
 "games/totk/android/java/com/aure/totk/companion/CompanionContent.java" = { n = 2, vars = ["companion"] }
 "games/totk/android/java/com/aure/totk/setup/ArtPolicy.java" = { n = 1, vars = ["companion"] }
 "games/totk/android/setup/setup.c" = { n = 1, vars = ["ondevice_setup"] }

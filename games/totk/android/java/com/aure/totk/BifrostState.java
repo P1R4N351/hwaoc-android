@@ -12,7 +12,8 @@ import com.aure.totk.setup.GameBuild;
 final class BifrostState {
     private BifrostState() { }
     /** The colour table, by the game's bifrost_looks variable (games/games.toml). */
-    static final int GAME = "BOTW".equals(GameBuild.BIFROST_LOOKS) ? BifrostLooks.BOTW : BifrostLooks.TOTK;
+    static final int GAME = "HWAOC".equals(GameBuild.BIFROST_LOOKS) ? BifrostLooks.HWAOC
+            : ("BOTW".equals(GameBuild.BIFROST_LOOKS) ? BifrostLooks.BOTW : BifrostLooks.TOTK);
     private static final CompanionNative SOURCE = new CompanionNative();
     private static final long[] WORDS = new long[CompanionState.FIELDS];
     private static final CompanionState STATE = new CompanionState();

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
-// Native Vulkan HUD minimap & objective redirection (2-slot staging rings) + one-shot UI texture harvest.
-// Included only by vk_draw.c; exports vk_minimap_* for companion_jni.c.
+// Native Vulkan HUD minimap, left-HUD & objective per-draw attachment redirection (2-slot staging rings)
+// + one-shot UI texture harvest. Redirects HUD draws at recording time onto an offscreen color attachment
+// sharing the pass depth/stencil views; never masks, clears, or overwrites Display 0.
 
 #include <math.h>
 #include <pthread.h>
@@ -13,17 +14,20 @@
 enum {
     VK_MM_MIN_SIDE = 96u,
     VK_MM_MAX_SIDE = 768u,
-    VK_MM_SAVE_W = 896u,
-    VK_MM_SAVE_H = 896u,
-    VK_OBJ_MAX_W = 768u,
-    VK_OBJ_MAX_H = 224u,
+    VK_MM_SAVE_MAX_W = 2560u,
+    VK_MM_SAVE_MAX_H = 1440u,
+    VK_OBJ_MAX_W = 1024u,
+    VK_OBJ_MAX_H = 288u,
+    VK_LHUD_MAX_W = 640u,
+    VK_LHUD_MAX_H = 1440u,
     VK_UI_TEX_SIDE = 512u,
     VK_MM_SLOTS = 2,
     VK_MM_MAX_CAND = 8,
-    VK_MM_TTL = 3u
+    VK_MM_TTL = 2u
 };
 #define VK_MM_BUF_BYTES ((VkDeviceSize)(VK_MM_MAX_SIDE * VK_MM_MAX_SIDE * 4u))
 #define VK_OBJ_BUF_BYTES ((VkDeviceSize)(VK_OBJ_MAX_W * VK_OBJ_MAX_H * 4u))
+#define VK_LHUD_BUF_BYTES ((VkDeviceSize)(VK_LHUD_MAX_W * VK_LHUD_MAX_H * 4u))
 #define VK_UI_BUF_BYTES ((VkDeviceSize)(VK_UI_TEX_SIDE * VK_UI_TEX_SIDE * 4u))
 
 typedef struct { VkBuffer buf; VkDeviceMemory mem; uint8_t *ptr; } vk_mm_slot;
@@ -46,7 +50,7 @@ typedef struct {
 
 static struct {
     pthread_mutex_t mu;
-    vk_mm_stream mm, obj;
+    vk_mm_stream mm, obj, lhud;
     vk_mm_slot ui_slot;
     VkImage ui_img;
     VkDeviceMemory ui_mem;
@@ -56,28 +60,34 @@ static struct {
     int ui_seen_n, ui_seen_pos;
     _Atomic int ui_want;
     vk_ui_cand ui_cand;
-    VkImage save_img;
-    VkDeviceMemory save_mem;
-    VkFormat save_fmt;
-    int save_ready, save_failed;
+    VkImage hud_img, hud_cleared_im, hud_state_im, pass_im, saved_hit_img;
+    VkImageView hud_view, main_cview, depth_view, stencil_view;
+    VkDeviceMemory hud_mem;
+    VkFormat hud_fmt;
+    VkImageLayout main_clayout, depth_layout, stencil_layout;
+    VkRect2D pass_area;
+    uint32_t hud_w, hud_h, pass_w, pass_h;
+    int hud_ready, hud_failed, has_depth, has_stencil_att, cur_hud, pass_hud_cleared;
     vk_mm_cand cand[VK_MM_MAX_CAND];
     _Atomic int cand_count, want_active;
     _Atomic uint32_t cand_idx;
-    uint32_t frame_counter, mm_ttl, obj_ttl;
-    int saw_mm_frame, saw_obj_frame;
-    int in_hud_pass, pass_opaque_fs, pass_mm_hit, pass_obj_hit, pc_mm_done, pc_obj_done;
-    VkImage pass_im, saved_hit_img;
-    uint32_t frame_got_mm, frame_got_obj, pass_w, pass_h;
-    vk_mm_rect save_box, pc_mm, pc_obj, hit_mm, hit_obj;
+    uint32_t frame_counter, mm_ttl, obj_ttl, lhud_ttl;
+    uint32_t hud_cleared_frame, hud_state_frame, frame_got_mm, frame_got_obj, frame_got_lhud;
+    int saw_mm_frame, saw_obj_frame, saw_lhud_frame;
+    int in_hud_pass, pass_opaque_fs, pass_modal, pass_dialog;
+    int pass_mm_hit, pass_obj_hit, obj_bounds_init, pass_obj_icon, pass_obj_pill, pass_obj_text, cand_obj_text;
+    int pass_lhud_any, pass_lhud_top;
+    vk_mm_rect hit_mm, hit_obj, prev_hit_obj, hit_lhud;
     uint32_t learn_mm_w, learn_mm_h;
     int32_t learn_mm_cx, learn_mm_cy, learn_mm_half;
-    uint32_t learn_obj_w, learn_obj_h;
-    vk_mm_rect learn_obj;
     float obj_umin_x, obj_umin_y, obj_umax_x, obj_umax_y;
+    float obj_icon_cx, obj_icon_core_w, obj_icon_cy, obj_pill_mn_x, obj_pill_cy;
+    float cand_text_mn_x, cand_text_cy, learn_obj_icon_x, learn_obj_text_x, learn_obj_cy;
 } g_vk_mm = {
     .mu = PTHREAD_MUTEX_INITIALIZER,
     .mm = { .slot_bytes = VK_MM_BUF_BYTES, .pending_slot = -1, .ready_slot = -1 },
     .obj = { .slot_bytes = VK_OBJ_BUF_BYTES, .pending_slot = -1, .ready_slot = -1 },
+    .lhud = { .slot_bytes = VK_LHUD_BUF_BYTES, .pending_slot = -1, .ready_slot = -1 },
 };
 
 static int vk_mm_supported_fmt(VkFormat fmt) {
@@ -186,132 +196,148 @@ static int vk_mm_create_img(
     return 1;
 }
 
-static int vk_mm_ensure_save(VkCommandBuffer cb, VkFormat fmt) {
-    if (g_vk_mm.save_ready) {
-        if (g_vk_mm.save_fmt == fmt) return 1;
-        vkDestroyImage(V.dev, g_vk_mm.save_img, NULL);
-        vk_memory_release(g_vk_mm.save_mem, VK_MEMORY_DIAGNOSTIC);
-        g_vk_mm.save_img = VK_NULL_HANDLE; g_vk_mm.save_mem = VK_NULL_HANDLE; g_vk_mm.save_ready = 0;
+static void vk_mm_destroy_hud(void) {
+    if (g_vk_mm.hud_view) vkDestroyImageView(V.dev, g_vk_mm.hud_view, NULL);
+    if (g_vk_mm.hud_img) vkDestroyImage(V.dev, g_vk_mm.hud_img, NULL);
+    if (g_vk_mm.hud_mem) vk_memory_release(g_vk_mm.hud_mem, VK_MEMORY_DIAGNOSTIC);
+    g_vk_mm.hud_view = VK_NULL_HANDLE; g_vk_mm.hud_img = VK_NULL_HANDLE;
+    g_vk_mm.hud_mem = VK_NULL_HANDLE; g_vk_mm.hud_ready = 0;
+    g_vk_mm.hud_cleared_frame = 0u; g_vk_mm.hud_state_frame = 0u;
+    g_vk_mm.hud_cleared_im = VK_NULL_HANDLE; g_vk_mm.hud_state_im = VK_NULL_HANDLE;
+    g_vk_mm.prev_hit_obj = (vk_mm_rect){0, 0, 0u, 0u};
+}
+
+static int vk_mm_ensure_hud(VkCommandBuffer cb, uint32_t w, uint32_t h, VkFormat fmt) {
+    if (w > VK_MM_SAVE_MAX_W || h > VK_MM_SAVE_MAX_H) return 0;
+    if (g_vk_mm.hud_ready) {
+        if (g_vk_mm.hud_fmt == fmt && g_vk_mm.hud_w == w && g_vk_mm.hud_h == h) return 1;
+        vkDeviceWaitIdle(V.dev);
+        vk_mm_destroy_hud();
     }
-    if (g_vk_mm.save_failed || !V.dev || !cb) return 0;
-    if (!vk_mm_create_img(cb, VK_MM_SAVE_W, VK_MM_SAVE_H, fmt,
-            VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
-            &g_vk_mm.save_img, &g_vk_mm.save_mem)) {
-        g_vk_mm.save_failed = 1;
-        return 0;
+    if (g_vk_mm.hud_failed || !V.dev || !cb || !w || !h) return 0;
+    if (!vk_mm_create_img(cb, w, h, fmt,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            &g_vk_mm.hud_img, &g_vk_mm.hud_mem)) {
+        g_vk_mm.hud_failed = 1; return 0;
     }
-    g_vk_mm.save_fmt = fmt;
-    g_vk_mm.save_ready = 1;
+    VkImageViewCreateInfo vi = {
+        VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_vk_mm.hud_img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = fmt, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u}
+    };
+    if (vkCreateImageView(V.dev, &vi, NULL, &g_vk_mm.hud_view)) {
+        vk_mm_destroy_hud(); g_vk_mm.hud_failed = 1; return 0;
+    }
+    g_vk_mm.hud_fmt = fmt; g_vk_mm.hud_w = w; g_vk_mm.hud_h = h;
+    g_vk_mm.hud_ready = 1;
     return 1;
 }
 
-static vk_mm_rect vk_mm_clamp_rect(int32_t x0, int32_t y0, int32_t x1, int32_t y1, const vk_mm_rect *lim) {
-    int32_t lx0 = lim->x, ly0 = lim->y, lx1 = lim->x + (int32_t)lim->w, ly1 = lim->y + (int32_t)lim->h;
-    if (x0 < lx0) x0 = lx0; if (y0 < ly0) y0 = ly0;
-    if (x1 > lx1) x1 = lx1; if (y1 > ly1) y1 = ly1;
-    return (vk_mm_rect){x0, y0, (uint32_t)(x1 > x0 ? x1 - x0 : 0), (uint32_t)(y1 > y0 ? y1 - y0 : 0)};
+static vk_mm_rect vk_mm_lhud_box(uint32_t w, uint32_t h) {
+    uint32_t lw = ((uint32_t)lrintf((float)w * 0.26f)) & ~3u;
+    if (lw > VK_LHUD_MAX_W) lw = VK_LHUD_MAX_W;
+    if (lw > (w & ~3u)) lw = w & ~3u;
+    uint32_t lh = h < VK_LHUD_MAX_H ? h : VK_LHUD_MAX_H;
+    return (vk_mm_rect){0, 0, lw, lh};
 }
 
-static vk_mm_rect vk_mm_union_rect(const vk_mm_rect *a, const vk_mm_rect *b) {
-    if (!a->w || !a->h) return *b;
-    if (!b->w || !b->h) return *a;
-    int32_t x0 = a->x < b->x ? a->x : b->x, y0 = a->y < b->y ? a->y : b->y;
-    int32_t x1 = (a->x + (int32_t)a->w) > (b->x + (int32_t)b->w) ? (a->x + (int32_t)a->w) : (b->x + (int32_t)b->w);
-    int32_t y1 = (a->y + (int32_t)a->h) > (b->y + (int32_t)b->h) ? (a->y + (int32_t)a->h) : (b->y + (int32_t)b->h);
-    return (vk_mm_rect){x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0)};
-}
-
-static vk_mm_rect vk_mm_pad_rect(const vk_mm_rect *r, int32_t px, int32_t py, uint32_t pw, uint32_t ph) {
-    vk_mm_rect fb = {0, 0, pw, ph};
-    return vk_mm_clamp_rect(r->x - px, r->y - py, r->x + (int32_t)r->w + px, r->y + (int32_t)r->h + py, &fb);
-}
-
-static vk_mm_rect vk_mm_compute_save_box(uint32_t w, uint32_t h) {
-    int32_t sw = (int32_t)(w < VK_MM_SAVE_W ? w : VK_MM_SAVE_W);
-    int32_t sh = (int32_t)(h < VK_MM_SAVE_H ? h : VK_MM_SAVE_H);
-    int32_t x1 = (int32_t)w, x0 = x1 - sw, y1 = (int32_t)h, y0 = y1 - sh;
-    if (g_vk_mm.learn_mm_w == w && g_vk_mm.learn_mm_h == h && g_vk_mm.learn_mm_half > 0) {
-        int32_t half = g_vk_mm.learn_mm_half + 48;
-        if (half > (int32_t)(VK_MM_SAVE_W / 2u)) half = (int32_t)(VK_MM_SAVE_W / 2u);
-        vk_mm_rect mm = vk_mm_pad_rect(&(vk_mm_rect){g_vk_mm.learn_mm_cx - half,
-            g_vk_mm.learn_mm_cy - half, (uint32_t)(half * 2), (uint32_t)(half * 2)}, 0, 0, w, h);
-        vk_mm_rect u = mm;
-        if (g_vk_mm.learn_obj_w == w && g_vk_mm.learn_obj_h == h && g_vk_mm.learn_obj.w > 0u) {
-            vk_mm_rect ob = vk_mm_pad_rect(&g_vk_mm.learn_obj, 24, 24, w, h);
-            vk_mm_rect cand = vk_mm_union_rect(&mm, &ob);
-            if (cand.w <= VK_MM_SAVE_W && cand.h <= VK_MM_SAVE_H) u = cand;
-        }
-        int32_t ux0 = u.x, uy0 = u.y, ux1 = u.x + (int32_t)u.w, uy1 = u.y + (int32_t)u.h;
-        if (ux0 < x0 && ux1 <= x1) x0 = ux1 - sw > 0 ? ux1 - sw : 0;
-        if (ux0 >= x0 && ux1 <= x1 && uy0 >= y0 && uy1 <= y1) return (vk_mm_rect){x0, y0, (uint32_t)sw, (uint32_t)sh};
-        x0 = ux0; x1 = ux1; y0 = uy0; y1 = uy1;
-        if (x1 - x0 < sw) { int32_t nx0 = x1 - sw; x0 = nx0 > 0 ? nx0 : 0; if (x0 + sw <= (int32_t)w) x1 = x0 + sw; }
-        if (y1 - y0 < sh) { int32_t ny0 = y1 - sh; y0 = ny0 > 0 ? ny0 : 0; if (y0 + sh <= (int32_t)h) y1 = y0 + sh; }
-    }
-    return (vk_mm_rect){x0, y0, (uint32_t)(x1 - x0), (uint32_t)(y1 - y0)};
-}
+static int vk_minimap_in_hud_pass(void) { return g_vk_mm.in_hud_pass; }
 
 static void vk_minimap_pass_begin(
-    VkCommandBuffer cb, vk_tex *t, unsigned lv, unsigned l0,
-    uint32_t w, uint32_t h, int load_c0, int has_stencil, int native_ui) {
-    g_vk_mm.in_hud_pass = 0; g_vk_mm.pass_opaque_fs = 0;
-    g_vk_mm.pass_mm_hit = 0; g_vk_mm.pass_obj_hit = 0;
-    g_vk_mm.pc_mm_done = 0; g_vk_mm.pc_obj_done = 0;
+    VkCommandBuffer cb, vk_tex *t, unsigned lv, unsigned l0, uint32_t w, uint32_t h,
+    VkFormat att_fmt, VkRect2D area, VkImageView main_cview, VkImageLayout main_clayout,
+    const VkRenderingAttachmentInfo *dp, const VkRenderingAttachmentInfo *sp,
+    int load_c0, int ok) {
+    g_vk_mm.in_hud_pass = 0; g_vk_mm.cur_hud = 0; g_vk_mm.pass_hud_cleared = 0;
+    g_vk_mm.pass_opaque_fs = 0; g_vk_mm.pass_modal = 0; g_vk_mm.pass_dialog = 0;
     g_vk_mm.ui_cand.img = VK_NULL_HANDLE; g_vk_mm.ui_cand.score = -1;
-    if (!cb || !t || !V.dev || !vk_tex_image(t)) return;
+    if (!ok || !cb || !t || !V.dev || !vk_tex_image(t) || !main_cview || !sp || !sp->imageView) return;
     if (!atomic_load_explicit(&g_vk_mm.want_active, memory_order_acquire)) return;
-    if (native_ui || !load_c0 || !has_stencil || vk_tex_samples(t) > 1u || vk_tex_is3d(t)) return;
-    if (!(vk_tex_aspect(t) & VK_IMAGE_ASPECT_COLOR_BIT) || w < 640u || h < 360u) return;
+    if (!load_c0 || vk_tex_samples(t) > 1u || vk_tex_is3d(t) || !(vk_tex_aspect(t) & VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    if (w < 640u || h < 360u || w > VK_MM_SAVE_MAX_W || h > VK_MM_SAVE_MAX_H) return;
     if (lv >= vk_tex_levels(t) || l0 >= vk_tex_layers(t)) return;
-    VkFormat fmt = vk_tex_format(t);
-    if (!vk_mm_supported_fmt(fmt)) return;
+    if (area.offset.x != 0 || area.offset.y != 0 || area.extent.width != w || area.extent.height != h) return;
+    if (!vk_mm_supported_fmt(att_fmt) || !vk_mm_ensure_hud(cb, w, h, att_fmt)) return;
     VkImage im = vk_tex_image(t);
     uint32_t fr = g_vk_mm.frame_counter;
-    if (g_vk_mm.frame_got_mm == fr && g_vk_mm.frame_got_obj == fr && g_vk_mm.saved_hit_img == im) return;
-    if (!vk_mm_ensure_save(cb, fmt)) return;
-    vk_mm_rect sb = vk_mm_compute_save_box(w, h);
-    if (!sb.w || !sb.h) return;
-    vk_barrier_all(cb);
-    VkImageCopy cp = {
-        {VK_IMAGE_ASPECT_COLOR_BIT, lv, l0, 1}, {sb.x, sb.y, 0},
-        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {0, 0, 0}, {sb.w, sb.h, 1}
-    };
-    vkCmdCopyImage(cb, im, VK_IMAGE_LAYOUT_GENERAL, g_vk_mm.save_img, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-    vk_barrier_all(cb);
-    g_vk_mm.in_hud_pass = 1; g_vk_mm.pass_im = im;
-    g_vk_mm.pass_w = w; g_vk_mm.pass_h = h;
-    g_vk_mm.save_box = sb;
+    if (g_vk_mm.hud_cleared_frame == fr && g_vk_mm.hud_cleared_im == im) g_vk_mm.pass_hud_cleared = 1;
+    if (g_vk_mm.hud_state_frame != fr || g_vk_mm.hud_state_im != im) {
+        g_vk_mm.pass_mm_hit = 0; g_vk_mm.pass_obj_hit = 0; g_vk_mm.obj_bounds_init = 0;
+        g_vk_mm.pass_obj_icon = 0; g_vk_mm.pass_obj_pill = 0; g_vk_mm.pass_obj_text = 0; g_vk_mm.cand_obj_text = 0;
+        g_vk_mm.obj_icon_cx = 0.f; g_vk_mm.obj_icon_core_w = 0.f;
+        g_vk_mm.pass_lhud_any = 0; g_vk_mm.pass_lhud_top = 0;
+        g_vk_mm.hud_state_frame = fr; g_vk_mm.hud_state_im = im;
+    }
+    g_vk_mm.pass_area = area; g_vk_mm.main_cview = main_cview; g_vk_mm.main_clayout = main_clayout;
+    g_vk_mm.has_depth = (dp && dp->imageView) ? 1 : 0;
+    if (g_vk_mm.has_depth) { g_vk_mm.depth_view = dp->imageView; g_vk_mm.depth_layout = dp->imageLayout; }
+    g_vk_mm.has_stencil_att = 1; g_vk_mm.stencil_view = sp->imageView; g_vk_mm.stencil_layout = sp->imageLayout;
+    g_vk_mm.in_hud_pass = 1; g_vk_mm.pass_im = im; g_vk_mm.pass_w = w; g_vk_mm.pass_h = h;
 }
 
-static int vk_minimap_pass_preclear(VkClearAttachment ca[2], VkClearRect cr[2], int max_n) {
-    if (!g_vk_mm.in_hud_pass) return 0;
-    int n = 0; uint32_t fr = g_vk_mm.frame_counter;
-    VkClearValue blk = {.color = {.float32 = {0.f, 0.f, 0.f, 1.f}}};
-    if (n < max_n && g_vk_mm.mm_ttl > 0u && g_vk_mm.frame_got_mm != fr
-            && g_vk_mm.learn_mm_w == g_vk_mm.pass_w && g_vk_mm.learn_mm_h == g_vk_mm.pass_h && g_vk_mm.learn_mm_half > 0) {
-        int32_t half = g_vk_mm.learn_mm_half, pad = half / 12;
-        if (pad < 12) pad = 12; else if (pad > 32) pad = 32;
-        vk_mm_rect r = vk_mm_clamp_rect(g_vk_mm.learn_mm_cx - half - pad, g_vk_mm.learn_mm_cy - half - pad,
-            g_vk_mm.learn_mm_cx + half + pad, g_vk_mm.learn_mm_cy + half + pad, &g_vk_mm.save_box);
-        if (r.w > 0u && r.h > 0u) {
-            g_vk_mm.pc_mm = r; g_vk_mm.pc_mm_done = 1;
-            ca[n] = (VkClearAttachment){VK_IMAGE_ASPECT_COLOR_BIT, 0u, blk};
-            cr[n++] = (VkClearRect){{{r.x, r.y}, {r.w, r.h}}, 0u, 1u};
-        }
-    }
-    if (n < max_n && g_vk_mm.obj_ttl > 0u && g_vk_mm.frame_got_obj != fr
-            && g_vk_mm.learn_obj_w == g_vk_mm.pass_w && g_vk_mm.learn_obj_h == g_vk_mm.pass_h
-            && g_vk_mm.learn_obj.w > 0u && g_vk_mm.learn_obj.h > 0u) {
-        vk_mm_rect ob = g_vk_mm.learn_obj;
-        vk_mm_rect r = vk_mm_clamp_rect(ob.x - 16, ob.y - 16,
-            ob.x + (int32_t)ob.w + 16, ob.y + (int32_t)ob.h + 16, &g_vk_mm.save_box);
-        if (r.w > 0u && r.h > 0u) {
-            g_vk_mm.pc_obj = r; g_vk_mm.pc_obj_done = 1;
-            ca[n] = (VkClearAttachment){VK_IMAGE_ASPECT_COLOR_BIT, 0u, blk};
-            cr[n++] = (VkClearRect){{{r.x, r.y}, {r.w, r.h}}, 0u, 1u};
-        }
-    }
-    return n;
+static void vk_mm_clear_hud_img(VkCommandBuffer cb) {
+    VkImageMemoryBarrier2 pb = {
+        VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_READ_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT, .dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = g_vk_mm.hud_img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u}
+    };
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = 1u, .pImageMemoryBarriers = &pb};
+    VkClearColorValue clr = {{0.f, 0.f, 0.f, 0.f}};
+    VkImageSubresourceRange rr = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+    vkCmdPipelineBarrier2(cb, &di);
+    vkCmdClearColorImage(cb, g_vk_mm.hud_img, VK_IMAGE_LAYOUT_GENERAL, &clr, 1u, &rr);
+    g_vk_mm.pass_hud_cleared = 1;
+    g_vk_mm.hud_cleared_frame = g_vk_mm.frame_counter;
+    g_vk_mm.hud_cleared_im = g_vk_mm.pass_im;
+}
+
+static int vk_mm_switch_target(VkCommandBuffer cb, int want_hud) {
+    if (!g_vk_mm.in_hud_pass || !g_vk_mm.hud_ready || g_vk_mm.cur_hud == want_hud) return 0;
+    vk_occlusion_end(cb);
+    vkCmdEndRendering(cb);
+    if (want_hud && !g_vk_mm.pass_hud_cleared) vk_mm_clear_hud_img(cb);
+    VkMemoryBarrier2 mb = {
+        VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
+        .srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+        .srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        .dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+        .dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT
+            | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+    };
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .memoryBarrierCount = 1u, .pMemoryBarriers = &mb};
+    vkCmdPipelineBarrier2(cb, &di);
+    VkRenderingAttachmentInfo ca = {
+        VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = want_hud ? g_vk_mm.hud_view : g_vk_mm.main_cview,
+        .imageLayout = want_hud ? VK_IMAGE_LAYOUT_GENERAL : g_vk_mm.main_clayout,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE
+    };
+    VkRenderingAttachmentInfo da = {
+        VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = g_vk_mm.depth_view, .imageLayout = g_vk_mm.depth_layout,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE
+    };
+    VkRenderingAttachmentInfo sa = {
+        VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = g_vk_mm.stencil_view, .imageLayout = g_vk_mm.stencil_layout,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD, .storeOp = VK_ATTACHMENT_STORE_OP_STORE
+    };
+    VkRenderingInfo ri = {
+        VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = g_vk_mm.pass_area, .layerCount = 1u,
+        .colorAttachmentCount = 1u, .pColorAttachments = &ca,
+        .pDepthAttachment = g_vk_mm.has_depth ? &da : NULL,
+        .pStencilAttachment = g_vk_mm.has_stencil_att ? &sa : NULL
+    };
+    vkCmdBeginRendering(cb, &ri);
+    g_vk_mm.cur_hud = want_hud;
+    return 1;
+}
+
+static int vk_minimap_bind_main(VkCommandBuffer cb) {
+    return vk_mm_switch_target(cb, 0);
 }
 
 static float vk_mm_f16(uint16_t h) {
@@ -321,38 +347,235 @@ static float vk_mm_f16(uint16_t h) {
     float f = 0.f; memcpy(&f, &u, 4); return f;
 }
 
+typedef struct {
+    VkFormat vfmt;
+    uint32_t offset, stride, divisor;
+    uint64_t vbuf, vbuf_sz;
+} vk_mm_attr;
+
+typedef struct {
+    int nattr, has_vp, base_instance;
+    uint32_t vin_mask, st, dt, c0_mask, blend_en;
+    vk_mm_attr attr[16];
+    uint64_t ubo_addr[4], ubo_sz[4];
+    float vp0[4], ax, ay, acx, acy;
+} vk_mm_draw_ctx;
+
 static int vk_mm_read_mem(uint64_t addr, void *out, size_t n) {
     VkBuffer bb = VK_NULL_HANDLE; uint64_t oo = 0, av = 0;
     if (!addr || !vk_resolve_span(addr, &bb, &oo, &av) || av < n) return 0;
-    memcpy(out, (const void *)(uintptr_t)addr, n);
+    vk_ub_read(addr, out, n);
     return 1;
 }
 
-static int vk_mm_attr_xy_bounds(
-    VkFormat vfmt, uint32_t off, uint32_t stride, uint64_t vbuf, uint64_t vbuf_sz,
-    const p_draw *dw, const p_draw_idx *di, int32_t cnt, float *mn, float *mx) {
-    int half = (vfmt == VK_FORMAT_R16G16_SFLOAT || vfmt == VK_FORMAT_R16G16B16A16_SFLOAT);
-    int flt = (vfmt == VK_FORMAT_R32G32_SFLOAT || vfmt == VK_FORMAT_R32G32B32_SFLOAT || vfmt == VK_FORMAT_R32G32B32A32_SFLOAT);
-    if ((!half && !flt) || !vbuf || cnt <= 0) return 0;
-    int32_t lim = cnt < 256 ? cnt : 256;
-    size_t elem = half ? 4u : 8u;
+static int vk_mm_fmt_info(VkFormat vfmt, int *is_half) {
+    *is_half = 0;
+    if (vfmt == VK_FORMAT_R16_SFLOAT) { *is_half = 1; return 1; }
+    if (vfmt == VK_FORMAT_R16G16_SFLOAT) { *is_half = 1; return 2; }
+    if (vfmt == VK_FORMAT_R16G16B16_SFLOAT) { *is_half = 1; return 3; }
+    if (vfmt == VK_FORMAT_R16G16B16A16_SFLOAT) { *is_half = 1; return 4; }
+    if (vfmt == VK_FORMAT_R32_SFLOAT) return 1;
+    if (vfmt == VK_FORMAT_R32G32_SFLOAT) return 2;
+    if (vfmt == VK_FORMAT_R32G32B32_SFLOAT) return 3;
+    if (vfmt == VK_FORMAT_R32G32B32A32_SFLOAT) return 4;
+    return 0;
+}
+
+static int64_t vk_mm_vertex_idx(const p_draw *dw, const p_draw_idx *di, int32_t v) {
+    if (di) {
+        uint32_t ix = 0u;
+        size_t isz = di->itype == 0 ? 1u : (di->itype == 1 ? 2u : 4u);
+        if (!di->ibuf || !vk_mm_read_mem(di->ibuf + (uint64_t)v * isz, &ix, isz)) return -1;
+        return (int64_t)di->base_vertex + (int64_t)ix;
+    }
+    return dw ? (int64_t)dw->first + v : -1;
+}
+
+static int vk_mm_read_fvec(
+    const vk_mm_draw_ctx *dc, int loc, int64_t vi, int ncomp, int half, float out[4]) {
+    out[0] = 0.f; out[1] = 0.f; out[2] = 0.f; out[3] = 1.f;
+    if (loc < 0 || loc >= dc->nattr || loc >= 16 || ncomp < 1 || ncomp > 4) return 0;
+    const vk_mm_attr *a = &dc->attr[loc];
+    if (!a->vbuf) return 0;
+    int64_t eff = a->divisor ? (int64_t)dc->base_instance : vi;
+    if (eff < 0) return 0;
+    size_t elem = (size_t)ncomp * (half ? 2u : 4u);
+    uint64_t vo = (uint64_t)eff * a->stride + a->offset;
+    if (a->vbuf_sz && (vo > a->vbuf_sz || a->vbuf_sz - vo < elem)) return 0;
+    uint8_t raw[16] = {0};
+    if (!vk_mm_read_mem(a->vbuf + vo, raw, elem)) return 0;
+    if (half) {
+        uint16_t hv[4] = {0};
+        memcpy(hv, raw, elem);
+        for (int k = 0; k < ncomp; k++) out[k] = vk_mm_f16(hv[k]);
+    } else {
+        memcpy(out, raw, elem);
+    }
+    for (int k = 0; k < ncomp; k++) if (!isfinite(out[k])) return 0;
+    return 1;
+}
+
+static int vk_mm_find_sprite_locs(
+    const vk_mm_draw_ctx *dc, int *pos_loc, int *pos_n, int *pos_half, int *idx_loc, int *idx_half) {
+    *pos_loc = -1; *pos_n = 0; *pos_half = 0; *idx_loc = -1; *idx_half = 0;
+    int n = dc->nattr < 16 ? dc->nattr : 16;
+    if (n <= 0) return 0;
+    uint32_t mask = dc->vin_mask ? dc->vin_mask : (n == 16 ? 0xffffu : ((1u << n) - 1u));
+    for (int loc = 0; loc < n; loc++) {
+        if (!(mask & (1u << loc))) continue;
+        int h = 0, nc = vk_mm_fmt_info(dc->attr[loc].vfmt, &h);
+        if (nc >= 2) { *pos_loc = loc; *pos_n = nc; *pos_half = h; }
+    }
+    if (*pos_loc < 0) return 0;
+    for (int loc = 0; loc < *pos_loc; loc++) {
+        if (!(mask & (1u << loc))) continue;
+        int h = 0, nc = vk_mm_fmt_info(dc->attr[loc].vfmt, &h);
+        if (nc == 1) { *idx_loc = loc; *idx_half = h; break; }
+    }
+    return 1;
+}
+
+static void vk_mm_viewport(const vk_mm_draw_ctx *dc, float vp[4], float *gvw, float *gvh) {
+    float vx = dc->has_vp ? dc->vp0[0] : 0.f;
+    float vy = dc->has_vp ? dc->vp0[1] : 0.f;
+    float vw = dc->has_vp ? dc->vp0[2] : (float)g_vk_mm.pass_w;
+    float vh = dc->has_vp ? dc->vp0[3] : (float)g_vk_mm.pass_h;
+    *gvw = fabsf(vw); *gvh = fabsf(vh);
+    if (!vw) vw = 1.f;
+    if (!vh) vh = 1.f;
+    vp[0] = vx; vp[1] = vy + vh; vp[2] = vw; vp[3] = -vh;
+}
+
+static int vk_mm_is_ortho_mat(const float p[16]) {
+    for (int i = 0; i < 16; i++) if (!isfinite(p[i])) return 0;
+    if (fabsf(p[15] - 1.f) >= 1e-2f) return 0;
+    if (fabsf(p[1]) >= 1e-3f || fabsf(p[2]) >= 1e-3f || fabsf(p[3]) >= 1e-3f) return 0;
+    if (fabsf(p[4]) >= 1e-3f || fabsf(p[6]) >= 1e-3f || fabsf(p[7]) >= 1e-3f) return 0;
+    if (fabsf(p[8]) >= 1e-3f || fabsf(p[9]) >= 1e-3f || fabsf(p[11]) >= 1e-3f) return 0;
+    float ax = fabsf(p[0]), ay = fabsf(p[5]);
+    if (ax < (2.f / 8192.f) || ax > (2.f / 160.f)) return 0;
+    if (ay < (2.f / 8192.f) || ay > (2.f / 160.f)) return 0;
+    return fabsf(p[12]) <= 4.f && fabsf(p[13]) <= 4.f;
+}
+
+static int vk_mm_is_proj_mat(const float p[16]) {
+    for (int i = 0; i < 16; i++) if (!isfinite(p[i])) return 0;
+    float nx = p[0] * p[0] + p[1] * p[1] + p[2] * p[2];
+    float ny = p[4] * p[4] + p[5] * p[5] + p[6] * p[6];
+    if (nx < 1e-10f || nx > 16.f || ny < 1e-10f || ny > 16.f) return 0;
+    float dot = p[0] * p[4] + p[1] * p[5] + p[2] * p[6];
+    if (dot * dot >= 0.5f * nx * ny) return 0;
+    float wnorm = fabsf(p[3]) + fabsf(p[7]) + fabsf(p[11]) + fabsf(p[15]);
+    return wnorm >= 1e-4f;
+}
+
+static int vk_mm_proj_point(
+    const float pos[4], const float m[12], const float p[16], const float vp[4], float xy[2]) {
+    float wx = pos[0] * m[0] + pos[1] * m[1] + pos[2] * m[2] + pos[3] * m[3];
+    float wy = pos[0] * m[4] + pos[1] * m[5] + pos[2] * m[6] + pos[3] * m[7];
+    float wz = pos[0] * m[8] + pos[1] * m[9] + pos[2] * m[10] + pos[3] * m[11];
+    float cx = p[0] * wx + p[4] * wy + p[8] * wz + p[12] * pos[3];
+    float cy = p[1] * wx + p[5] * wy + p[9] * wz + p[13] * pos[3];
+    float cw = p[3] * wx + p[7] * wy + p[11] * wz + p[15] * pos[3];
+    if (!isfinite(cw) || fabsf(cw) < 1e-5f) return 0;
+    xy[0] = vp[0] + ((cx / cw) * 0.5f + 0.5f) * vp[2];
+    xy[1] = vp[1] + ((cy / cw) * 0.5f + 0.5f) * vp[3];
+    return isfinite(xy[0]) && isfinite(xy[1]);
+}
+
+static int vk_mm_scan_ubo(
+    const vk_mm_draw_ctx *dc, int ortho_only, float p_out[16],
+    uint64_t *ua_out, uint64_t *usz_out, uint32_t *m_base_out) {
+    static const uint32_t k_poff[2] = { 32u, 0u };
+    static const uint32_t k_mbase[2] = { 96u, 64u };
+    for (int u = 0; u < 4; u++) {
+        uint64_t ua = dc->ubo_addr[u], usz = dc->ubo_sz[u];
+        if (!ua || (usz && usz < 112u)) continue;
+        for (int k = 0; k < 2; k++) {
+            if (usz && k_mbase[k] + 48u > usz) continue;
+            float p[16] = {0};
+            if (!vk_mm_read_mem(ua + k_poff[k], p, sizeof p)) continue;
+            int ok = ortho_only ? vk_mm_is_ortho_mat(p) : vk_mm_is_proj_mat(p);
+            if (!ok) continue;
+            memcpy(p_out, p, sizeof p);
+            *ua_out = ua; *usz_out = usz; *m_base_out = k_mbase[k];
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int vk_mm_find_proj(
+    const vk_mm_draw_ctx *dc, int allow_proj, float p_out[16], float vp_out[4],
+    uint64_t *ua_out, uint64_t *usz_out, uint32_t *m_base_out) {
+    float gvw = 0.f, gvh = 0.f;
+    vk_mm_viewport(dc, vp_out, &gvw, &gvh);
+    if (gvw < 64.f || gvh < 64.f) return 0;
+    if (vk_mm_scan_ubo(dc, 1, p_out, ua_out, usz_out, m_base_out)) return 1;
+    if (allow_proj && vk_mm_scan_ubo(dc, 0, p_out, ua_out, usz_out, m_base_out)) return 1;
+    return 0;
+}
+
+static int vk_mm_ubo_xy_bounds(
+    const vk_mm_draw_ctx *dc, const p_draw *dw, const p_draw_idx *di, int32_t cnt, float *mn, float *mx) {
+    int pos_loc = -1, pos_n = 0, pos_half = 0, idx_loc = -1, idx_half = 0, h0 = 0;
+    if (!vk_mm_find_sprite_locs(dc, &pos_loc, &pos_n, &pos_half, &idx_loc, &idx_half)) return 0;
+    int nc0 = vk_mm_fmt_info(dc->attr[0].vfmt, &h0);
+    (void)h0;
+    float p[16] = {0}, vp[4] = {0}, m[12] = {0};
+    uint64_t ua = 0u, usz = 0u;
+    uint32_t m_base = 0u;
+    if (!vk_mm_find_proj(dc, (idx_loc >= 0 || nc0 < 2), p, vp, &ua, &usz, &m_base)) return 0;
+    int32_t lim = cnt < 256 ? cnt : 256, last_idx = -1;
     for (int32_t i = 0; i < lim; i++) {
         int32_t v = cnt <= 256 ? i : (int32_t)(((int64_t)i * cnt) / lim);
-        int64_t vi = dw ? (int64_t)dw->first + v : -1;
-        if (di) {
-            uint32_t ix = 0; size_t isz = di->itype == 0 ? 1u : di->itype == 1 ? 2u : 4u;
-            if (!di->ibuf || !vk_mm_read_mem(di->ibuf + (uint64_t)v * isz, &ix, isz)) return 0;
-            vi = (int64_t)di->base_vertex + (int64_t)ix;
+        int64_t vi = vk_mm_vertex_idx(dw, di, v);
+        float pos[4] = {0}, iv[4] = {0}, xy[2] = {0};
+        if (vi < 0 || !vk_mm_read_fvec(dc, pos_loc, vi, pos_n, pos_half, pos)) return 0;
+        int32_t idx = 0;
+        if (idx_loc >= 0) {
+            if (!vk_mm_read_fvec(dc, idx_loc, vi, 1, idx_half, iv)) return 0;
+            float tf = truncf(iv[0]);
+            if (tf < 0.f || tf >= 512.f) return 0;
+            idx = (int32_t)tf;
         }
-        if (vi < 0) return 0;
-        uint64_t vo = (uint64_t)vi * stride + off;
-        if (vbuf_sz && (vo > vbuf_sz || vbuf_sz - vo < elem)) return 0;
-        uint8_t b[8] = {0}; float xy[2] = {0.f, 0.f};
-        if (!vk_mm_read_mem(vbuf + vo, b, elem)) return 0;
-        if (half) { uint16_t h0, h1; memcpy(&h0, b, 2); memcpy(&h1, b + 2, 2); xy[0] = vk_mm_f16(h0); xy[1] = vk_mm_f16(h1); }
-        else memcpy(xy, b, 8);
+        if (idx != last_idx) {
+            uint64_t mo = (uint64_t)m_base + (uint64_t)idx * 48u;
+            if ((usz && mo + 48u > usz) || !vk_mm_read_mem(ua + mo, m, sizeof m)) return 0;
+            for (int k = 0; k < 12; k++) if (!isfinite(m[k])) return 0;
+            last_idx = idx;
+        }
+        if (!vk_mm_proj_point(pos, m, p, vp, xy)) return 0;
         if (i == 0) { mn[0] = mx[0] = xy[0]; mn[1] = mx[1] = xy[1]; }
-        else { if (xy[0] < mn[0]) mn[0] = xy[0]; if (xy[0] > mx[0]) mx[0] = xy[0]; if (xy[1] < mn[1]) mn[1] = xy[1]; if (xy[1] > mx[1]) mx[1] = xy[1]; }
+        else {
+            if (xy[0] < mn[0]) { mn[0] = xy[0]; } if (xy[0] > mx[0]) { mx[0] = xy[0]; }
+            if (xy[1] < mn[1]) { mn[1] = xy[1]; } if (xy[1] > mx[1]) { mx[1] = xy[1]; }
+        }
+    }
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    if (!isfinite(mn[0]) || !isfinite(mx[0]) || !isfinite(mn[1]) || !isfinite(mx[1])) return 0;
+    if (mn[0] < -w || mx[0] > 2.f * w || mn[1] < -h || mx[1] > 2.f * h) return 0;
+    return mx[0] >= mn[0] && mx[1] >= mn[1];
+}
+
+static int vk_mm_attr_xy_bounds(
+    const vk_mm_draw_ctx *dc, const p_draw *dw, const p_draw_idx *di, int32_t cnt, float *mn, float *mx) {
+    if (cnt <= 0) return 0;
+    if (vk_mm_ubo_xy_bounds(dc, dw, di, cnt, mn, mx)) return 1;
+    if (dc->nattr < 1) return 0;
+    int half = 0, nc = vk_mm_fmt_info(dc->attr[0].vfmt, &half);
+    if (nc < 2) return 0;
+    int32_t lim = cnt < 256 ? cnt : 256;
+    for (int32_t i = 0; i < lim; i++) {
+        int32_t v = cnt <= 256 ? i : (int32_t)(((int64_t)i * cnt) / lim);
+        int64_t vi = vk_mm_vertex_idx(dw, di, v);
+        float xy[4] = {0};
+        if (vi < 0 || !vk_mm_read_fvec(dc, 0, vi, 2, half, xy)) return 0;
+        if (i == 0) { mn[0] = mx[0] = xy[0]; mn[1] = mx[1] = xy[1]; }
+        else {
+            if (xy[0] < mn[0]) { mn[0] = xy[0]; } if (xy[0] > mx[0]) { mx[0] = xy[0]; }
+            if (xy[1] < mn[1]) { mn[1] = xy[1]; } if (xy[1] > mx[1]) { mx[1] = xy[1]; }
+        }
     }
     return 1;
 }
@@ -369,7 +592,7 @@ static void vk_mm_try_minimap(const float *mn, const float *mx) {
     if (side > g_vk_mm.pass_w) side = g_vk_mm.pass_w;
     if (side > g_vk_mm.pass_h) side = g_vk_mm.pass_h;
     int32_t x0 = (int32_t)lrintf(cx - side * 0.5f), y0 = (int32_t)lrintf(cy - side * 0.5f);
-    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x0 < 0) { x0 = 0; } if (y0 < 0) { y0 = 0; }
     if (x0 + (int32_t)side > (int32_t)g_vk_mm.pass_w) x0 = (int32_t)g_vk_mm.pass_w - (int32_t)side;
     if (y0 + (int32_t)side > (int32_t)g_vk_mm.pass_h) y0 = (int32_t)g_vk_mm.pass_h - (int32_t)side;
     g_vk_mm.hit_mm = (vk_mm_rect){x0, y0, side, side};
@@ -379,61 +602,208 @@ static void vk_mm_try_minimap(const float *mn, const float *mx) {
     g_vk_mm.learn_mm_half = (int32_t)(side / 2u);
 }
 
-static void vk_mm_try_objective(const float *mn, const float *mx) {
-    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
-    float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
-    float cy = (mn[1] + mx[1]) * 0.5f;
-    if (mn[0] < w * 0.62f || mx[0] > w * 0.995f || cy < h * 0.28f || cy > h * 0.62f) return;
-    if (bw < h * 0.08f || bw > w * 0.36f || bh < h * 0.015f || bh > h * 0.14f || bw < bh * 1.4f) return;
-    if (!g_vk_mm.pass_obj_hit) {
-        g_vk_mm.obj_umin_x = mn[0]; g_vk_mm.obj_umin_y = mn[1];
-        g_vk_mm.obj_umax_x = mx[0]; g_vk_mm.obj_umax_y = mx[1];
-    } else {
-        if (mn[0] < g_vk_mm.obj_umin_x) g_vk_mm.obj_umin_x = mn[0];
-        if (mn[1] < g_vk_mm.obj_umin_y) g_vk_mm.obj_umin_y = mn[1];
-        if (mx[0] > g_vk_mm.obj_umax_x) g_vk_mm.obj_umax_x = mx[0];
-        if (mx[1] > g_vk_mm.obj_umax_y) g_vk_mm.obj_umax_y = mx[1];
+static void vk_mm_rebuild_obj_rect(void) {
+    float h = (float)g_vk_mm.pass_h;
+    float cy = g_vk_mm.pass_obj_text ? g_vk_mm.cand_text_cy
+        : (g_vk_mm.pass_obj_pill ? g_vk_mm.obj_pill_cy : g_vk_mm.obj_icon_cy);
+    int32_t oh = ((int32_t)lrintf(h * 0.19f)) & ~1;
+    if (oh > (int32_t)VK_OBJ_MAX_H) { oh = (int32_t)(VK_OBJ_MAX_H & ~1u); }
+    if (oh > (int32_t)g_vk_mm.pass_h) { oh = (int32_t)(g_vk_mm.pass_h & ~1u); }
+    int32_t y0 = (int32_t)lrintf(cy) - oh / 2, y1 = y0 + oh;
+    if (y0 < 0) { y0 = 0; y1 = oh; }
+    if (y1 > (int32_t)g_vk_mm.pass_h) {
+        y1 = (int32_t)g_vk_mm.pass_h;
+        y0 = y1 > oh ? y1 - oh : 0;
     }
-    int32_t x0 = (int32_t)floorf(g_vk_mm.obj_umin_x - h * 0.085f), x1 = (int32_t)g_vk_mm.pass_w;
-    int32_t y0 = (int32_t)floorf(g_vk_mm.obj_umin_y - h * 0.026f);
-    int32_t y1 = (int32_t)ceilf(g_vk_mm.obj_umax_y + h * 0.026f);
-    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
-    if (y1 > (int32_t)g_vk_mm.pass_h) y1 = (int32_t)g_vk_mm.pass_h;
-    if (x1 - x0 > (int32_t)VK_OBJ_MAX_W) x0 = x1 - (int32_t)VK_OBJ_MAX_W;
-    if (y1 - y0 > (int32_t)VK_OBJ_MAX_H) y1 = y0 + (int32_t)VK_OBJ_MAX_H;
+    float xmn = 1e9f, xmx = -1e9f;
+    if (g_vk_mm.obj_bounds_init) {
+        xmn = g_vk_mm.obj_umin_x - h * 0.018f;
+        xmx = g_vk_mm.obj_umax_x + h * 0.018f;
+    }
+    int has_ic = g_vk_mm.pass_obj_icon;
+    float icx = g_vk_mm.obj_icon_cx;
+    if (!has_ic && g_vk_mm.obj_ttl > 0u && fabsf(cy - g_vk_mm.learn_obj_cy) <= h * 0.055f) {
+        has_ic = 1; icx = g_vk_mm.learn_obj_icon_x;
+    }
+    if (has_ic) {
+        float l = icx - h * 0.095f, r = icx + h * 0.095f;
+        if (l < xmn) { xmn = l; } if (r > xmx) { xmx = r; }
+    } else if (g_vk_mm.obj_bounds_init && !g_vk_mm.pass_obj_pill) {
+        xmn = g_vk_mm.obj_umin_x - h * 0.065f;
+    }
+    if (xmn > xmx) return;
+    int32_t x0 = (int32_t)floorf(xmn), x1 = (int32_t)ceilf(xmx);
+    if (x0 < 0) { x0 = 0; } if (x1 > (int32_t)g_vk_mm.pass_w) { x1 = (int32_t)g_vk_mm.pass_w; }
+    if (x1 - x0 > (int32_t)VK_OBJ_MAX_W) { x1 = x0 + (int32_t)VK_OBJ_MAX_W; }
     int32_t ow = (x1 - x0) & ~3;
     if (ow < 64 || y1 <= y0) return;
-    x0 = x1 - ow;
-    vk_mm_rect ob = {x0, y0, (uint32_t)ow, (uint32_t)(y1 - y0)};
-    if (ob.h > VK_OBJ_MAX_H) ob.h = VK_OBJ_MAX_H;
-    g_vk_mm.hit_obj = ob; g_vk_mm.pass_obj_hit = 1;
-    g_vk_mm.learn_obj = ob; g_vk_mm.learn_obj_w = g_vk_mm.pass_w; g_vk_mm.learn_obj_h = g_vk_mm.pass_h;
+    vk_mm_rect nr = {x0, y0, (uint32_t)ow, (uint32_t)(y1 - y0)};
+    vk_mm_rect pr = g_vk_mm.prev_hit_obj;
+    if (g_vk_mm.obj_ttl > 0u && pr.w >= 64u && abs(x0 - pr.x) <= 6 && abs(y0 - pr.y) <= 6
+            && abs(ow - (int32_t)pr.w) <= 8 && abs((y1 - y0) - (int32_t)pr.h) <= 6) {
+        nr = pr;
+    }
+    g_vk_mm.hit_obj = nr;
 }
 
-static void vk_minimap_note_draw(
-    int indirect, uint32_t st, uint32_t dt, uint32_t c0_mask, uint32_t blend_en,
-    VkFormat vfmt, uint32_t off, uint32_t stride, uint64_t vbuf, uint64_t vbuf_sz,
-    const p_draw *dw, const p_draw_idx *di, float ax, float ay, float acx, float acy) {
-    if (!g_vk_mm.in_hud_pass || indirect || dt != 0u) return;
+static void vk_mm_add_bar_bounds(const float *mn, const float *mx) {
+    if (!g_vk_mm.obj_bounds_init) {
+        g_vk_mm.obj_umin_x = mn[0]; g_vk_mm.obj_umin_y = mn[1];
+        g_vk_mm.obj_umax_x = mx[0]; g_vk_mm.obj_umax_y = mx[1];
+        g_vk_mm.obj_bounds_init = 1;
+    } else {
+        if (mn[0] < g_vk_mm.obj_umin_x) { g_vk_mm.obj_umin_x = mn[0]; }
+        if (mn[1] < g_vk_mm.obj_umin_y) { g_vk_mm.obj_umin_y = mn[1]; }
+        if (mx[0] > g_vk_mm.obj_umax_x) { g_vk_mm.obj_umax_x = mx[0]; }
+        if (mx[1] > g_vk_mm.obj_umax_y) { g_vk_mm.obj_umax_y = mx[1]; }
+    }
+    vk_mm_rebuild_obj_rect();
+}
+
+static int vk_mm_is_mm_draw(const float *mn, const float *mx, uint32_t st, int32_t cnt) {
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    if (g_vk_mm.pass_mm_hit) {
+        if (st != 0u && mn[0] >= w * 0.45f) return 1;
+        vk_mm_rect r = g_vk_mm.hit_mm;
+        return mn[0] >= (float)(r.x - 28) && mx[0] <= (float)(r.x + (int32_t)r.w + 28)
+            && mn[1] >= (float)(r.y - 28) && mx[1] <= (float)(r.y + (int32_t)r.h + 28);
+    }
+    if (g_vk_mm.mm_ttl > 0u && !g_vk_mm.pass_dialog && st == 0u && cnt >= 4 && cnt <= 24) {
+        float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
+        float cx = (mn[0] + mx[0]) * 0.5f, cy = (mn[1] + mx[1]) * 0.5f;
+        if (bw >= h * 0.14f && bw <= h * 0.46f && fabsf(bw - bh) <= fmaxf(12.f, bw * 0.10f)
+                && fabsf(cx - (float)g_vk_mm.learn_mm_cx) <= 28.f
+                && fabsf(cy - (float)g_vk_mm.learn_mm_cy) <= 28.f) {
+            vk_mm_try_minimap(mn, mx);
+            return g_vk_mm.pass_mm_hit;
+        }
+    }
+    return 0;
+}
+
+static int vk_mm_is_lhud_draw(const float *mn, const float *mx, int32_t cnt) {
+    if (cnt < 4 || (!g_vk_mm.pass_mm_hit && g_vk_mm.pass_dialog)) return 0;
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
+    if (mn[1] >= -8.f && mx[1] <= h * 0.18f && mn[0] >= -8.f && mn[0] <= w * 0.095f
+            && mx[0] <= w * 0.22f && bw >= 10.f && bh >= 5.f && bh <= h * 0.09f) {
+        g_vk_mm.pass_lhud_top = 1;
+    }
+    if (!(g_vk_mm.pass_lhud_top || g_vk_mm.pass_mm_hit || g_vk_mm.lhud_ttl > 0u)) return 0;
+    if (mn[0] < -16.f || mn[0] > w * 0.20f || mx[0] > w * 0.26f || mn[1] < -16.f || mx[1] > h + 16.f) return 0;
+    if (bw < 6.f || bw > w * 0.26f || bh < 6.f || bh > h * 0.42f) return 0;
+    if (mn[0] > w * 0.18f && bh > bw * 6.f) return 0;
+    g_vk_mm.pass_lhud_any = 1;
+    g_vk_mm.hit_lhud = vk_mm_lhud_box(g_vk_mm.pass_w, g_vk_mm.pass_h);
+    return 1;
+}
+
+static int vk_mm_obj_pill(const float *mn, const float *mx, int32_t cnt) {
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cy = (mn[1] + mx[1]) * 0.5f;
+    if (cnt > 36 || mn[0] < w * 0.48f || mn[0] > w * 0.88f || mx[0] < w * 0.72f) return 0;
+    if (bh < h * 0.018f || bh > h * 0.14f || bw < bh * 2.0f) return 0;
+    int known = (g_vk_mm.pass_obj_icon && fabsf(cy - g_vk_mm.obj_icon_cy) <= h * 0.06f)
+        || (g_vk_mm.pass_obj_text && fabsf(cy - g_vk_mm.cand_text_cy) <= h * 0.06f && mn[0] <= g_vk_mm.cand_text_mn_x)
+        || (g_vk_mm.obj_ttl > 0u && fabsf(cy - g_vk_mm.learn_obj_cy) <= h * 0.06f && mn[0] >= g_vk_mm.learn_obj_icon_x - 64.f);
+    if (!known && !(mx[0] >= w * 0.88f && bw >= w * 0.16f)) return 0;
+    g_vk_mm.pass_obj_pill = 1; g_vk_mm.obj_pill_mn_x = mn[0]; g_vk_mm.obj_pill_cy = cy;
+    g_vk_mm.pass_obj_hit = 1;
+    vk_mm_add_bar_bounds(mn, mx);
+    return 1;
+}
+
+static int vk_mm_obj_text(const float *mn, const float *mx, int32_t cnt) {
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cy = (mn[1] + mx[1]) * 0.5f;
+    if (cnt < 12 || cnt > 1200 || mn[0] < w * 0.52f || mx[0] > w + 24.f) return 0;
+    if (bw < h * 0.045f || bw > w * 0.44f || bh < h * 0.014f || bh > h * 0.14f || bw < bh * 1.3f) return 0;
+    float icx = g_vk_mm.obj_icon_cx;
+    int near_pill = g_vk_mm.pass_obj_pill && fabsf(cy - g_vk_mm.obj_pill_cy) <= h * 0.055f
+        && mn[0] >= g_vk_mm.obj_pill_mn_x - 24.f;
+    int near_icon = g_vk_mm.pass_obj_icon && fabsf(cy - g_vk_mm.obj_icon_cy) <= h * 0.055f
+        && mn[0] >= icx - 12.f && mn[0] <= icx + h * 0.10f;
+    int near_learn = g_vk_mm.obj_ttl > 0u && fabsf(cy - g_vk_mm.learn_obj_cy) <= h * 0.055f
+        && fabsf(mn[0] - g_vk_mm.learn_obj_text_x) <= 64.f;
+    if (!g_vk_mm.cand_obj_text || near_pill || near_icon || near_learn) {
+        g_vk_mm.cand_obj_text = 1; g_vk_mm.cand_text_mn_x = mn[0]; g_vk_mm.cand_text_cy = cy;
+    }
+    if (!near_pill && !near_icon && !near_learn) return 0;
+    g_vk_mm.pass_obj_text = 1; g_vk_mm.pass_obj_hit = 1;
+    vk_mm_add_bar_bounds(mn, mx);
+    return 1;
+}
+
+static int vk_mm_obj_icon(const float *mn, const float *mx, int32_t cnt) {
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cy = (mn[1] + mx[1]) * 0.5f;
+    float icx = (mn[0] + mx[0]) * 0.5f;
+    if (cnt > 96 || mx[0] > w * 0.92f || bw < h * 0.004f || bw > h * 0.18f || bh < h * 0.004f || bh > h * 0.18f) return 0;
+    if (fabsf(bw - bh) > fmaxf(8.f, bw * 0.35f)) return 0;
+    int near_text = (g_vk_mm.pass_obj_text || g_vk_mm.cand_obj_text)
+        && fabsf(cy - g_vk_mm.cand_text_cy) <= h * 0.06f
+        && icx <= g_vk_mm.cand_text_mn_x + 36.f && icx >= g_vk_mm.cand_text_mn_x - h * 0.12f;
+    int near_pill = g_vk_mm.pass_obj_pill && fabsf(cy - g_vk_mm.obj_pill_cy) <= h * 0.06f
+        && icx >= g_vk_mm.obj_pill_mn_x - h * 0.06f && icx <= g_vk_mm.obj_pill_mn_x + h * 0.14f;
+    int near_learn = g_vk_mm.obj_ttl > 0u && fabsf(cy - g_vk_mm.learn_obj_cy) <= h * 0.06f
+        && fabsf(icx - g_vk_mm.learn_obj_icon_x) <= h * 0.08f;
+    int near_icon = g_vk_mm.pass_obj_icon && fabsf(cy - g_vk_mm.obj_icon_cy) <= h * 0.06f
+        && fabsf(icx - g_vk_mm.obj_icon_cx) <= h * 0.05f;
+    if (bw >= h * 0.016f || near_text || near_pill) {
+        if (!g_vk_mm.pass_obj_icon || bw < g_vk_mm.obj_icon_core_w) {
+            g_vk_mm.obj_icon_core_w = bw; g_vk_mm.obj_icon_cx = icx; g_vk_mm.obj_icon_cy = cy;
+        }
+        g_vk_mm.pass_obj_icon = 1;
+    }
+    if (!near_text && !near_pill && !near_learn
+            && !(near_icon && (g_vk_mm.pass_obj_pill || g_vk_mm.cand_obj_text || g_vk_mm.obj_ttl > 0u))) return 0;
+    g_vk_mm.pass_obj_hit = 1;
+    vk_mm_rebuild_obj_rect();
+    return 1;
+}
+
+static int vk_mm_is_obj_draw(const float *mn, const float *mx, int32_t cnt) {
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    float cy = (mn[1] + mx[1]) * 0.5f;
+    if (mn[0] < w * 0.45f || mx[0] > w + 48.f || cy < h * 0.14f || cy > h * 0.68f) return 0;
+    if (vk_mm_obj_pill(mn, mx, cnt)) return 1;
+    if (vk_mm_obj_text(mn, mx, cnt)) return 1;
+    return vk_mm_obj_icon(mn, mx, cnt);
+}
+
+static int vk_minimap_select_target(
+    VkCommandBuffer cb, const vk_mm_draw_ctx *dc, int indirect, const p_draw *dw, const p_draw_idx *di) {
+    if (!g_vk_mm.in_hud_pass) return 0;
+    if (indirect || dc->dt != 0u || dc->nattr < 1) return vk_mm_switch_target(cb, 0);
     int32_t cnt = dw ? dw->count : (di ? di->count : 0);
     float mn[2] = {0}, mx[2] = {0};
-    if (!vk_mm_attr_xy_bounds(vfmt, off, stride, vbuf, vbuf_sz, dw, di, cnt, mn, mx)) return;
-    mn[0] = acx + (mn[0] - acx) * ax; mx[0] = acx + (mx[0] - acx) * ax;
-    mn[1] = acy + (mn[1] - acy) * ay; mx[1] = acy + (mx[1] - acy) * ay;
-    if (st != 0u && (c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { vk_mm_try_minimap(mn, mx); return; }
-    if (st == 0u && (c0_mask & 0xfu) != 0u && !blend_en && cnt >= 3 && cnt <= 6) {
-        float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
-        if ((bw >= g_vk_mm.pass_w * 0.90f && bh >= g_vk_mm.pass_h * 0.90f)
-                || (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f)) {
-            g_vk_mm.pass_opaque_fs = 1;
-        }
-        return;
+    if (cnt < 3 || cnt > 4096 || !vk_mm_attr_xy_bounds(dc, dw, di, cnt, mn, mx)) return vk_mm_switch_target(cb, 0);
+    mn[0] = dc->acx + (mn[0] - dc->acx) * dc->ax; mx[0] = dc->acx + (mx[0] - dc->acx) * dc->ax;
+    mn[1] = dc->acy + (mn[1] - dc->acy) * dc->ay; mx[1] = dc->acy + (mx[1] - dc->acy) * dc->ay;
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cx = (mn[0] + mx[0]) * 0.5f, cy = (mn[1] + mx[1]) * 0.5f;
+    if (dc->st == 0u && !dc->blend_en && cnt <= 6) {
+        int px_fs = (bw >= w * 0.90f && bh >= h * 0.90f);
+        int ndc_fs = (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f);
+        if (px_fs || ndc_fs) { g_vk_mm.pass_opaque_fs = 1; return vk_mm_switch_target(cb, 0); }
     }
-    if (st == 0u && (c0_mask & 0xfu) != 0u && blend_en && cnt >= 16 && cnt <= 600) vk_mm_try_objective(mn, mx);
+    if ((dc->c0_mask & 0xfu) != 0u && cnt >= 4) {
+        if (bw >= w * 0.28f && bw <= w * 0.88f && bh >= h * 0.12f && bh <= h * 0.88f
+                && fabsf(cx - w * 0.5f) < w * 0.16f && mn[1] < h * 0.66f && mx[1] > h * 0.20f)
+            g_vk_mm.pass_modal = 1;
+        if (bw >= w * 0.34f && bw <= w * 0.88f && bh <= h * 0.45f && cy > h * 0.62f && fabsf(cx - w * 0.5f) < w * 0.18f)
+            g_vk_mm.pass_dialog = 1;
+    }
+    if (dc->st != 0u && (dc->c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { vk_mm_try_minimap(mn, mx); return 0; }
+    if (g_vk_mm.pass_opaque_fs || g_vk_mm.pass_modal || (dc->c0_mask & 0xfu) == 0u) return vk_mm_switch_target(cb, 0);
+    int want = vk_mm_is_mm_draw(mn, mx, dc->st, cnt);
+    if (!want) want = vk_mm_is_lhud_draw(mn, mx, cnt);
+    if (!want && dc->blend_en) want = vk_mm_is_obj_draw(mn, mx, cnt);
+    return vk_mm_switch_target(cb, want);
 }
 
 static int vk_minimap_want_ui_tex(void) {
-    return g_vk_mm.in_hud_pass && !g_vk_mm.pass_opaque_fs
+    return g_vk_mm.in_hud_pass && !g_vk_mm.pass_opaque_fs && !g_vk_mm.pass_modal
         && atomic_load_explicit(&g_vk_mm.ui_want, memory_order_relaxed) == 1;
 }
 
@@ -459,41 +829,26 @@ static void vk_minimap_note_fs_tex(vk_tex *x, uint32_t dt) {
     if (score > g_vk_mm.ui_cand.score) g_vk_mm.ui_cand = (vk_ui_cand){im, tw, th, fmt, ser, score};
 }
 
-static void vk_mm_stream_stage(
-    vk_mm_stream *st, VkCommandBuffer cb, VkImage im, unsigned lv, unsigned l0, VkFormat fmt, const vk_mm_rect *r) {
+static void vk_mm_stream_stage(vk_mm_stream *st, VkCommandBuffer cb, const vk_mm_rect *r) {
     if (st->wrote_in_frame || atomic_load_explicit(&st->pending_valid, memory_order_acquire)) return;
     VkDeviceSize need = (VkDeviceSize)r->w * r->h * 4u;
     if ((g_vk_mm.frame_counter & 1u) != 0u || !r->w || !r->h || need > st->slot_bytes) return;
-    if (!vk_mm_ensure_stream_ring(st)) return;
+    if (!g_vk_mm.hud_ready || !vk_mm_ensure_stream_ring(st)) return;
     vk_mm_slot *dst = &st->slot[st->write_slot];
     VkBufferImageCopy rg = {
-        .bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, l0, 1},
-        .imageOffset = {r->x, r->y, 0}, .imageExtent = {r->w, r->h, 1}
+        .bufferOffset = 0, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u},
+        .imageOffset = {r->x, r->y, 0}, .imageExtent = {r->w, r->h, 1u}
     };
-    vkCmdCopyImageToBuffer(cb, im, VK_IMAGE_LAYOUT_GENERAL, dst->buf, 1, &rg);
+    vkCmdCopyImageToBuffer(cb, g_vk_mm.hud_img, VK_IMAGE_LAYOUT_GENERAL, dst->buf, 1u, &rg);
     VkBufferMemoryBarrier2 bb = {
         VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2, .srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT,
         .srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT, .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
         .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT, .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
         .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .buffer = dst->buf, .offset = 0, .size = need
     };
-    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1, .pBufferMemoryBarriers = &bb};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .bufferMemoryBarrierCount = 1u, .pBufferMemoryBarriers = &bb};
     vkCmdPipelineBarrier2(cb, &di);
-    st->wrote_in_frame = 1; st->write_w = r->w; st->write_h = r->h; st->write_fmt = fmt;
-}
-
-static void vk_mm_restore_box(
-    VkCommandBuffer cb, VkImage im, unsigned lv, unsigned l0, const vk_mm_rect *raw) {
-    if (!g_vk_mm.save_ready) return;
-    vk_mm_rect r = vk_mm_clamp_rect(raw->x, raw->y, raw->x + (int32_t)raw->w, raw->y + (int32_t)raw->h, &g_vk_mm.save_box);
-    if (!r.w || !r.h) return;
-    vk_barrier_all(cb);
-    VkImageCopy cp = {
-        {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {r.x - g_vk_mm.save_box.x, r.y - g_vk_mm.save_box.y, 0},
-        {VK_IMAGE_ASPECT_COLOR_BIT, lv, l0, 1}, {r.x, r.y, 0}, {r.w, r.h, 1}
-    };
-    vkCmdCopyImage(cb, g_vk_mm.save_img, VK_IMAGE_LAYOUT_GENERAL, im, VK_IMAGE_LAYOUT_GENERAL, 1, &cp);
-    vk_barrier_all(cb);
+    st->wrote_in_frame = 1; st->write_w = r->w; st->write_h = r->h; st->write_fmt = g_vk_mm.hud_fmt;
 }
 
 static int vk_mm_ensure_ui(VkCommandBuffer cb) {
@@ -543,43 +898,49 @@ static void vk_mm_stage_ui_tex(VkCommandBuffer cb) {
     atomic_store_explicit(&g_vk_mm.ui_want, 2, memory_order_release);
 }
 
-static void vk_minimap_pass_end(
-    VkCommandBuffer cb, vk_tex *t, unsigned lv, unsigned l0, VkFormat fmt, uint64_t serial) {
-    (void)fmt;
-    int was = g_vk_mm.in_hud_pass, mh = g_vk_mm.pass_mm_hit, oh = g_vk_mm.pass_obj_hit, op = g_vk_mm.pass_opaque_fs;
-    g_vk_mm.in_hud_pass = 0; g_vk_mm.pass_mm_hit = 0; g_vk_mm.pass_obj_hit = 0; g_vk_mm.pass_opaque_fs = 0;
+static void vk_minimap_pass_end(VkCommandBuffer cb, vk_tex *t, uint64_t serial) {
+    int was = g_vk_mm.in_hud_pass, cleared = g_vk_mm.pass_hud_cleared;
+    int mh = g_vk_mm.pass_mm_hit, oh = g_vk_mm.pass_obj_hit, op = g_vk_mm.pass_opaque_fs, md = g_vk_mm.pass_modal;
+    int lh = (!op && !md && g_vk_mm.pass_lhud_any && (mh || (g_vk_mm.pass_lhud_top && !g_vk_mm.pass_dialog))
+        && g_vk_mm.hit_lhud.w >= 64u && g_vk_mm.hit_lhud.h >= 64u);
+    float oicx = g_vk_mm.obj_icon_cx;
+    int obj_pair = (!op && !md && g_vk_mm.cand_obj_text && g_vk_mm.pass_obj_icon
+        && fabsf(g_vk_mm.cand_text_cy - g_vk_mm.obj_icon_cy) <= (float)g_vk_mm.pass_h * 0.055f
+        && g_vk_mm.cand_text_mn_x >= oicx - 12.f
+        && g_vk_mm.cand_text_mn_x <= oicx + (float)g_vk_mm.pass_h * 0.10f);
+    g_vk_mm.in_hud_pass = 0; g_vk_mm.cur_hud = 0;
     if (!was || !t || !V.dev || vk_tex_image(t) != g_vk_mm.pass_im) return;
-    if (!atomic_load_explicit(&g_vk_mm.want_active, memory_order_acquire)) return;
-    if (op && !mh && !oh) return;
+    if (!atomic_load_explicit(&g_vk_mm.want_active, memory_order_acquire) || op || md) return;
     VkCommandBuffer copy_cb = cb ? cb : vk_cb();
     if (!copy_cb) return;
-    VkImage im = vk_tex_image(t); VkFormat tf = vk_tex_format(t); uint32_t fr = g_vk_mm.frame_counter;
+    VkImage im = vk_tex_image(t); uint32_t fr = g_vk_mm.frame_counter;
+    if (obj_pair) {
+        g_vk_mm.learn_obj_icon_x = oicx; g_vk_mm.learn_obj_text_x = g_vk_mm.cand_text_mn_x;
+        g_vk_mm.learn_obj_cy = g_vk_mm.obj_icon_cy; g_vk_mm.saw_obj_frame = 1;
+    } else if (oh && cleared) {
+        g_vk_mm.saw_obj_frame = 1;
+    }
+    if (!cleared) return;
     if (mh) {
-        vk_mm_find_cand(g_vk_mm.hit_mm.w, g_vk_mm.hit_mm.h, tf, serial);
-        vk_mm_stream_stage(&g_vk_mm.mm, copy_cb, im, lv, l0, tf, &g_vk_mm.hit_mm);
-        int32_t pad = (int32_t)(g_vk_mm.hit_mm.w / 24u);
-        if (pad < 12) pad = 12; else if (pad > 32) pad = 32;
-        vk_mm_rect pm = vk_mm_pad_rect(&g_vk_mm.hit_mm, pad, pad, g_vk_mm.pass_w, g_vk_mm.pass_h);
-        vk_mm_rect u = g_vk_mm.pc_mm_done ? vk_mm_union_rect(&g_vk_mm.pc_mm, &pm) : pm;
-        vk_mm_restore_box(copy_cb, im, lv, l0, &u);
+        vk_mm_find_cand(g_vk_mm.hit_mm.w, g_vk_mm.hit_mm.h, g_vk_mm.hud_fmt, serial);
+        vk_mm_stream_stage(&g_vk_mm.mm, copy_cb, &g_vk_mm.hit_mm);
         g_vk_mm.saw_mm_frame = 1; g_vk_mm.frame_got_mm = fr; g_vk_mm.saved_hit_img = im;
-    } else if (g_vk_mm.pc_mm_done) {
-        vk_mm_restore_box(copy_cb, im, lv, l0, &g_vk_mm.pc_mm);
     }
     if (oh) {
-        vk_mm_stream_stage(&g_vk_mm.obj, copy_cb, im, lv, l0, tf, &g_vk_mm.hit_obj);
-        vk_mm_rect po = vk_mm_pad_rect(&g_vk_mm.hit_obj, 16, 16, g_vk_mm.pass_w, g_vk_mm.pass_h);
-        vk_mm_rect u = g_vk_mm.pc_obj_done ? vk_mm_union_rect(&g_vk_mm.pc_obj, &po) : po;
-        vk_mm_restore_box(copy_cb, im, lv, l0, &u);
-        g_vk_mm.saw_obj_frame = 1; g_vk_mm.frame_got_obj = fr; g_vk_mm.saved_hit_img = im;
-    } else if (g_vk_mm.pc_obj_done) {
-        vk_mm_restore_box(copy_cb, im, lv, l0, &g_vk_mm.pc_obj);
+        g_vk_mm.prev_hit_obj = g_vk_mm.hit_obj;
+        vk_mm_stream_stage(&g_vk_mm.obj, copy_cb, &g_vk_mm.hit_obj);
+        g_vk_mm.frame_got_obj = fr; g_vk_mm.saved_hit_img = im;
     }
-    if ((mh || oh) && atomic_load_explicit(&g_vk_mm.ui_want, memory_order_relaxed) == 1) vk_mm_stage_ui_tex(copy_cb);
+    if (lh) {
+        vk_mm_stream_stage(&g_vk_mm.lhud, copy_cb, &g_vk_mm.hit_lhud);
+        g_vk_mm.saw_lhud_frame = 1; g_vk_mm.frame_got_lhud = fr; g_vk_mm.saved_hit_img = im;
+    }
+    if ((mh || oh || lh) && atomic_load_explicit(&g_vk_mm.ui_want, memory_order_relaxed) == 1) vk_mm_stage_ui_tex(copy_cb);
 }
 
 static void vk_minimap_pass_abort(void) {
-    g_vk_mm.in_hud_pass = 0; g_vk_mm.pass_mm_hit = 0; g_vk_mm.pass_obj_hit = 0; g_vk_mm.pass_opaque_fs = 0;
+    g_vk_mm.in_hud_pass = 0; g_vk_mm.cur_hud = 0; g_vk_mm.pass_hud_cleared = 0;
+    g_vk_mm.pass_opaque_fs = 0; g_vk_mm.pass_modal = 0; g_vk_mm.pass_dialog = 0;
 }
 
 static void vk_mm_stream_present(vk_mm_stream *st, uint32_t fr, uint64_t fence) {
@@ -606,6 +967,7 @@ static void vk_minimap_present(void) {
     uint64_t fq = mtl_last_fence() + 1u;
     vk_mm_stream_present(&g_vk_mm.mm, fr, fq);
     vk_mm_stream_present(&g_vk_mm.obj, fr, fq);
+    vk_mm_stream_present(&g_vk_mm.lhud, fr, fq);
     if (g_vk_mm.ui_wrote_frame) {
         g_vk_mm.ui_pending = 1; g_vk_mm.ui_pending_fence = fq; g_vk_mm.ui_pending_frame = fr;
         g_vk_mm.ui_wrote_frame = 0;
@@ -618,18 +980,22 @@ static void vk_minimap_present(void) {
     }
     if (g_vk_mm.saw_mm_frame) g_vk_mm.mm_ttl = VK_MM_TTL; else if (g_vk_mm.mm_ttl > 0u) g_vk_mm.mm_ttl--;
     if (g_vk_mm.saw_obj_frame) g_vk_mm.obj_ttl = VK_MM_TTL; else if (g_vk_mm.obj_ttl > 0u) g_vk_mm.obj_ttl--;
-    g_vk_mm.saw_mm_frame = 0; g_vk_mm.saw_obj_frame = 0;
+    if (g_vk_mm.saw_lhud_frame) g_vk_mm.lhud_ttl = VK_MM_TTL; else if (g_vk_mm.lhud_ttl > 0u) g_vk_mm.lhud_ttl--;
+    g_vk_mm.saw_mm_frame = 0; g_vk_mm.saw_obj_frame = 0; g_vk_mm.saw_lhud_frame = 0;
 }
 
-static void vk_mm_copy_rgba(uint8_t *dst, const uint8_t *src, uint32_t w, uint32_t h, VkFormat fmt, int keep_a) {
+static void vk_mm_copy_rgba(uint8_t *dst, const uint8_t *src, uint32_t w, uint32_t h, VkFormat fmt, int alpha_mode) {
     int bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
     size_t n = (size_t)w * h;
     for (size_t i = 0; i < n; i++) {
         size_t o = i * 4u;
-        dst[o + 0] = src[o + (bgra ? 2 : 0)];
-        dst[o + 1] = src[o + 1];
-        dst[o + 2] = src[o + (bgra ? 0 : 2)];
-        dst[o + 3] = keep_a ? src[o + 3] : 255u;
+        uint8_t r = src[o + (bgra ? 2 : 0)], g = src[o + 1], b = src[o + (bgra ? 0 : 2)], a = src[o + 3];
+        if (alpha_mode == 0) a = 255u;
+        else if (alpha_mode == 2) {
+            uint8_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+            if (a < mx) a = mx;
+        }
+        dst[o + 0] = r; dst[o + 1] = g; dst[o + 2] = b; dst[o + 3] = a;
     }
 }
 
@@ -656,27 +1022,38 @@ int vk_minimap_read(uint8_t *rgba_out, int max_bytes, int32_t meta[5]) {
     return updated;
 }
 
-int vk_minimap_objective_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]) {
+static int vk_mm_read_overlay_stream(
+    vk_mm_stream *st, uint32_t ttl, int saw_frame, uint32_t max_w, uint32_t max_h,
+    uint8_t *rgba_out, int max_bytes, int32_t meta[4]) {
     if (!meta) return 0;
     atomic_store_explicit(&g_vk_mm.want_active, 1, memory_order_release);
     uint32_t client_seq = (uint32_t)meta[2];
     int updated = 0;
     pthread_mutex_lock(&g_vk_mm.mu);
-    int active = (g_vk_mm.obj_ttl > 0u || g_vk_mm.saw_obj_frame
-        || atomic_load_explicit(&g_vk_mm.obj.pending_valid, memory_order_relaxed)) ? 1 : 0;
-    int rslot = g_vk_mm.obj.ready_slot;
-    uint32_t w = g_vk_mm.obj.ready_w, h = g_vk_mm.obj.ready_h, seq = g_vk_mm.obj.seq;
-    if (active && rslot >= 0 && rslot < VK_MM_SLOTS && g_vk_mm.obj.slot[rslot].ptr && seq != client_seq
-            && w > 0 && w <= VK_OBJ_MAX_W && h > 0 && h <= VK_OBJ_MAX_H) {
+    int active = (ttl > 0u || saw_frame || atomic_load_explicit(&st->pending_valid, memory_order_relaxed)) ? 1 : 0;
+    int rslot = st->ready_slot;
+    uint32_t w = st->ready_w, h = st->ready_h, seq = st->seq;
+    if (active && rslot >= 0 && rslot < VK_MM_SLOTS && st->slot[rslot].ptr && seq != client_seq
+            && w > 0 && w <= max_w && h > 0 && h <= max_h) {
         size_t need = (size_t)w * h * 4u;
         if (rgba_out && need > 0 && max_bytes > 0 && (size_t)max_bytes >= need) {
-            vk_mm_copy_rgba(rgba_out, g_vk_mm.obj.slot[rslot].ptr, w, h, g_vk_mm.obj.ready_fmt, 0);
+            vk_mm_copy_rgba(rgba_out, st->slot[rslot].ptr, w, h, st->ready_fmt, 2);
             updated = 1;
         }
     }
     meta[0] = (int32_t)w; meta[1] = (int32_t)h; meta[2] = (int32_t)seq; meta[3] = active;
     pthread_mutex_unlock(&g_vk_mm.mu);
     return updated;
+}
+
+int vk_minimap_objective_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]) {
+    return vk_mm_read_overlay_stream(&g_vk_mm.obj, g_vk_mm.obj_ttl, g_vk_mm.saw_obj_frame,
+        VK_OBJ_MAX_W, VK_OBJ_MAX_H, rgba_out, max_bytes, meta);
+}
+
+int vk_minimap_lhud_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]) {
+    return vk_mm_read_overlay_stream(&g_vk_mm.lhud, g_vk_mm.lhud_ttl, g_vk_mm.saw_lhud_frame,
+        VK_LHUD_MAX_W, VK_LHUD_MAX_H, rgba_out, max_bytes, meta);
 }
 
 int vk_minimap_ui_tex_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request) {
@@ -710,5 +1087,5 @@ int vk_minimap_cycle(void) {
 void vk_minimap_enable(int on) {
     int v = on ? 1 : 0;
     atomic_store_explicit(&g_vk_mm.want_active, v, memory_order_release);
-    if (!v) { g_vk_mm.mm_ttl = 0u; g_vk_mm.obj_ttl = 0u; }
+    if (!v) { g_vk_mm.mm_ttl = 0u; g_vk_mm.obj_ttl = 0u; g_vk_mm.lhud_ttl = 0u; g_vk_mm.prev_hit_obj = (vk_mm_rect){0, 0, 0u, 0u}; }
 }

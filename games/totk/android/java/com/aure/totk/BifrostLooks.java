@@ -30,7 +30,7 @@ final class BifrostLooks {
     static final int RESULT_UNHANDLED = 7001;
 
     // ---- the looks: one table ----
-    static final int TOTK = 0, BOTW = 1, BOTW_NO_SLATE = 2;        // palette (row)
+    static final int TOTK = 0, BOTW = 1, BOTW_NO_SLATE = 2, HWAOC = 3;   // palette (row)
     static final int BASE = 0, OPEN = 1, LOW = 2;                  // kind (column)
 
     static final class Look {
@@ -74,6 +74,8 @@ final class BifrostLooks {
                               new Look("sheikah-slate-open", 0xa6ebff, 77, false, 60, "STATIC", 0.5f, 255), LOW_HEARTS },
         /* BOTW_NO_SLATE */ { new Look("slate-inactive", hue(0xff9b3d), 77, false, 60, "BREATH", 0.10f, 150),
                               new Look("slate-inactive-open", 0xffb870, 77, false, 60, "STATIC", 0.5f, 255), LOW_HEARTS },
+        /* HWAOC         */ { new Look("sheikah-blue", 0x0060ff, 82, false, 60, "BREATH", 0.10f, 160),
+                              new Look("sheikah-blue-open", 0x3888ff, 85, false, 60, "STATIC", 0.5f, 255), LOW_HEARTS },
     };
 
     // ---- the game state the feed works from (BifrostState reads it from the common state) ----

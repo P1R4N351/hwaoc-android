@@ -207,7 +207,7 @@ public final class BifrostProbe {
         equal(Integer.toHexString(BifrostLooks.hue(0x57dfbf)), "ffc3");
         equal(Integer.toHexString(BifrostLooks.hue(0x66d8fa)), "c4ff");
         equal(Integer.toHexString(BifrostLooks.hue(0xff9b3d)), "ff7b00");
-        equal(BifrostLooks.LOOKS.length, 3);
+        equal(BifrostLooks.LOOKS.length, 4);
         for (Look[] row : BifrostLooks.LOOKS) {
             equal(row.length, 3);
             equal(row[BifrostLooks.LOW].name, "low-hearts");
@@ -219,7 +219,8 @@ public final class BifrostProbe {
         equal(BifrostLooks.lowOn(80), 20); equal(BifrostLooks.lowOff(80), 24);
         equal(BifrostLooks.lowOn(4), 4); equal(BifrostLooks.lowOff(4), 4);
 
-        Feed totk = new Feed(BifrostLooks.TOTK, false), botw = new Feed(BifrostLooks.BOTW, false);
+        Feed totk = new Feed(BifrostLooks.TOTK, false), botw = new Feed(BifrostLooks.BOTW, false),
+                hwaoc = new Feed(BifrostLooks.HWAOC, false);
         equal(totk.want(null), null);
         equal(totk.want(state(false, true, true, 4, 12)), null);                       // title, loading
         equal(totk.want(state(true, false, true, 12, 12)).name, "purah-pad");
@@ -229,6 +230,10 @@ public final class BifrostProbe {
         equal(botw.want(state(true, true, true, 12, 12)).name, "sheikah-slate-open");
         equal(botw.want(state(true, false, false, 12, 12)).name, "slate-inactive");
         equal(botw.want(state(true, true, false, 12, 12)).name, "slate-inactive-open");
+        equal(hwaoc.want(state(true, false, true, -1, -1)).name, "sheikah-blue");
+        equal(hwaoc.want(state(true, false, true, -1, -1)).color, 0xff0060ff);
+        equal(hwaoc.want(state(true, true, true, -1, -1)).name, "sheikah-blue-open");
+        equal(hwaoc.want(state(true, true, true, -1, -1)).color, 0xff3888ff);
         equal(totk.want(state(true, true, false, 12, 12)).name, "purah-pad-open");     // only Breath of the Wild has the orange
         // Hysteresis, and low hearts over the open menu.
         equal(botw.want(state(true, false, true, 5, 12)).name, "sheikah-slate");
@@ -275,7 +280,9 @@ public final class BifrostProbe {
     static void pacing() {
         for (int classic = 0; classic < 2; classic++) for (int seed = 1; seed <= 40; seed++) {
             Random r = new Random(seed * 31L + classic);
-            Feed feed = new Feed(seed % 2 == 0 ? BifrostLooks.TOTK : BifrostLooks.BOTW, classic == 1);
+            int gameRow = seed % 3 == 0 ? BifrostLooks.TOTK
+                    : (seed % 3 == 1 ? BifrostLooks.BOTW : BifrostLooks.HWAOC);
+            Feed feed = new Feed(gameRow, classic == 1);
             Bucket bucket = new Bucket();
             List<Long> times = new ArrayList<>(); List<String> kinds = new ArrayList<>();
             long now = 5_000_000, lastPulse = -1, lastDisplay = -1, shownSince = -1;
@@ -619,27 +626,7 @@ class AndroidBifrostTests(unittest.TestCase):
         self.assertNotIn('import android', LOOKS.read_text())
         self.assertNotIn('android.', STATE.read_text())
 
-    def test_one_state_source_for_every_build(self):
-        # One BifrostState, fed by the common state's one getter; the game's variables (games/games.toml) say which colour
-        # table it uses and whether its tablet can be missing.
-        import sys
-        sys.path.insert(0, str(ROOT / 'tools'))
-        import games
-        source = (JAVA / 'BifrostState.java').read_text()
-        self.assertIn('SOURCE.state(WORDS)', source)
-        self.assertIn('BifrostLooks.fromState', source)
-        self.assertIn('"BOTW".equals(GameBuild.BIFROST_LOOKS) ? BifrostLooks.BOTW : BifrostLooks.TOTK', source)
-        self.assertFalse((ROOT / 'games/totk/android/java-botw').exists())
-        self.assertIn('TABLET_CAN_BE_MISSING = GameBuild.TABLET_CAN_BE_MISSING', (JAVA / 'companion/CompanionContent.java').read_text())
-        self.assertEqual([games.values(g)['tablet_can_be_missing'] for g in ('totk', 'botw')], [False, True])
-        self.assertEqual([games.values(g)['bifrost_looks'] for g in ('totk', 'botw')], ['TOTK', 'BOTW'])
-        self.assertIn('TABLET_CAN_BE_MISSING = false', games.java('totk'))
-        self.assertIn('TABLET_CAN_BE_MISSING = true', games.java('botw'))
-        looks = LOOKS.read_text()
-        self.assertNotIn('fromSnapshot', looks)
-        self.assertNotIn('fromDuo', looks)
-        self.assertNotIn('nativeLedState', (JAVA / 'companion/DuoSurfaceView.java').read_text())
-        # The names the native host keeps are the ones the title module publishes, in the order duo_state_fill reads them.
+    def _check_duo_state_tables(self):
         header = (ROOT / 'games/totk/duo/duo_state.h').read_text()
         names = header.split('#define DUO_STATE_NAMES', 1)[1].split('\n\n', 1)[0].replace('\\', ' ')
         names = [n.strip().strip('"') for n in names.replace('\n', ' ').split(',') if n.strip()]
@@ -654,10 +641,7 @@ class AndroidBifrostTests(unittest.TestCase):
         published = ''.join((modules / f).read_text() for f in ('botw_states.h', 'botw_heal_advisor.h', '01007EF00011E000.cpp'))
         for name in names:
             self.assertIn(name, published)
-        # Tears of the Kingdom's table (the same header, picked by title at run time): its names, in the order
-        # duo_state_fill_totk reads them, are ones the vendored Tears of the Kingdom module publishes as integers.
-        totk = header.split('#define DUO_TOTK_STATE_NAMES', 1)[1].split('\n', 1)[0]
-        totk = [n.strip().strip('"') for n in totk.split(',') if n.strip()]
+        totk = [n.strip().strip('"') for n in header.split('#define DUO_TOTK_STATE_NAMES', 1)[1].split('\n', 1)[0].split(',') if n.strip()]
         self.assertEqual(totk, ['totk.status', 'totk.state.menu_open', 'totk.state.life', 'totk.state.max_life'])
         order = header.split('enum { DUO_TOTK_STATUS', 1)[1].split('}', 1)[0]
         self.assertEqual(['DUO_TOTK_STATUS'] + [n.strip() for n in order.split(',') if n.strip()],
@@ -665,11 +649,30 @@ class AndroidBifrostTests(unittest.TestCase):
         module = (modules / '0100F2C0115B6000.cpp').read_text()
         for name in totk:
             self.assertIn(f'I64("{name}",', module)
-        # The host keeps the running title's names only (duo_host.cpp LedTap through duo_state_table).
         host = (ROOT / 'games/totk/duo/duo_host.cpp').read_text()
         self.assertIn('g_led_table = duo_state_table(port->title_id);', host)
         self.assertIn('duo_state_index(g_led_table, name)', host)
         self.assertNotIn('strncmp(name, "botw.", 5)', host)
+
+    def test_one_state_source_for_every_build(self):
+        import sys
+        sys.path.insert(0, str(ROOT / 'tools'))
+        import games
+        source = (JAVA / 'BifrostState.java').read_text()
+        self.assertIn('SOURCE.state(WORDS)', source)
+        self.assertIn('BifrostLooks.fromState', source)
+        self.assertIn('"BOTW".equals(GameBuild.BIFROST_LOOKS) ? BifrostLooks.BOTW : BifrostLooks.TOTK', source)
+        self.assertFalse((ROOT / 'games/totk/android/java-botw').exists())
+        self.assertIn('TABLET_CAN_BE_MISSING = GameBuild.TABLET_CAN_BE_MISSING', (JAVA / 'companion/CompanionContent.java').read_text())
+        self.assertEqual([games.values(g)['tablet_can_be_missing'] for g in ('totk', 'botw')], [False, True])
+        self.assertEqual([games.values(g)['bifrost_looks'] for g in ('totk', 'botw', 'hwaoc')], ['TOTK', 'BOTW', 'HWAOC'])
+        self.assertIn('TABLET_CAN_BE_MISSING = false', games.java('totk'))
+        self.assertIn('TABLET_CAN_BE_MISSING = true', games.java('botw'))
+        looks = LOOKS.read_text()
+        self.assertNotIn('fromSnapshot', looks)
+        self.assertNotIn('fromDuo', looks)
+        self.assertNotIn('nativeLedState', (JAVA / 'companion/DuoSurfaceView.java').read_text())
+        self._check_duo_state_tables()
 
     def test_manifest_asks_for_bifrost_only(self):
         import importlib.util

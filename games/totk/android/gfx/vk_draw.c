@@ -1209,7 +1209,7 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
     pso_life_pass_write(0);
     R.open = 0; g_bound_pipe = VK_NULL_HANDLE;
     if (vk_native_ui_enabled()) for (unsigned i = 0; i < R.ncolor; i++) if (R.ctex[i]) vk_tex_native_written(R.ctex[i], R.native);
-    if (R.ncolor > 0 && R.ctex[0]) vk_minimap_pass_end(cb, R.ctex[0], R.clevel[0], R.clayer[0], R.cfmt[0], R.c_serial[0]);
+    if (R.ncolor > 0 && R.ctex[0]) vk_minimap_pass_end(cb, R.ctex[0], R.c_serial[0]);
     else vk_minimap_pass_abort();
     pd_pass_end(cb);
     if (vk_fg_extract_active) fg_extract_pass_end();
@@ -1716,18 +1716,22 @@ static int begin_rendering_inner(int draw_tail) {
     VkCommandBuffer cb = vk_cb();
     split_depth_begin(cb, da.loadOp);
     vk_barrier_all(cb);
-    if (nc > 0 && ca[0].imageView && R.ctex[0]) {
-        vk_minimap_pass_begin(cb, R.ctex[0], R.clevel[0], R.clayer[0], R.w, R.h,
-                              ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD, sa.imageView != VK_NULL_HANDLE, R.native);
-    } else vk_minimap_pass_abort();
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {R.host_w, R.host_h}}, .layerCount = 1, .colorAttachmentCount = nc, .pColorAttachments = ca,
         .pDepthAttachment = da.imageView ? &da : NULL, .pStencilAttachment = sa.imageView ? &sa : NULL};
+    int mm_ok = (nc == 1u && ca[0].imageView && R.ctex[0] && !R.native && !R.store_discard && !vk_gpuprof_on
+        && R.samples <= VK_SAMPLE_COUNT_1_BIT && R.w == R.host_w && R.h == R.host_h);
+    if (mm_ok) {
+        vk_minimap_pass_begin(cb, R.ctex[0], R.clevel[0], R.clayer[0], R.w, R.h, R.cfmt[0], ri.renderArea,
+                              ca[0].imageView, ca[0].imageLayout,
+                              da.imageView ? &da : NULL, sa.imageView ? &sa : NULL,
+                              ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD, mm_ok);
+    } else vk_minimap_pass_abort();
     { int i = pp_begin(cb, 0); PP.open = i;
       if (i >= 0) { pp_rec *r = &PP.rec[i]; r->w = R.host_w; r->h = R.host_h; r->f0 = R.cfmt[0]; r->df = R.dfmt != VK_FORMAT_UNDEFINED ? R.dfmt : R.sfmt; r->ncolor = (uint8_t)nc; PP.draws0 = g_stat_draws;
           if (R.native) r->native_op=(uint8_t)(1+(vk_tex_native_window(R.ctex[0]) ? VK_NUI_WINDOW_PASS : VK_NUI_UI_PASS)); } }
     if (R.native) native_count[vk_tex_native_window(R.ctex[0]) ? VK_NUI_WINDOW_PASS : VK_NUI_UI_PASS]++;
     R.secondary = vk_record_enabled() && !PD.active && !PP.active && !probe_on() &&
-        !(vk_fg_extract_active && fg_extract_inline());
+        !(vk_fg_extract_active && fg_extract_inline()) && !vk_minimap_in_hud_pass();
     if (vk_gpuprof_on) {
         vk_gpuprof_secondary(R.secondary); /* stats stay inside secondaries; no inheritedQueries requirement */
         VkFormat fmt[10]; const tex_t *tex[10]; uint32_t widths[10], heights[10];
@@ -1764,11 +1768,6 @@ static int begin_rendering_inner(int draw_tail) {
             (sa.imageView && sa.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
     }
     vkCmdBeginRendering(cb, &ri);
-    { VkClearAttachment mm_ca[2]; VkClearRect mm_cr[2]; int mm_nc = vk_minimap_pass_preclear(mm_ca, mm_cr, 2);
-      for (int mm_i = 0; mm_i < mm_nc; mm_i++) {
-          if (R.secondary) vk_record_clear(&mm_ca[mm_i], &mm_cr[mm_i]);
-          else vkCmdClearAttachments(cb, 1, &mm_ca[mm_i], 1, &mm_cr[mm_i]);
-      } }
     totk_ft_count(FT_COUNT_PASSES, 1);
     R.open = 1; g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; g_dyn_input_rev++; g_stat_passes++; R.draws0 = g_stat_draws; pass_inputs_reset(); g_pops.disabled_at_start = S.render_disabled;
     pso_life_pass_write(1);
@@ -3621,6 +3620,9 @@ static void clear_color(const p_clear_color *c) {
     VkClearRect cr = {clear_rect(), 0, 1};
     if (cr.rect.extent.width && cr.rect.extent.height) {
         if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_break(vk_cb());
+        if (c->index == 0 && !R.secondary && vk_minimap_bind_main(vk_cb())) {
+            g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; descriptor_unbind(); vk_stage_sig_invalidate(0x3fu);
+        }
         if (R.secondary) vk_record_clear(&ca, &cr); else vkCmdClearAttachments(vk_cb(), 1, &ca, 1, &cr);
         if (pso_life_active() && full && (c->mask & 15) == 15) PL.color_clear |= 1u << c->index;
         pso_life_view_write(R.ctex[c->index], PL.color_view[c->index], VK_IMAGE_ASPECT_COLOR_BIT,
@@ -6510,11 +6512,6 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             }
         }
     }
-    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_begin(cb, p, sh);
-    if (R.secondary) g_record_draw = vk_record_draw_begin(p, layout);
-    else { VK_REC_DO(VK_REC_CMD, if (p != g_bound_pipe) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); g_bound_pipe = p; }); }
-    { static const char *vt = (const char *)1; if (vt == (const char *)1) vt = getenv("TOTK_VK_PASS_DUMP_VSTEX");
-      g_pd_cap = PD.active && !g_pd_vstex_done && vt && *vt && !strncmp(sh[0]->key, vt, strlen(vt)); }
     g_ui_aspect_on = 0;
     if (vk_canvas_on && !g_indirect.on && sh[0]->canvas_ui && count == 6 && R.ncolor && R.ctex[0]) {   /* vk_ui_aspect.h: a HUD quad */
         float shown = pres_shown_aspect();
@@ -6524,6 +6521,34 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             g_ui_aspect_on = vk_ui_aspect_on(&g_ui_aspect);
         }
     }
+    if (!R.secondary && vk_minimap_in_hud_pass()) {
+        vk_mm_draw_ctx mmc = {
+            .nattr = S.nattr, .has_vp = S.has_vp, .base_instance = dw ? (int)dw->base_instance : (di ? (int)di->base_instance : 0),
+            .vin_mask = sh[0] ? sh[0]->vin_mask : 0u, .st = S.ds.st,
+            .dt = (uint32_t)(R.dfmt != VK_FORMAT_UNDEFINED && S.ds.dt),
+            .c0_mask = (uint32_t)(S.chmask.mask & 0xfu), .blend_en = (S.color.blend_en & 1u),
+            .ax = g_ui_aspect_on ? g_ui_aspect.sx : 1.0f, .ay = g_ui_aspect_on ? g_ui_aspect.sy : 1.0f,
+            .acx = g_ui_aspect_on ? g_ui_aspect.cx : 0.0f, .acy = g_ui_aspect_on ? g_ui_aspect.cy : 0.0f,
+        };
+        for (int ui = 0; ui < 4; ui++) { mmc.ubo_addr[ui] = S.ubo[0][ui].addr; mmc.ubo_sz[ui] = S.ubo[0][ui].size; }
+        if (S.has_vp) memcpy(mmc.vp0, S.vp[0], sizeof mmc.vp0);
+        for (int mi = 0; mi < S.nattr && mi < 16; mi++) {
+            uint32_t ms = (uint32_t)(S.attr[mi].stream & 15);
+            mmc.attr[mi] = (vk_mm_attr){
+                vk_vertex_fmt(S.attr[mi].fmt), (uint32_t)S.attr[mi].offset,
+                (uint32_t)S.stream[ms].stride, (uint32_t)S.stream[ms].divisor,
+                S.vbuf[ms].address, S.vbuf[ms].size
+            };
+        }
+        if (vk_minimap_select_target(cb, &mmc, g_indirect.on, dw, di)) {
+            g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; descriptor_unbind(); vk_stage_sig_invalidate(0x3fu);
+        }
+    }
+    if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_begin(cb, p, sh);
+    if (R.secondary) g_record_draw = vk_record_draw_begin(p, layout);
+    else { VK_REC_DO(VK_REC_CMD, if (p != g_bound_pipe) { vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p); g_bound_pipe = p; }); }
+    { static const char *vt = (const char *)1; if (vt == (const char *)1) vt = getenv("TOTK_VK_PASS_DUMP_VSTEX");
+      g_pd_cap = PD.active && !g_pd_vstex_done && vt && *vt && !strncmp(sh[0]->key, vt, strlen(vt)); }
     VK_REC_DO(VK_REC_CMD, dynamic_state(cb, prim));
     VK_REC_DO(VK_REC_BIND,
         if (__builtin_expect(vk_xlate_stats_enabled, 0)) {
@@ -6553,18 +6578,6 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             if (va && vk_resolve_span(va, &bb, &oo, &av) && av >= 32) memcpy(q->v0, (const void *)(uintptr_t)(va + (uint64_t)q->first * S.stream[st].stride), 32); }
     }
     {
-        uint32_t mm_st = S.nattr > 0 ? (uint32_t)(S.attr[0].stream & 15) : 0u;
-        VkFormat mm_vfmt = S.nattr > 0 ? vk_vertex_fmt(S.attr[0].fmt) : VK_FORMAT_UNDEFINED;
-        vk_minimap_note_draw(g_indirect.on, S.ds.st, S.ds.dt, (uint32_t)(S.chmask.mask & 0xfu), (S.color.blend_en & 1u),
-                             mm_vfmt, S.nattr > 0 ? (uint32_t)S.attr[0].offset : 0u,
-                             S.nattr > 0 ? (uint32_t)S.stream[mm_st].stride : 0u,
-                             S.nattr > 0 ? S.vbuf[mm_st].address : 0ull,
-                             S.nattr > 0 ? S.vbuf[mm_st].size : 0ull,
-                             dw, di,
-                             g_ui_aspect_on ? g_ui_aspect.sx : 1.0f,
-                             g_ui_aspect_on ? g_ui_aspect.sy : 1.0f,
-                             g_ui_aspect_on ? g_ui_aspect.cx : 0.0f,
-                             g_ui_aspect_on ? g_ui_aspect.cy : 0.0f);
         if (sh[1] && vk_minimap_want_ui_tex()) {
             int n_ = sh[1]->nb < 16 ? sh[1]->nb : 16;
             for (int i_ = 0; i_ < n_; i_++) {

@@ -156,7 +156,9 @@ public final class TotkActivity extends NativeActivity {
         saves = SaveMirror.Watcher.start(this);
         int given = nativeFeedbackEnabled();   // what start_game gave the game (TOTK_RUMBLE / TOTK_GYRO and the hardware)
         if (given != 0 && !isFinishing()) feedback = new GameFeedback(this, given);
-        BifrostBridge.setEnabled(getSharedPreferences("warriors_companion", MODE_PRIVATE).getBoolean("stick_lights", true));
+        android.content.SharedPreferences wcSp = getSharedPreferences("warriors_companion", MODE_PRIVATE);
+        BifrostBridge.syncScreenBrightness = wcSp.getBoolean("stick_screen_sync", true);
+        BifrostBridge.setEnabled(wcSp.getBoolean("stick_lights", true));
         if (!isFinishing()) bifrost = BifrostBridge.create(this);
         if (!updateChecked) {
             updateChecked = true;

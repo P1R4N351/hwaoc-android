@@ -54,6 +54,7 @@ public final class CompanionNative implements DataSource {
     private static native int warriorsMinimapCycleNative();
     private static native void warriorsMinimapEnableNative(boolean on);
     private static native int warriorsObjectiveNative(byte[] rgbaOut, int[] meta);
+    private static native int warriorsLeftHudNative(byte[] rgbaOut, int[] meta);
     private static native int warriorsUiTexNative(byte[] rgbaOut, int[] meta, boolean request);
 
     @Override public String read(int detail) {
@@ -130,6 +131,11 @@ public final class CompanionNative implements DataSource {
     public static int warriorsObjective(byte[] rgbaOut, int[] meta) {
         if (!loaded || rgbaOut == null || meta == null || meta.length < 4) return 0;
         try { return warriorsObjectiveNative(rgbaOut, meta); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; return 0; }
+    }
+    public static int warriorsLeftHud(byte[] rgbaOut, int[] meta) {
+        if (!loaded || rgbaOut == null || meta == null || meta.length < 4) return 0;
+        try { return warriorsLeftHudNative(rgbaOut, meta); }
         catch (UnsatisfiedLinkError unavailable) { loaded = false; return 0; }
     }
     public static int warriorsUiTex(byte[] rgbaOut, int[] meta, boolean request) {

@@ -236,6 +236,7 @@ public final class CompanionNative {
     public static int warriorsMinimapCycle() { return ++cycleCount; }
     public static void warriorsMinimapEnable(boolean on) { enabledRt = on; }
     public static int warriorsObjective(byte[] rgbaOut, int[] meta) { return 0; }
+    public static int warriorsLeftHud(byte[] rgbaOut, int[] meta) { return 0; }
     public static int warriorsUiTex(byte[] rgbaOut, int[] meta, boolean request) { return 0; }
 }''',
     'com/aure/totk/companion/WarriorsAssetHarvester.java': '''package com.aure.totk.companion;
@@ -246,14 +247,18 @@ public final class WarriorsAssetHarvester {
     public void clearCache(Context c) { }
     public void setMinimap(Bitmap bmp) { }
     public Bitmap backdrop() { return null; }
-    public Bitmap emblem() { return null; }
+    public Bitmap filter() { return null; }
+    public Bitmap glyph() { return null; }
+    public Bitmap borderFrieze() { return null; }
+    public Bitmap borderEdge() { return null; }
+    public Bitmap borderSide() { return null; }
     public Bitmap minimap() { return null; }
     public Bitmap objective() { return null; }
     public void setObjective(Bitmap bmp) { }
-    public Bitmap purahTex() { return null; }
+    public Bitmap leftHud() { return null; }
+    public void setLeftHud(Bitmap bmp) { }
     public boolean isSuppressed() { return false; }
     public void setSuppressed(boolean s) { }
-    public boolean ingestGpuUiTex(Context c, byte[] r, int w, int h, int k) { return false; }
     public String source() { return "NONE"; }
 }''',
     'com/aure/totk/companion/SnapshotPoller.java': '''package com.aure.totk.companion;
@@ -282,7 +287,8 @@ public final class ScreenProbe {
         };
         boolean botw = args[0].equals("botw"), duo = args[1].equals("duo"), warriors = args[1].equals("warriors");
         require(CompanionContent.TABLET_CAN_BE_MISSING == botw, "the build says whether its tablet can be missing");
-        for (int initial = 0; initial < 3; initial++) {
+        int lastPage = warriors ? 1 : 2;
+        for (int initial = 0; initial <= lastPage; initial++) {
             CompanionScreen screen = CompanionContent.create(context, source, initial);
             require(screen.view() == screen, "the screen is its own view");
             if (warriors) {
@@ -303,8 +309,7 @@ public final class ScreenProbe {
                 continue;
             }
             require(screen.page() == initial, "created on the page asked for");
-            for (int page = 0; page < 3; page++) { screen.setPage(page); require(screen.page() == page, "page round trip " + page); }
-            int lastPage = warriors ? 3 : 2;
+            for (int page = 0; page <= lastPage; page++) { screen.setPage(page); require(screen.page() == page, "page round trip " + page); }
             screen.setPage(7); require(screen.page() == lastPage, "beyond the last page: the last");
             screen.setPage(-3); require(screen.page() == 0, "before the first: the first");
             int redraws = android.view.View.invalidated, fulls = fullRequests();
@@ -522,10 +527,31 @@ class CompanionScreenTests(unittest.TestCase):
     def test_hwaoc_screen_is_warriors_view(self):
         classes = self.screen_classes('hwaoc')
         self.assertIn('pass: companion screen hwaoc warriors', self.run_probe(classes, 'com.aure.totk.companion.ScreenProbe', 'hwaoc', 'warriors'))
-        self.assertIn('CYCLE RT', (JAVA / 'WarriorsCompanionDraw.java').read_text())
-        self.assertNotIn('PixelCopy', (JAVA / 'WarriorsAssetHarvester.java').read_text())
-        self.assertNotIn('BATTLE TIMER', (JAVA / 'WarriorsCompanionDraw.java').read_text())
-        self.assertNotIn('KEEPS / KOs', (JAVA / 'WarriorsCompanionDraw.java').read_text())
+        draw_src = (JAVA / 'WarriorsCompanionDraw.java').read_text()
+        harvester_src = (JAVA / 'WarriorsAssetHarvester.java').read_text()
+        self.assertNotIn('CUTSCENE', draw_src)
+        self.assertNotIn('PURAH PAD LINK', draw_src)
+        self.assertNotIn('drawRoundRect', draw_src)
+        self.assertNotIn('0xF205080A', draw_src)
+        self.assertIn('Minimap Layer', draw_src)
+        self.assertNotIn('PixelCopy', harvester_src)
+        self.assertNotIn('BATTLE TIMER', draw_src)
+        self.assertNotIn('KEEPS / KOs', draw_src)
+        self.assertNotIn('STATE / FRAMES', draw_src)
+        self.assertNotIn('1% LOW', draw_src)
+        self.assertNotIn('PURE BLACK', draw_src)
+        self.assertNotIn('"STATUS"', draw_src)
+        self.assertNotIn('tabName(', draw_src)
+        self.assertIn('drawWallFrieze', draw_src)
+        self.assertIn('-90f', draw_src)
+        self.assertIn('c.rotate(', draw_src)
+        mm_src = (ANDROID / 'gfx/vk_minimap.h').read_text(encoding='utf-8')
+        self.assertIn('vk_mm_ubo_xy_bounds', mm_src)
+        draw_c = (ANDROID / 'gfx/vk_draw.c').read_text(encoding='utf-8')
+        self.assertIn('vk_mm_find_proj', mm_src)
+        for forbidden in ('save_img', 'pass_preclear', 'restore_box', 'mm_skip', 'skip_out'):
+            self.assertNotIn(forbidden, mm_src)
+            self.assertNotIn(forbidden, draw_c)
 
     def test_botw_screen_keeps_no_page_and_needs_no_library(self):
         # No libduo_host.so on the host: the class still loads and the screen still stands behind the interface.
