@@ -35,4 +35,6 @@ public final class GameBuild {
     public static final boolean TABLET_CAN_BE_MISSING = false;
     /** BifrostLooks row name: "TOTK" or "BOTW". */
     public static final String BIFROST_LOOKS = "TOTK";
+    /** Whether the app boots straight into the game by default when playable. */
+    public static final boolean DIRECT_BOOT = false;
 }

@@ -24,7 +24,7 @@ import java.nio.ByteBuffer;
 public final class WarriorsCompanionView extends View implements CompanionScreen {
     private static final long POLL_MS = 50L;
     private static final long DEV_STAT_MS = 1000L;
-    private static final int MINIMAP_MAX_BYTES = 512 * 512 * 4;
+    private static final int MINIMAP_MAX_BYTES = 768 * 768 * 4;
     private static final String PREFS = "warriors_companion";
 
     private final DataSource source;
@@ -47,6 +47,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             String text = source != null ? source.warriorsDetail(ints, flts) : null;
             if (text != null) model.update(ints, flts, text, now);
             else model.updateOrbit(now);
+            model.stickLights = BifrostBridge.enabled;
             model.stickSync = BifrostBridge.syncScreenBrightness;
             model.screenBrightnessPct = BifrostBridge.lastScreenPct;
             pollNativeMinimap();
@@ -66,6 +67,9 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         this.model.gameKind = WarriorsCompanionModel.GAME_AOC;
         SharedPreferences sp = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         this.model.devOnStatus = sp.getBoolean("dev_on_status", true);
+        boolean lights = sp.getBoolean("stick_lights", true);
+        this.model.stickLights = lights;
+        BifrostBridge.setEnabled(lights);
         boolean sync = sp.getBoolean("stick_screen_sync", true);
         this.model.stickSync = sync;
         BifrostBridge.syncScreenBrightness = sync;
@@ -77,8 +81,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     }
 
     private void pollNativeMinimap() {
-        if (model.activeTab() == WarriorsCompanionModel.TAB_TACTICAL && model.inGame
-                && !model.moviePlaying && !model.hostPaused) {
+        if (model.inGame && !model.moviePlaying && !model.hostPaused) {
             CompanionNative.warriorsMinimapEnable(true);
             int got = CompanionNative.warriorsMinimap(minimapBytes, minimapMeta);
             int rw = minimapMeta[0], rh = minimapMeta[1];
@@ -147,7 +150,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         int clamped = Math.max(0, Math.min(WarriorsCompanionModel.TAB_COUNT - 1, page));
         if (clamped != model.activeTab()) {
             model.selectTab(clamped);
-            CompanionNative.warriorsMinimapEnable(clamped == WarriorsCompanionModel.TAB_TACTICAL);
+            CompanionNative.warriorsMinimapEnable(model.inGame && !model.moviePlaying && !model.hostPaused);
             invalidate();
         }
     }
@@ -318,7 +321,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     private boolean handleStatusTap(float lx, float ly) {
         if (lx < 796f || lx > 1194f) return false;
         SharedPreferences sp = getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
-        if (ly >= 180f && ly <= 290f) {
+        if (ly >= 170f && ly <= 264f) {
             model.devOnStatus = !model.devOnStatus;
             sp.edit().putBoolean("dev_on_status", model.devOnStatus).apply();
             if (model.devOnStatus) {
@@ -330,15 +333,21 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             }
             return true;
         }
-        if (ly >= 314f && ly <= 424f) {
+        if (ly >= 280f && ly <= 374f) {
+            model.stickLights = !model.stickLights;
+            sp.edit().putBoolean("stick_lights", model.stickLights).apply();
+            BifrostBridge.setEnabled(model.stickLights);
+            return true;
+        }
+        if (ly >= 390f && ly <= 484f) {
             model.stickSync = !model.stickSync;
             BifrostBridge.syncScreenBrightness = model.stickSync;
             sp.edit().putBoolean("stick_screen_sync", model.stickSync).apply();
             return true;
         }
-        if (ly >= 448f && ly <= 558f) { model.toggleAutoDim(); return true; }
-        if (ly >= 728f && ly <= 838f) { triggerArtRescan(); return true; }
-        if (ly >= 862f && ly <= 960f) {
+        if (ly >= 500f && ly <= 594f) { model.toggleAutoDim(); return true; }
+        if (ly >= 746f && ly <= 840f) { triggerArtRescan(); return true; }
+        if (ly >= 856f && ly <= 950f) {
             art.clearCache(getContext());
             syncArtFlags();
             return true;
@@ -347,7 +356,15 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     }
 
     private void triggerArtRescan() {
-        File[] roots = new File[] { getContext().getFilesDir(), getContext().getExternalFilesDir(null) };
+        String dataDir = System.getenv("TOTK_DATA_DIR");
+        File dd = dataDir != null && !dataDir.isEmpty() ? new File(dataDir) : null;
+        File[] roots = new File[] {
+            dd != null ? new File(dd, "romfs/Movie") : null,
+            dd != null ? new File(dd, "romfs") : null,
+            dd,
+            getContext().getFilesDir(),
+            getContext().getExternalFilesDir(null),
+        };
         art.harvestFromGameDirsAsync(getContext(), roots, model.gameKind, () -> {
             syncArtFlags();
             invalidate();

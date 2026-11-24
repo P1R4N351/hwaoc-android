@@ -37,7 +37,7 @@ public final class TotkActivity extends NativeActivity {
         updateOpen = true;
         // Explicitly pause on both single- and dual-screen devices, independent of window focus.
         nativeGameFocus(false, true);
-        if (bifrost != null) bifrost.stop();
+        if (bifrost != null) bifrost.pause();
         com.aure.totk.setup.UpdatePrompt.show(this, version, now -> {
             updateOpen = false;
             if (bifrost != null && resumed) bifrost.start();
@@ -156,6 +156,7 @@ public final class TotkActivity extends NativeActivity {
         saves = SaveMirror.Watcher.start(this);
         int given = nativeFeedbackEnabled();   // what start_game gave the game (TOTK_RUMBLE / TOTK_GYRO and the hardware)
         if (given != 0 && !isFinishing()) feedback = new GameFeedback(this, given);
+        BifrostBridge.setEnabled(getSharedPreferences("warriors_companion", MODE_PRIVATE).getBoolean("stick_lights", true));
         if (!isFinishing()) bifrost = BifrostBridge.create(this);
         if (!updateChecked) {
             updateChecked = true;
@@ -221,20 +222,20 @@ public final class TotkActivity extends NativeActivity {
         }
         if (single && bifrost != null) {   // one display: focus loss pauses the game, so the LEDs go back too
             if (focused && resumed && !updateOpen) bifrost.start();
-            else bifrost.stop();
+            else bifrost.pause();
         }
     }
     @Override protected void onPause() {
         resumed = false;
         GameFeedback f = feedback;
         if (f != null) f.pause();   // no motion in the background, and no motor left running
-        if (bifrost != null) bifrost.stop();   // the LEDs never stay on the game's effect
+        if (bifrost != null) bifrost.pause();   // the LEDs never stay on the game's effect
         super.onPause();
     }
     @Override protected void onStop() {
         // Leaving the foreground may be the last chance before the process is killed: push a save made just now.
         if (saves != null) saves.flush();
-        if (bifrost != null) bifrost.stop();
+        if (bifrost != null) bifrost.pause();
         super.onStop();
     }
     @Override protected void onDestroy() {

@@ -221,7 +221,7 @@ public final class Snapshot {
     public double coordinate(int axis) { return Double.NaN; }
 }''',
     'com/aure/totk/BifrostBridge.java':
-        'package com.aure.totk; public final class BifrostBridge { public static volatile boolean syncScreenBrightness = true; public static volatile int lastScreenPct = -1; }',
+        'package com.aure.totk; public final class BifrostBridge { public static volatile boolean enabled = true, syncScreenBrightness = true; public static volatile int lastScreenPct = -1; public static void setEnabled(boolean on) { enabled = on; } }',
     'com/aure/totk/companion/CompanionNative.java': '''package com.aure.totk.companion;
 public final class CompanionNative {
     public static boolean enabledRt;
@@ -273,6 +273,10 @@ public final class ScreenProbe {
         for (int initial = 0; initial < 3; initial++) {
             CompanionScreen screen = CompanionContent.create(context, source, initial);
             require(screen.view() == screen, "the screen is its own view");
+            if (warriors) {
+                WarriorsCompanionModel wm = new WarriorsCompanionModel();
+                require(wm.stickLights && wm.stickSync, "stick lights and sync default ON");
+            }
             String wantClass = duo ? "DuoSurfaceView" : warriors ? "WarriorsCompanionView" : "CompanionView";
             require(screen.getClass().getSimpleName().equals(wantClass), "this build's screen");
             CompanionState state = new CompanionState();

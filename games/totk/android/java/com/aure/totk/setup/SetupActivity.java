@@ -530,17 +530,26 @@ public final class SetupActivity extends Activity implements SetupService.Listen
     private boolean returnToRunningGame(Intent intent) {
         if (closingGame || !Intent.ACTION_MAIN.equals(intent.getAction()) || !intent.hasCategory(Intent.CATEGORY_LAUNCHER)
                 || intent.getBooleanExtra(EXTRA_SETTINGS, false) || intent.hasExtra(EXTRA_GAME_ERROR) || intent.hasExtra(EXTRA_UPDATE)
-                || pendingUpdate() != null || !SettingsStore.secondaryDisplay(this)
-                || InstallState.gameState(this).state != GameLock.State.GAME) return false;
-        try {
-            GameLaunch.start(this);
-            finish();
-            overridePendingTransition(0, 0);
-            return true;
-        } catch (RuntimeException failed) {
-            android.util.Log.w("TotkSetup", "Could not return to the running game", failed);
-            return false;
+                || pendingUpdate() != null) return false;
+        if (SettingsStore.secondaryDisplay(this) && InstallState.gameState(this).state == GameLock.State.GAME) {
+            try {
+                GameLaunch.start(this);
+                finish();
+                overridePendingTransition(0, 0);
+                return true;
+            } catch (RuntimeException failed) {
+                android.util.Log.w("TotkSetup", "Could not return to the running game", failed);
+                return false;
+            }
         }
+        if (GameBuild.DIRECT_BOOT && ui && gameError == null && SettingsStore.skipMenu(this)
+                && !SetupService.status.running && !SetupService.jobActive(this) && InstallState.read(this).playable()
+                && InstallState.gameState(this).state == GameLock.State.FREE && StorageLocation.available(this)
+                && !StorageLocation.migrationPending(this, true) && !SaveMirror.enabled(this)) {
+            launchGame();
+            return true;
+        }
+        return false;
     }
     /** Called only by the live, main-display game: its caller token keeps Settings in that same task. */
     public static void openOnGame(android.app.Activity game) {
@@ -581,6 +590,8 @@ public final class SetupActivity extends Activity implements SetupService.Listen
             });
             return;
         }
+        if (GameBuild.DIRECT_BOOT && !settingsShortcut
+                && moveSettingsToMain(new Intent(getIntent()).putExtra(EXTRA_SETTINGS, true))) return;
         showUi();
     }
     @Override protected void onNewIntent(Intent intent) {

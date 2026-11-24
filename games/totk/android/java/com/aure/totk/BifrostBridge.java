@@ -22,6 +22,7 @@ import java.util.Map;
 public final class BifrostBridge {
     private static final String TAG = "TotkBifrost";
     private static volatile BifrostBridge current;
+    public static volatile boolean enabled = true;
     public static volatile boolean syncScreenBrightness = true;
     public static volatile int lastScreenPct = -1;
 
@@ -48,7 +49,7 @@ public final class BifrostBridge {
     private final BifrostLooks.State state = new BifrostLooks.State();
     private HandlerThread thread;
     private volatile Handler worker;
-    private volatile boolean running, dead;
+    private volatile boolean running, dead, foreground, closed;
     private String said = "";
     private volatile int generation;
 
@@ -65,8 +66,24 @@ public final class BifrostBridge {
     }
 
     /** UI thread: the game is in the foreground and running. */
+    public static void setEnabled(boolean on) {
+        enabled = on;
+        BifrostBridge b = current;
+        if (b == null) return;
+        if (!on) b.stop();
+        else if (b.foreground && !b.closed) b.start();
+    }
+
+    void pause() {
+        foreground = false;
+        stop();
+    }
+
     void start() {
-        if (running || dead) return;
+        if (closed || dead) return;
+        foreground = true;
+        current = this;
+        if (!enabled || running) return;
         try {
             if (worker == null) {
                 // The manifest's <queries> entry makes Bifrost visible here. Not installed: nothing is started.
@@ -118,6 +135,8 @@ public final class BifrostBridge {
 
     /** UI thread, before the process ends: the clear is sent here, since the worker may never run again. */
     void close() {
+        closed = true;
+        foreground = false;
         running = false;
         ++generation;
         if (current == this) current = null;

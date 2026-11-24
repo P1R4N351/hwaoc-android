@@ -40,17 +40,7 @@ Generated from `games/games.toml` (`python3 tools/games.py table`; the test chec
 | `duo` | The Eden Duo companion of a gpl_companion game: package = the folder under duo/vendor/companions/packages that the APK carries as assets/duo/<package>/dualscreen (build_release.py; audit_apk.py compares it byte for byte), module = the title module's main source under duo/vendor/companions (android/Makefile passes it with title_id to duo/CMakeLists.txt, which adds the sources that module needs) | `{"package": "TearsOfTheKingdom", "module": "native/modules/0100F2C0115B6000.cpp"}` | `{"package": "BreathOfTheWild", "module": "native/modules/01007EF00011E000.cpp"}` | `{"package": "AgeOfCalamity", "module": "native/modules/01002B00111A2000.cpp"}` |
 | `tablet_can_be_missing` | Whether the game starts without its tablet (BotW's Sheikah Slate; the stick LEDs have a look for that) | `false` | `true` | `false` |
 | `bifrost_looks` | Row of BifrostLooks.LOOKS the stick-LED bridge uses (colour table) | `TOTK` | `BOTW` | `BOTW` |
-
-Flavours (`build_release.py --game <game> --flavour <flavour>`):
-
-| Game | Flavour | Package | Launcher label | Version | Code | Key | Repository | Release tag, asset |
-|---|---|---|---|---|---|---|---|---|
-| `totk` | `fork` | `io.github.p1r4n351.totk` | TotK Native (fork) | `1.0.1-fork.4` | 10004 | `fork-release.p12` | P1R4N351/totk-android | `v<version>`, `TotK-Native-<version>.apk` |
-| `totk` | `dev` | `io.github.p1r4n351.totk.dev` | TotK Native (dev) | `1.0.1-dev` | clock | `totk-dev.pem` | P1R4N351/totk-android | `v<version>`, `TotK-Native-<version>.apk` |
-| `botw` | `release` | `io.github.p1r4n351.botw` | BotW Native | `0.2.0-pre.1` | 200 | `botw-release.pem` | P1R4N351/botw-android | `botw-v<version>`, `BotW-Native-<version>.apk` |
-| `botw` | `dev` | `io.github.p1r4n351.botw` | BotW Native | `0.2.0-dev` | clock | `botw-dev.pem` | P1R4N351/botw-android | `botw-v<version>`, `BotW-Native-<version>.apk` |
-| `hwaoc` | `release` | `io.github.p1r4n351.hwaoc` | AoC Native | `0.1.0-beta.1` | 101 | `hwaoc-release.pem` | P1R4N351/hwaoc-android | `hwaoc-v<version>`, `AoC-Native-<version>.apk` |
-| `hwaoc` | `dev` | `io.github.p1r4n351.hwaoc.dev` | AoC Native (dev) | `0.1.0-dev` | clock | `hwaoc-dev.pem` | P1R4N351/hwaoc-android | `hwaoc-v<version>`, `AoC-Native-<version>.apk` |
+| `direct_boot` | Whether the app boots straight into the game by default when playable, moving setup and warm launches onto the main display on dual-screen handhelds | `false` | `false` | `true` |
 
 Flavours (`build_release.py --game <game> --flavour <flavour>`):
 

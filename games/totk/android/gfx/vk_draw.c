@@ -1210,6 +1210,7 @@ static void end_rendering_inner(vk_pass_end_kind reason, uint32_t detail) {
     R.open = 0; g_bound_pipe = VK_NULL_HANDLE;
     if (vk_native_ui_enabled()) for (unsigned i = 0; i < R.ncolor; i++) if (R.ctex[i]) vk_tex_native_written(R.ctex[i], R.native);
     if (R.ncolor > 0 && R.ctex[0]) vk_minimap_pass_end(cb, R.ctex[0], R.clevel[0], R.clayer[0], R.cfmt[0], R.c_serial[0]);
+    else vk_minimap_pass_abort();
     pd_pass_end(cb);
     if (vk_fg_extract_active) fg_extract_pass_end();
     fg_extract_authority_span_end(cb); /* rejected frames must consume/poison pending authority */
@@ -1715,6 +1716,10 @@ static int begin_rendering_inner(int draw_tail) {
     VkCommandBuffer cb = vk_cb();
     split_depth_begin(cb, da.loadOp);
     vk_barrier_all(cb);
+    if (nc > 0 && ca[0].imageView && R.ctex[0]) {
+        vk_minimap_pass_begin(cb, R.ctex[0], R.clevel[0], R.clayer[0], R.w, R.h,
+                              ca[0].loadOp == VK_ATTACHMENT_LOAD_OP_LOAD, sa.imageView != VK_NULL_HANDLE, R.native);
+    } else vk_minimap_pass_abort();
     VkRenderingInfo ri = {VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {R.host_w, R.host_h}}, .layerCount = 1, .colorAttachmentCount = nc, .pColorAttachments = ca,
         .pDepthAttachment = da.imageView ? &da : NULL, .pStencilAttachment = sa.imageView ? &sa : NULL};
     { int i = pp_begin(cb, 0); PP.open = i;
@@ -6541,6 +6546,20 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
         int a0 = -1; for (int a = 0; a < 16; a++) if ((sh[0]->vin_mask >> a & 1) && a < S.nattr && S.attr[a].fmt) { a0 = a; break; }
         if (a0 >= 0) { uint32_t st = S.attr[a0].stream & 15; uint64_t va = S.vbuf[st].address; VkBuffer bb; uint64_t oo, av;
             if (va && vk_resolve_span(va, &bb, &oo, &av) && av >= 32) memcpy(q->v0, (const void *)(uintptr_t)(va + (uint64_t)q->first * S.stream[st].stride), 32); }
+    }
+    {
+        uint32_t mm_st = S.nattr > 0 ? (uint32_t)(S.attr[0].stream & 15) : 0u;
+        VkFormat mm_vfmt = S.nattr > 0 ? vk_vertex_fmt(S.attr[0].fmt) : VK_FORMAT_UNDEFINED;
+        vk_minimap_note_draw(g_indirect.on, S.ds.st, S.ds.dt, (uint32_t)(S.chmask.mask & 0xfu),
+                             mm_vfmt, S.nattr > 0 ? (uint32_t)S.attr[0].offset : 0u,
+                             S.nattr > 0 ? (uint32_t)S.stream[mm_st].stride : 0u,
+                             S.nattr > 0 ? S.vbuf[mm_st].address : 0ull,
+                             S.nattr > 0 ? S.vbuf[mm_st].size : 0ull,
+                             dw, di,
+                             g_ui_aspect_on ? g_ui_aspect.sx : 1.0f,
+                             g_ui_aspect_on ? g_ui_aspect.sy : 1.0f,
+                             g_ui_aspect_on ? g_ui_aspect.cx : 0.0f,
+                             g_ui_aspect_on ? g_ui_aspect.cy : 0.0f);
     }
     uint32_t inst = dw ? (dw->instances > 1 ? (uint32_t)dw->instances : 1) : (di->instances > 1 ? (uint32_t)di->instances : 1);
     uint32_t base_inst = dw ? (uint32_t)dw->base_instance : (uint32_t)di->base_instance;

@@ -37,7 +37,7 @@ final class SettingsStore {
         edit.putBoolean(INITIALIZED, true).apply();
         writeEnv(context, settings);
     }
-    static boolean skipMenu(Context context) { return prefs(context).getBoolean(SKIP_MENU, false); }
+    static boolean skipMenu(Context context) { return prefs(context).getBoolean(SKIP_MENU, GameBuild.DIRECT_BOOT); }
     static void skipMenu(Context context, boolean skip) { prefs(context).edit().putBoolean(SKIP_MENU, skip).apply(); }
 
     static String locale() {
