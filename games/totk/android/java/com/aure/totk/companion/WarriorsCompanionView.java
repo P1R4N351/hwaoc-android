@@ -294,10 +294,11 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
 
     @Override protected void onDraw(Canvas canvas) {
         super.onDraw(canvas);
-        draw.drawAll(canvas, model, art.backdrop(), art.filter(), art.glyph(),
+        boolean moving = draw.drawAll(canvas, model, art.backdrop(), art.filter(), art.glyph(),
                 art.borderFrieze(), art.borderEdge(), art.borderSide(),
                 art.minimap(), art.objective(), art.leftHud(),
                 getWidth(), getHeight(), SystemClock.uptimeMillis());
+        if (moving) postInvalidateOnAnimation();
     }
 
     @Override public boolean performClick() { return super.performClick(); }
@@ -323,10 +324,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     }
 
     private boolean handleHeaderTap(float lx, float ly) {
-        if (ly > 92f) return false;
-        int hit = -1;
-        if (lx <= 200f) hit = WarriorsCompanionModel.TAB_TACTICAL;
-        else if (lx >= 1040f) hit = WarriorsCompanionModel.TAB_LEDGER;
+        int hit = WarriorsCompanionLayout.headerTabAt(lx, ly);
         if (hit < 0) return false;
         model.selectTab(hit);
         CompanionNative.warriorsMinimapEnable(hit == WarriorsCompanionModel.TAB_TACTICAL);
@@ -341,9 +339,8 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     }
 
     private boolean handleStatusTap(float lx, float ly) {
-        float endY = WarriorsCompanionDraw.ROW_Y0 + 7f * WarriorsCompanionDraw.ROW_STEP;
-        if (lx < 740f || lx > 1196f || ly < WarriorsCompanionDraw.ROW_Y0 || ly >= endY) return false;
-        int row = (int) ((ly - WarriorsCompanionDraw.ROW_Y0) / WarriorsCompanionDraw.ROW_STEP);
+        int row = WarriorsCompanionLayout.statusRowAt(lx, ly);
+        if (row < 0) return false;
         SharedPreferences sp = getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
         if (row == 0) { toggleCornerHud(sp); return true; }
         if (row == 1) { toggleStickLights(sp); return true; }

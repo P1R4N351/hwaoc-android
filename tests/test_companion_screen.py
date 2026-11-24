@@ -73,6 +73,7 @@ public class Bitmap {
     public void recycle() { }
     public int getWidth() { return 1; } public int getHeight() { return 1; } public boolean isRecycled() { return false; }
     public void copyPixelsFromBuffer(java.nio.Buffer src) { }
+    public void getPixels(int[] p, int off, int stride, int x, int y, int w, int h) { }
 }''',
     'android/graphics/Color.java': 'package android.graphics; public class Color { public static final int WHITE = -1; }',
     'android/graphics/ColorFilter.java': 'package android.graphics; public class ColorFilter { }',
@@ -494,7 +495,8 @@ class CompanionScreenTests(unittest.TestCase):
         """Both screens and the one CompanionContent, compiled with this game's generated GameBuild (with another
         companion value when given: the MIT page is chosen by no game today, but stays compiled and working)."""
         shared = [JAVA / n for n in ('CompanionScreen.java', 'CompanionState.java', 'DataSource.java', 'ItemActions.java', 'Motion.java',
-                                     'WarriorsCompanionModel.java', 'WarriorsCompanionDraw.java', 'WarriorsCompanionView.java',
+                                     'WarriorsCompanionModel.java', 'WarriorsCompanionLayout.java', 'WarriorsCompanionDraw.java',
+                                     'WarriorsCompanionView.java',
                                      'CompanionView.java', 'DuoSurfaceView.java', 'CompanionContent.java')]
         build = games.java(game)
         if companion:
@@ -572,6 +574,38 @@ class CompanionScreenTests(unittest.TestCase):
         sources = self.write('pump', {**view, 'com/aure/totk/companion/PumpProbe.java': PUMP_PRELUDE + pump + PUMP_TESTS})
         classes = self.build('pump', sources + [JAVA / n for n in ('CompanionScreen.java', 'CompanionState.java', 'DataSource.java')])
         self.assertIn('pass: companion shell pump', self.run_probe(classes, 'com.aure.totk.companion.PumpProbe'))
+
+
+class WarriorsLayoutMotion(unittest.TestCase):
+    """The Warriors companion's one layout and motion source (shared verbatim with the Age of Imprisonment port):
+    element rects in every live-element state stay inside the Pad frame and apart; live elements and the page switch
+    ease on frame time instead of snapping; per-frame size jitter is held; the view keeps drawing while anything moves."""
+
+    def test_layout_and_motion_suite(self):
+        javac, java = shutil.which('javac'), shutil.which('java')
+        if not javac or not java:
+            self.skipTest('a JDK is required')
+        layout = JAVA / 'WarriorsCompanionLayout.java'
+        self.assertNotIn('import android.', layout.read_text())
+        with tempfile.TemporaryDirectory(prefix='warriors-layout-') as tmp:
+            done = subprocess.run([javac, '--release', '17', '-Xlint:all', '-Werror', '-d', tmp, str(layout),
+                                   str(ROOT / 'tests/WarriorsCompanionLayoutTest.java')], capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            run = subprocess.run([java, '-cp', tmp, 'com.aure.totk.companion.WarriorsCompanionLayoutTest'],
+                                 capture_output=True, text=True, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stderr + run.stdout)
+            self.assertIn('WarriorsCompanionLayoutTest: PASS', run.stdout)
+
+    def test_draw_and_view_use_the_shared_layout(self):
+        draw = (JAVA / 'WarriorsCompanionDraw.java').read_text()
+        view = (JAVA / 'WarriorsCompanionView.java').read_text()
+        self.assertIn('scene.step(', draw)
+        self.assertNotIn('816f', draw)          # the minimap centre comes from the layout, not a literal
+        self.assertIn('if (moving) postInvalidateOnAnimation();', view)
+        self.assertIn('WarriorsCompanionLayout.statusRowAt(', view)
+        self.assertIn('WarriorsCompanionLayout.headerTabAt(', view)
+        self.assertIn('scanLeftHud(', draw)                 # left HUD is laid out by its content clusters
+        self.assertIn('c.drawBitmap(b, srcRect, dstF, imgPaint);', draw)
 
 
 class DuoTouchDefault(unittest.TestCase):
