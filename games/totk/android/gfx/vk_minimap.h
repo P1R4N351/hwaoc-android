@@ -323,6 +323,21 @@ static int vk_minimap_skip_draw(void) {
     return g_vk_mm.in_hud_pass && g_vk_mm.skip_cur_draw;
 }
 
+static int vk_hud_override_blend(
+    uint32_t blend_en, uint32_t *chmask_io, uint32_t src_rgb, uint32_t dst_rgb,
+    uint32_t eq_rgb, uint32_t *src_a_out, uint32_t *dst_a_out, uint32_t *eq_a_out) {
+    if (!(blend_en & 1u) || (*chmask_io & 0xfu) == 0u || (eq_rgb != 0u && eq_rgb != 1u)) return 0;
+    if ((src_rgb == 5u || src_rgb == 2u) && dst_rgb == 6u) {
+        *chmask_io |= 0x8u; *src_a_out = 2u; *dst_a_out = 6u; *eq_a_out = 1u;
+        return 1;
+    }
+    if ((src_rgb == 5u || src_rgb == 2u) && dst_rgb == 2u) {
+        *chmask_io |= 0x8u; *src_a_out = 1u; *dst_a_out = 2u; *eq_a_out = 1u;
+        return 1;
+    }
+    return 0;
+}
+
 static void vk_minimap_pass_begin(
     VkCommandBuffer cb, vk_tex *t, unsigned lv, unsigned l0, uint32_t w, uint32_t h,
     VkFormat att_fmt, VkRect2D area, VkImageView main_cview, VkImageLayout main_clayout,
@@ -1403,13 +1418,80 @@ static void vk_minimap_present(void) {
     g_vk_mm.prev_lhud_top = g_vk_mm.pass_lhud_top; g_vk_mm.pass_lhud_top = 0;
 }
 
+static _Atomic int g_vk_srgb_lut_ready;
+static float g_vk_srgb_to_lin[256];
+static float g_vk_lin_to_srgb[4097];
+
+static void vk_mm_ensure_srgb_lut(void) {
+    if (atomic_load_explicit(&g_vk_srgb_lut_ready, memory_order_acquire) == 2) return;
+    int expected = 0;
+    if (atomic_compare_exchange_strong(&g_vk_srgb_lut_ready, &expected, 1)) {
+        for (uint32_t u = 0u; u < 256u; u++) {
+            float x = (float)u * (1.0f / 255.0f);
+            g_vk_srgb_to_lin[u] = x <= 0.04045f ? x * (1.0f / 12.92f) : powf((x + 0.055f) / 1.055f, 2.4f);
+        }
+        for (uint32_t i = 0u; i <= 4096u; i++) {
+            float l = (float)i * (1.0f / 4096.0f);
+            g_vk_lin_to_srgb[i] = l <= 0.0031308f ? l * 12.92f : 1.055f * powf(l, 1.0f / 2.4f) - 0.055f;
+        }
+        atomic_store_explicit(&g_vk_srgb_lut_ready, 2, memory_order_release);
+        return;
+    }
+    for (int spin = 0; spin < 1000000; spin++) {
+        if (atomic_load_explicit(&g_vk_srgb_lut_ready, memory_order_acquire) == 2) return;
+    }
+}
+
+static float vk_mm_srgb_to_lin(uint8_t u) {
+    return g_vk_srgb_to_lin[u];
+}
+
+static float vk_mm_lin_to_srgb(float l) {
+    if (l <= 0.0f) return 0.0f;
+    if (l >= 1.0f) return 1.0f;
+    if (l <= 0.0031308f) return l * 12.92f;
+    int idx = (int)(l * 4096.0f + 0.5f);
+    if (idx < 0) idx = 0;
+    if (idx > 4096) idx = 4096;
+    return g_vk_lin_to_srgb[idx];
+}
+
+static void vk_mm_srgb_premul_pixel(uint8_t *r, uint8_t *g, uint8_t *b, uint8_t *a) {
+    uint8_t av = *a;
+    if (av == 0u) {
+        uint8_t mx = *r > *g ? (*r > *b ? *r : *b) : (*g > *b ? *g : *b);
+        *a = mx;
+        return;
+    }
+    if (av == 255u) return;
+    float lr = vk_mm_srgb_to_lin(*r), lg = vk_mm_srgb_to_lin(*g), lb = vk_mm_srgb_to_lin(*b);
+    float ml = lr > lg ? (lr > lb ? lr : lb) : (lg > lb ? lg : lb);
+    float af = (float)av * (1.0f / 255.0f);
+    if (ml > af * 1.05f + 0.006f) {
+        af = ml < 1.0f ? ml : 1.0f;
+        av = (uint8_t)lrintf(af * 255.0f);
+        *a = av;
+    }
+    float ch[3] = {lr, lg, lb};
+    uint8_t *dst[3] = {r, g, b};
+    for (int i = 0; i < 3; i++) {
+        float s = ch[i] / af;
+        if (s > 1.0f) s = 1.0f;
+        uint32_t v = (uint32_t)lrintf(vk_mm_lin_to_srgb(s) * (float)av);
+        *dst[i] = (uint8_t)(v > av ? av : v);
+    }
+}
+
 static void vk_mm_copy_rgba(uint8_t *dst, const uint8_t *src, uint32_t w, uint32_t h, VkFormat fmt, int alpha_mode) {
     int bgra = (fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_B8G8R8A8_SRGB);
+    int srgb = (fmt == VK_FORMAT_R8G8B8A8_SRGB || fmt == VK_FORMAT_B8G8R8A8_SRGB);
+    if (alpha_mode == 2 && srgb) vk_mm_ensure_srgb_lut();
     size_t n = (size_t)w * h;
     for (size_t i = 0; i < n; i++) {
         size_t o = i * 4u;
         uint8_t r = src[o + (bgra ? 2 : 0)], g = src[o + 1], b = src[o + (bgra ? 0 : 2)], a = src[o + 3];
         if (alpha_mode == 0) a = 255u;
+        else if (alpha_mode == 2 && srgb) vk_mm_srgb_premul_pixel(&r, &g, &b, &a);
         else if (alpha_mode == 2) {
             uint8_t mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
             if (a < mx) a = mx;

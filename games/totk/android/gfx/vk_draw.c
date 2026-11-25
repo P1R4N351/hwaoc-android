@@ -6579,6 +6579,28 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             vk_mm_trace_cur_draw(sh);
             return;
         }
+        _Static_assert(NVN_BLEND_FUNC_ZERO == 1 && NVN_BLEND_FUNC_ONE == 2
+            && NVN_BLEND_FUNC_SRC_ALPHA == 5 && NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA == 6
+            && NVN_BLEND_EQUATION_ADD == 1, "vk_hud_override_blend factors");
+        if (!g_load_pipeline && vk_minimap_on_hud_target() && sh[1]
+                && ((sh[1]->fout_mask | sh[1]->fout_span) == 0u || ((sh[1]->fout_mask | sh[1]->fout_span) & 1u))) {
+            chmask_st och = S.chmask;
+            blend_st ob0 = S.blend[0];
+            uint32_t sa = (uint32_t)S.blend[0].src_a, da = (uint32_t)S.blend[0].dst_a, ea = (uint32_t)S.blend[0].eq_a;
+            uint32_t cm = (uint32_t)(S.chmask.mask & 0xfu);
+            if (vk_hud_override_blend((uint32_t)S.color.blend_en, &cm,
+                    (uint32_t)S.blend[0].src_rgb, (uint32_t)S.blend[0].dst_rgb, (uint32_t)S.blend[0].eq_rgb,
+                    &sa, &da, &ea)) {
+                S.chmask.mask = (S.chmask.mask & ~0xfu) | cm;
+                S.blend[0].src_a = sa; S.blend[0].dst_a = da; S.blend[0].eq_a = ea;
+                g_pipe_dirty = 1;
+                VkPipeline hp = pipe_get(sh[0], sh[1], prim, layout);
+                S.chmask = och;
+                S.blend[0] = ob0;
+                g_pipe_dirty = 1;
+                if (hp && hp != PIPE_FAILED) p = hp;
+            }
+        }
     }
     if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_begin(cb, p, sh);
     if (R.secondary) g_record_draw = vk_record_draw_begin(p, layout);

@@ -485,6 +485,33 @@ int main(void) {
     test_wid_routing_and_stability();
     test_left_world_marker_stays();
     test_travel_safely_subtitle_stays();
+    {
+        uint32_t cm = 0x7u, sa = 2u, da = 1u, ea = 1u;
+        assert(vk_hud_override_blend(1u, &cm, 5u, 6u, 1u, &sa, &da, &ea) == 1);
+        assert(cm == 0xfu && sa == 2u && da == 6u && ea == 1u);
+        uint8_t px[4] = {7u, 7u, 7u, 166u}, out[4] = {0};
+        vk_mm_copy_rgba(out, px, 1u, 1u, VK_FORMAT_R8G8B8A8_UNORM, 2);
+        assert(out[3] == 166u);
+        cm = 0xfu; sa = 5u; da = 2u; ea = 0u;
+        assert(vk_hud_override_blend(1u, &cm, 5u, 2u, 0u, &sa, &da, &ea) == 1);
+        assert(cm == 0xfu && sa == 1u && da == 2u && ea == 1u);
+        uint8_t glow[4] = {200u, 120u, 0u, 0u};
+        vk_mm_copy_rgba(out, glow, 1u, 1u, VK_FORMAT_R8G8B8A8_UNORM, 2);
+        assert(out[3] == 200u);
+        cm = 0u; sa = 5u; da = 6u;
+        assert(vk_hud_override_blend(1u, &cm, 5u, 6u, 1u, &sa, &da, &ea) == 0 && cm == 0u);
+        cm = 0xfu;
+        assert(vk_hud_override_blend(0u, &cm, 5u, 6u, 1u, &sa, &da, &ea) == 0 && sa == 5u);
+        assert(vk_hud_override_blend(1u, &cm, 5u, 6u, 2u, &sa, &da, &ea) == 0 && sa == 5u);
+        uint8_t srgb_frosted[4] = {109u, 109u, 109u, 38u};
+        vk_mm_copy_rgba(out, srgb_frosted, 1u, 1u, VK_FORMAT_R8G8B8A8_SRGB, 2);
+        assert(out[0] >= 37u && out[0] <= 39u && out[1] == out[0] && out[2] == out[0] && out[3] == 38u);
+        uint8_t srgb_face[4] = {149u, 98u, 58u, 255u};
+        vk_mm_copy_rgba(out, srgb_face, 1u, 1u, VK_FORMAT_R8G8B8A8_SRGB, 2);
+        assert(out[0] == 149u && out[1] == 98u && out[2] == 58u && out[3] == 255u);
+        vk_mm_copy_rgba(out, glow, 1u, 1u, VK_FORMAT_R8G8B8A8_SRGB, 2);
+        assert(out[3] == 200u);
+    }
     puts("vk_minimap_c_regression: PASS");
     return 0;
 }
