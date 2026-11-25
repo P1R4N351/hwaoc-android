@@ -483,6 +483,47 @@ static void test_aoc_parallel_worker_submit(void) {
     unsetenv("TOTK_KTGL_TAG");
 }
 
+static void test_real_screenlayout_and_corpus_fixes(void) {
+    _Alignas(16) uint8_t real_sl[0x380] = {0};
+    uintptr_t vt = 0x20000ULL;
+    SynPane r_pane, d1, d2, mis_txt, boss_hp, bar_pic;
+    const void *rp = &r_pane;
+    memcpy(real_sl, &vt, sizeof vt);
+    memcpy(real_sl + KTGL_SL_OFF_ROOT_PANE, &rp, sizeof rp);
+    syn_init(&r_pane, "NULL_top", NULL, real_sl);
+    syn_init(&d1, "NULL_box", &r_pane, real_sl);
+    syn_init(&d2, "NULL_sub", &d1, real_sl);
+    syn_init(&mis_txt, "TEXT22_mission", &d2, real_sl);
+    syn_init(&boss_hp, "btl_gauge_hp_boss_unit", &r_pane, real_sl);
+    syn_init(&bar_pic, "PIC_bar", &r_pane, real_sl);
+    syn_add_child(&r_pane, &d1);
+    syn_add_child(&d1, &d2);
+    syn_add_child(&d2, &mis_txt);
+    syn_add_child(&r_pane, &boss_hp);
+    syn_add_child(&r_pane, &bar_pic);
+    assert(ktgl_classify_pane(&bar_pic, &g_tb) == KTGL_WID_OBJECTIVE);
+
+    SynPane gp1, gp2, gls, gac, bg_cmn;
+    syn_init(&gp1, "btl_parts_guide_action", NULL, NULL);
+    syn_init(&gp2, "btl_parts_guide_btn_action", NULL, NULL);
+    syn_init(&gls, "PIC_icon_linkstrike", NULL, NULL);
+    syn_init(&gac, "action_gacha_hint", NULL, NULL);
+    syn_init(&bg_cmn, "battle_parts_main_guide_cmn_action", NULL, NULL);
+    assert(ktgl_classify_pane(&gp1, &g_tb) == KTGL_WID_WORLD_MARKER);
+    assert(ktgl_classify_pane(&gp2, &g_tb) == KTGL_WID_WORLD_MARKER);
+    assert(ktgl_classify_pane(&gls, &g_tb) == KTGL_WID_WORLD_MARKER);
+    assert(ktgl_classify_pane(&gac, &g_tb) == KTGL_WID_WORLD_MARKER);
+    assert(ktgl_classify_pane(&bg_cmn, &g_tb) == KTGL_WID_BTN_GUIDE);
+
+    SynPane ally_sl, ally_sync, item_sl, item_win;
+    syn_init(&ally_sl, "btl_plt_player_other", NULL, NULL);
+    syn_init(&ally_sync, "btl_gauge_sync_00", &ally_sl, &ally_sl);
+    syn_init(&item_sl, "btl_win_base_carrying_item", NULL, NULL);
+    syn_init(&item_win, "special_ability_select_parts_win_item_info", &item_sl, &item_sl);
+    assert(ktgl_classify_pane(&ally_sync, &g_tb) == KTGL_WID_ALLIES);
+    assert(ktgl_classify_pane(&item_win, &g_tb) == KTGL_WID_ITEMS);
+}
+
 int main(void) {
     test_prot_none_guard();
     test_all_widget_classes();
@@ -494,6 +535,7 @@ int main(void) {
     test_combo_bg_and_structural_cache();
     test_aoc_snapshot_map_and_cur_pane_priority();
     test_aoc_parallel_worker_submit();
+    test_real_screenlayout_and_corpus_fixes();
     printf("ktgl_wid_classify: PASS\n");
     return 0;
 }
