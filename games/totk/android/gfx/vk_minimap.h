@@ -86,7 +86,7 @@ static struct {
     float obj_umin_x, obj_umin_y, obj_umax_x, obj_umax_y;
     float obj_icon_cx, obj_icon_core_w, obj_icon_cy, obj_pill_mn_x, obj_pill_cy;
     float cand_text_mn_x, cand_text_cy, learn_obj_icon_x, learn_obj_text_x, learn_obj_cy;
-    uint8_t cur_wid, cur_wid_bg, wid_dest[15];
+    uint8_t stale_wid, cur_wid, cur_wid_bg, wid_dest[15];
     int wid_init, skip_cur_draw, pass_lhud_tagged, pass_obj_tagged, pass_mm_tagged, pass_mm_square, mm_tbox_init;
     float mm_tbox[4];
 } g_vk_mm = {
@@ -1216,10 +1216,15 @@ static int vk_minimap_select_target(
                 && ((bw >= w * 0.90f && bh >= h * 0.90f)
                     || (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f))) {
             g_vk_mm.pass_opaque_fs = 1; g_vk_mm_tr.cls = 'F';
+            g_vk_mm.stale_wid = g_vk_mm.cur_wid;   /* an id set before the HUD starts is not a HUD widget's */
             return vk_mm_switch_target(cb, 0);
         }
     } else {
         g_vk_mm_tr.cls = 'b';
+    }
+    if (g_vk_mm.stale_wid) {
+        if (wid == g_vk_mm.stale_wid) wid = 0u;
+        else g_vk_mm.stale_wid = 0u;
     }
     uint8_t dest = wid ? vk_mm_wid_dest(wid) : KTGL_DEST_FALLBACK;
     if (dest != KTGL_DEST_FALLBACK) {
@@ -1416,6 +1421,7 @@ static void vk_minimap_present(void) {
     memcpy(g_vk_mm.wm_prev, g_vk_mm.wm_cur, sizeof g_vk_mm.wm_prev);
     g_vk_mm.nwm_prev = g_vk_mm.nwm_cur; g_vk_mm.nwm_cur = 0;
     g_vk_mm.prev_lhud_top = g_vk_mm.pass_lhud_top; g_vk_mm.pass_lhud_top = 0;
+    g_vk_mm.stale_wid = 0u;
 }
 
 static _Atomic int g_vk_srgb_lut_ready;
