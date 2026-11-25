@@ -34,7 +34,9 @@ Milestones M0–M7 are verified on `1.3.0` (`v327680`), as recorded in [games/hw
   `0` warm misses on the covered scenes.
 - Save management for the game's flat `svdt` save is wired (`SaveManager.FLAT_SAVE`).
 - The `AoC Native` APK flavours (`0.1.0-beta.1` release, `0.1.0-dev` debuggable) build with `tools/build_app.sh`, with procedural Calamity star-gear main-menu emblem (`b5bb6f3`), AYN handheld Controller style detection (`6e6a5c1`, staged upstream on `P1R4N351/totk-android:ayn-controller-style`), and Vulkan fast-path optimizations (Opts 45–60).
-- **Milestone M7 (Second Screen):** Clean-room MIT Warriors companion (`ktgl_companion.h`, shared with [AoI Native](https://github.com/P1R4N351/hwaoi-android) and [`P1R4N351/nx-second-screen` `v0.3.0`](https://github.com/P1R4N351/nx-second-screen/releases/tag/v0.3.0)) verified live on AYN Thor Display 4 (`1240x1080`).
+- **Milestone M7 (Second Screen):** on a dual-screen handheld the game's own HUD is drawn on the second screen and
+  removed from the first; see [Second screen](#second-screen). The code is shared with
+  [AoI Native](https://github.com/P1R4N351/hwaoi-android).
 
 What differs from Tears of the Kingdom in the runtime (heap split, memory reserve, NVN level, shader list, saves):
 [games/hwaoc/ANDROID.md](games/hwaoc/ANDROID.md).
@@ -68,15 +70,32 @@ save manager exports, imports and backs it up through `SaveManager.FLAT_SAVE`.
 
 ## Second screen
 
-**AoC Native** ships the converged clean-room **MIT Warriors Second-Screen Companion** (`ktgl_companion.h`, shared with
-[AoI Native](https://github.com/P1R4N351/hwaoi-android) and published standalone in
-[`P1R4N351/nx-second-screen` `v0.3.0`](https://github.com/P1R4N351/nx-second-screen/releases/tag/v0.3.0)). On dual-screen
-handhelds such as the AYN Thor (Display 4, `1240x1080`), it attaches a `FLAG_NOT_FOCUSABLE | FLAG_KEEP_SCREEN_ON`
-`Presentation` with four evenly-spaced tabs (`RADAR`, `ACTIONS`, `COMBOS`, `STATUS`), a 128-point inertial trail with
-8 tactical waypoint pins, fail-closed Sheikah Rune (`R`) / Rod (`L`) / party / combo chords, cutscene auto-dimming,
-AMOLED pixel-orbit burn-in protection, and Bifrost LED sync. The APK continues to exclude GPL-3.0 Eden Duo companion
-assets (`gpl_companion = false`; enforced by `apk/audit_apk.py`). Engine hook notes:
-[games/hwaoc/SECOND_SCREEN_NOTES.md](games/hwaoc/SECOND_SCREEN_NOTES.md).
+Status 2026-11-25. On a dual-screen handheld such as the AYN Thor (Display 4, `1240x1080`) the game's own HUD is drawn
+on the second screen and removed from the first. The Vulkan layer redirects the HUD's draws as they are recorded into
+an offscreen image ([games/totk/android/gfx/vk_minimap.h](games/totk/android/gfx/vk_minimap.h)); the companion
+(`WarriorsCompanion*.java`, MIT, shared with [AoI Native](https://github.com/P1R4N351/hwaoi-android)) reads it back and
+lays it out on a `FLAG_NOT_FOCUSABLE | FLAG_KEEP_SCREEN_ON` `Presentation` without taking gamepad focus from the first
+screen.
+
+- **Moved to the second screen:** the minimap as one module, the objective bar, hearts, gauges, d-pad and item icons,
+  ally pills, combo row, button guide and KO counter.
+- **Kept on the first screen:** dialogue and speech pop-ups, markers and text drawn over the 3D world, and every menu.
+- **Two tabs:** the live HUD, and a status page with frame-rate telemetry and settings (corner HUD, stick lights and
+  their brightness, cutscene dimming, minimap layer, asset rescan and clear). Cutscene dimming, the AMOLED pixel orbit
+  and Bifrost stick LEDs remain. The radar trail, waypoint pins, Sheikah Rune / Rod / party chords and the combo
+  sequencer of earlier builds are no longer part of the companion.
+- **How a draw is attributed:** by default with positional rules in `vk_minimap.h`, ported from AoI Native and covered
+  by a host regression ([tests/test_vk_minimap.py](tests/test_vk_minimap.py)). Per-widget tagging from the game's UI
+  tree ([games/totk/runtime/ktgl_ui_patch.h](games/totk/runtime/ktgl_ui_patch.h),
+  [games/totk/runtime/ktgl_wid_classify.h](games/totk/runtime/ktgl_wid_classify.h),
+  [tests/test_ktgl_wid.py](tests/test_ktgl_wid.py)) is in the tree and is still being brought up on the device;
+  `TOTK_KTGL_TAG=0` turns it off, `TOTK_KTGL_WID_DEST` overrides a widget's destination, and `TOTK_VK_MM_TRACE=<n>`
+  logs the class of every HUD draw.
+- **Not done:** per-element show/hide checkboxes for either screen; a recorded device trace for this game (the rules
+  were measured on Age of Imprisonment).
+
+The APK continues to exclude GPL-3.0 Eden Duo companion assets (`gpl_companion = false`; enforced by
+`apk/audit_apk.py`). Engine hook notes: [games/hwaoc/SECOND_SCREEN_NOTES.md](games/hwaoc/SECOND_SCREEN_NOTES.md).
 
 ## Known limitations
 

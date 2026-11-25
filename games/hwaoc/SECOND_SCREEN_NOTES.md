@@ -23,7 +23,8 @@ Running ledger of engine hooks, state structures, and candidate second-screen ti
 ## Converged Clean-Room Second-Screen Companion (`companion = "warriors"`, MIT)
 
 - **UI & Architecture:** `WarriorsCompanionModel` + `WarriorsCompanionDraw` + `WarriorsCompanionView` (`CompanionScreen`) render a converged `1240 × 1080` procedural Canvas companion shared line-for-line with `hwaoi-android` (*Age of Imprisonment*), skinned in **Sheikah Slate Guardian Blue (`#38BDF8`)** + **Calamity Brass (`#EAB308`)** with `Bifrost` `BOTW` (`sheikah-slate`) stick LEDs (`gpl_companion = false`, zero copyrighted game assets).
-- **4 Zero-Pause Tabs (`0..3`):**
+- **Superseded 2026-11-24 (perf72):** the companion now has two tabs, the game's own HUD redirected from the first screen and a status page; see the README, "Second screen". The four tabs below describe the earlier design and are kept as a record of the hooks.
+- **4 Zero-Pause Tabs (`0..3`), earlier design:**
   1. `TACTICAL`: Concentric battlefield radar (`40m / 80m / 160m`, North-Up / Heading-Up synced to `TOTK_DUO_MAP_ROTATE`, 128-pt inertial stick-vector trail via `NxCompanionTrail`, 8 tactical pins), mission stopwatch, and keep/objective counter.
   2. `COMMAND`: 4-slot party switcher (`D-Up/Right/Down/Left`), Sheikah Runes (`R+Y` Bombs, `R+X` Stasis, `R+B` Cryonis, `R+A` Magnesis), Elemental Rods & Heal (`L+Y/X/B/A`), and Lock-On / Special / Dodge / Abort triggers via 2-step `NxCompanionSeq` OR-merged safely in `runtime/input.c`.
   3. `GRIMOIRE`: `C1`–`C6` Musou combo string visualizer and 1-tap macro sequencer (aborts automatically on manual combat input, pause, or movie cutscene).
