@@ -1488,6 +1488,19 @@ static VkDescriptorBufferInfo g_load_geometry;
 static unsigned g_load_stream;
 static int g_load_override;
 static VkPipeline pipe_get(vk_shader *vs, vk_shader *fs, int prim, VkPipelineLayout layout);
+static uint64_t mm_first_fs_tex_serial(const vk_shader *fs) {
+    if (!fs) return 0u;
+    int n = fs->nb < 16 ? fs->nb : 16;
+    for (int i = 0; i < n; i++) {
+        const vk_bind *b = &fs->b[i];
+        if ((b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+                || b->reg < 0 || b->reg >= 128 || !S.tex[1][b->reg]) continue;
+        int want = b->target; vk_tex *x = NULL;
+        vk_tex_by_id((int)(S.tex[1][b->reg] & 0xfffff), &want, &x);
+        if (x) return vk_tex_serial(x);
+    }
+    return 0u;
+}
 static int load_cov_cover_ok(const float xy[6][2], unsigned count) {
     if (count == 3) {
         double area = ((double)xy[1][0] - xy[0][0]) * ((double)xy[2][1] - xy[0][1]) - ((double)xy[1][1] - xy[0][1]) * ((double)xy[2][0] - xy[0][0]);
@@ -6540,6 +6553,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
                 S.vbuf[ms].address, S.vbuf[ms].size
             };
         }
+        vk_minimap_note_draw_tex(mm_first_fs_tex_serial(sh[1]));
         if (vk_minimap_select_target(cb, &mmc, g_indirect.on, dw, di)) {
             g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; descriptor_unbind(); vk_stage_sig_invalidate(0x3fu);
         }
@@ -6600,6 +6614,8 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
                 vk_tex_by_id((int)(S.tex[1][b_->reg] & 0xfffff), &want_, &x_);
                 if (x_) { if (!t0_) t0_ = x_; nt_++; }
             }
+            vk_minimap_trace_blend((uint8_t)S.blend[0].src_rgb, (uint8_t)S.blend[0].dst_rgb,
+                (uint8_t)S.blend[0].eq_rgb, (uint8_t)S.blend[0].src_a, (uint8_t)S.blend[0].dst_a, (uint8_t)S.blend[0].eq_a);
             vk_minimap_trace_draw(sh[0] ? sh[0]->key : NULL, sh[1] ? sh[1]->key : NULL, t0_, nt_);
         }
     }
