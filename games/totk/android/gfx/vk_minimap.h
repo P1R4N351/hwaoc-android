@@ -86,6 +86,9 @@ static struct {
     float obj_umin_x, obj_umin_y, obj_umax_x, obj_umax_y;
     float obj_icon_cx, obj_icon_core_w, obj_icon_cy, obj_pill_mn_x, obj_pill_cy;
     float cand_text_mn_x, cand_text_cy, learn_obj_icon_x, learn_obj_text_x, learn_obj_cy;
+    uint8_t cur_wid, cur_wid_bg, wid_dest[15];
+    int wid_init, skip_cur_draw, pass_lhud_tagged, pass_obj_tagged, pass_mm_tagged, pass_mm_square, mm_tbox_init;
+    float mm_tbox[4];
 } g_vk_mm = {
     .mu = PTHREAD_MUTEX_INITIALIZER,
     .mm = { .slot_bytes = VK_MM_BUF_BYTES, .pending_slot = -1, .ready_slot = -1 },
@@ -94,7 +97,7 @@ static struct {
 };
 
 static struct {
-    int on, valid, hb; char cls; int32_t cnt; uint32_t stt, sref, blend, mask, seq; float mn[2], mx[2];
+    int on, valid, hb; char cls; uint8_t wid; int32_t cnt; uint32_t stt, sref, blend, mask, seq; float mn[2], mx[2];
     uint8_t b_srgb, b_drgb, b_op, b_sa, b_da, b_opa;
 } g_vk_mm_tr;
 
@@ -248,15 +251,88 @@ static vk_mm_rect vk_mm_lhud_box(uint32_t w, uint32_t h) {
     return (vk_mm_rect){0, 0, lw, lh};
 }
 
+#include "../../runtime/ktgl_wid_ids.h"
+
+static uint8_t vk_mm_default_wid_dest(uint8_t wid) {
+    if (wid == KTGL_WID_MINIMAP) return KTGL_DEST_MM;
+    if (wid == KTGL_WID_OBJECTIVE) return KTGL_DEST_OBJ;
+    if (wid == KTGL_WID_SPEECH || wid == KTGL_WID_WORLD_MARKER || wid == KTGL_WID_MENU) return KTGL_DEST_TOP;
+    if (wid >= KTGL_WID_HEARTS && wid < KTGL_WID_COUNT) return KTGL_DEST_LHUD;
+    return KTGL_DEST_FALLBACK;
+}
+
+static uint8_t vk_mm_parse_dest_val(const char *s, size_t n, uint8_t wid) {
+    if (n == 3u && !strncmp(s, "top", 3u)) return KTGL_DEST_TOP;
+    if (n == 4u && !strncmp(s, "hide", 4u)) return KTGL_DEST_HIDE;
+    if (n == 6u && !strncmp(s, "bottom", 6u)) {
+        uint8_t d = vk_mm_default_wid_dest(wid);
+        return (d == KTGL_DEST_TOP || d == KTGL_DEST_FALLBACK) ? KTGL_DEST_LHUD : d;
+    }
+    if (n == 2u && !strncmp(s, "mm", 2u)) return KTGL_DEST_MM;
+    if (n == 3u && !strncmp(s, "obj", 3u)) return KTGL_DEST_OBJ;
+    if (n == 4u && !strncmp(s, "lhud", 4u)) return KTGL_DEST_LHUD;
+    return vk_mm_default_wid_dest(wid);
+}
+
+static void vk_mm_wid_dest_init(void) {
+    if (g_vk_mm.wid_init) return;
+    for (uint8_t i = 0u; i < KTGL_WID_COUNT; i++) g_vk_mm.wid_dest[i] = vk_mm_default_wid_dest(i);
+    const char *e = getenv("TOTK_KTGL_WID_DEST");
+    const char *p = e;
+    for (int step = 0; p && *p && step < 64; step++) {
+        while (*p == ',' || *p == ' ' || *p == ';') p++;
+        if (!*p) break;
+        char *eq = NULL;
+        long id = strtol(p, &eq, 10);
+        if (!eq || *eq != '=' || id <= 0 || id >= KTGL_WID_COUNT) {
+            while (*p && *p != ',' && *p != ';') p++;
+            continue;
+        }
+        const char *vs = eq + 1;
+        size_t vl = 0u;
+        while (vs[vl] && vs[vl] != ',' && vs[vl] != ';' && vs[vl] != ' ') vl++;
+        g_vk_mm.wid_dest[(uint8_t)id] = vk_mm_parse_dest_val(vs, vl, (uint8_t)id);
+        p = vs + vl;
+    }
+    g_vk_mm.wid_init = 1;
+}
+
+static uint8_t vk_mm_wid_dest(uint8_t wid) {
+    vk_mm_wid_dest_init();
+    return wid < KTGL_WID_COUNT ? g_vk_mm.wid_dest[wid] : KTGL_DEST_FALLBACK;
+}
+
+static int vk_mm_is_center_reset(const float *mn, const float *mx, float w) {
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
+    return bw <= 2.5f && bh <= 2.5f && mx[0] < w * 0.55f;
+}
+
+static void vk_minimap_note_draw_wid(uint8_t wid) {
+    uint8_t base = wid & 0x7fu;
+    g_vk_mm.cur_wid = base < KTGL_WID_COUNT ? base : 0u;
+    g_vk_mm.cur_wid_bg = (wid & (uint8_t)KTGL_WID_FLAG_BG) != 0u && g_vk_mm.cur_wid != 0u;
+}
+
+static int vk_minimap_on_hud_target(void) {
+    return g_vk_mm.in_hud_pass && g_vk_mm.cur_hud;
+}
+
 static int vk_minimap_in_hud_pass(void) { return g_vk_mm.in_hud_pass; }
+
+static int vk_minimap_skip_draw(void) {
+    return g_vk_mm.in_hud_pass && g_vk_mm.skip_cur_draw;
+}
 
 static void vk_minimap_pass_begin(
     VkCommandBuffer cb, vk_tex *t, unsigned lv, unsigned l0, uint32_t w, uint32_t h,
     VkFormat att_fmt, VkRect2D area, VkImageView main_cview, VkImageLayout main_clayout,
     const VkRenderingAttachmentInfo *dp, const VkRenderingAttachmentInfo *sp,
     int load_c0, int ok) {
+    vk_mm_wid_dest_init();
     g_vk_mm.in_hud_pass = 0; g_vk_mm.cur_hud = 0; g_vk_mm.pass_hud_cleared = 0;
+    g_vk_mm.skip_cur_draw = 0;
     g_vk_mm.pass_opaque_fs = 0; g_vk_mm.pass_modal = 0; g_vk_mm.pass_dialog = 0;
+    g_vk_mm.pass_lhud_tagged = 0; g_vk_mm.pass_obj_tagged = 0; g_vk_mm.pass_mm_tagged = 0;
     g_vk_mm.ui_cand.img = VK_NULL_HANDLE; g_vk_mm.ui_cand.score = -1;
     if (!ok || !cb || !t || !V.dev || !vk_tex_image(t) || !main_cview || !sp || !sp->imageView) return;
     if (!atomic_load_explicit(&g_vk_mm.want_active, memory_order_acquire)) return;
@@ -269,7 +345,7 @@ static void vk_minimap_pass_begin(
     uint32_t fr = g_vk_mm.frame_counter;
     if (g_vk_mm.hud_cleared_frame == fr && g_vk_mm.hud_cleared_im == im) g_vk_mm.pass_hud_cleared = 1;
     if (g_vk_mm.hud_state_frame != fr || g_vk_mm.hud_state_im != im) {
-        g_vk_mm.pass_mm_hit = 0; g_vk_mm.pass_obj_hit = 0; g_vk_mm.obj_bounds_init = 0;
+        g_vk_mm.pass_mm_hit = 0; g_vk_mm.pass_mm_square = 0; g_vk_mm.mm_tbox_init = 0; g_vk_mm.pass_obj_hit = 0; g_vk_mm.obj_bounds_init = 0;
         g_vk_mm.pass_obj_icon = 0; g_vk_mm.pass_obj_pill = 0; g_vk_mm.pass_obj_text = 0; g_vk_mm.cand_obj_text = 0;
         g_vk_mm.obj_icon_cx = 0.f; g_vk_mm.obj_icon_core_w = 0.f;
         if (g_vk_mm.nwm_cur || g_vk_mm.pass_lhud_top) {
@@ -613,10 +689,26 @@ static void vk_mm_try_minimap(const float *mn, const float *mx) {
     if (x0 + (int32_t)side > (int32_t)g_vk_mm.pass_w) x0 = (int32_t)g_vk_mm.pass_w - (int32_t)side;
     if (y0 + (int32_t)side > (int32_t)g_vk_mm.pass_h) y0 = (int32_t)g_vk_mm.pass_h - (int32_t)side;
     g_vk_mm.hit_mm = (vk_mm_rect){x0, y0, side, side};
-    g_vk_mm.pass_mm_hit = 1; g_vk_mm.mm_open = 1;
+    g_vk_mm.pass_mm_hit = 1; g_vk_mm.pass_mm_square = 1; g_vk_mm.mm_open = 1;
     g_vk_mm.learn_mm_w = g_vk_mm.pass_w; g_vk_mm.learn_mm_h = g_vk_mm.pass_h;
     g_vk_mm.learn_mm_cx = (int32_t)lrintf(cx); g_vk_mm.learn_mm_cy = (int32_t)lrintf(cy);
     g_vk_mm.learn_mm_half = (int32_t)(side / 2u);
+}
+
+static void vk_mm_expand_obj_y(float h, int32_t *y0, int32_t *y1) {
+    if (!g_vk_mm.obj_bounds_init) return;
+    int32_t uy0 = (int32_t)floorf(g_vk_mm.obj_umin_y - h * 0.014f);
+    int32_t uy1 = (int32_t)ceilf(g_vk_mm.obj_umax_y + h * 0.014f);
+    if (uy0 < 0) uy0 = 0;
+    if (uy1 > (int32_t)g_vk_mm.pass_h) uy1 = (int32_t)g_vk_mm.pass_h;
+    if (uy0 < *y0) *y0 = uy0;
+    if (uy1 > *y1) *y1 = uy1;
+    int32_t max_h = (int32_t)(VK_OBJ_MAX_H & ~1u);
+    if (*y1 - *y0 <= max_h) return;
+    *y0 = (int32_t)floorf(g_vk_mm.obj_umin_y);
+    if (*y0 < 0) *y0 = 0;
+    *y1 = *y0 + max_h;
+    if (*y1 > (int32_t)g_vk_mm.pass_h) { *y1 = (int32_t)g_vk_mm.pass_h; *y0 = *y1 > max_h ? *y1 - max_h : 0; }
 }
 
 static void vk_mm_rebuild_obj_rect(void) {
@@ -632,6 +724,7 @@ static void vk_mm_rebuild_obj_rect(void) {
         y1 = (int32_t)g_vk_mm.pass_h;
         y0 = y1 > oh ? y1 - oh : 0;
     }
+    vk_mm_expand_obj_y(h, &y0, &y1);
     float xmn = 1e9f, xmx = -1e9f;
     if (g_vk_mm.obj_bounds_init) {
         xmn = g_vk_mm.obj_umin_x - h * 0.018f;
@@ -758,8 +851,7 @@ static int vk_mm_is_world_marker(const float *mn, const float *mx, int32_t cnt) 
                 && fabsf(cy - g_vk_mm.learn_obj_cy) <= h * 0.06f)) return 0;
     if (g_vk_mm.obj_ttl == 0u && !g_vk_mm.pass_obj_pill && mn[0] >= w * 0.48f) return 0;
     int square = fabsf(bw - bh) <= fmaxf(8.f, bw * 0.20f);
-    int ring = g_vk_mm.ring_tex ? (g_vk_mm.cur_tex == g_vk_mm.ring_tex && square && bw <= 170.f * s)
-                                 : (square && bw >= 80.f * s && bw <= 170.f * s);
+    int ring = g_vk_mm.ring_tex && g_vk_mm.cur_tex == g_vk_mm.ring_tex && square && bw <= 170.f * s;
     if (cnt == 12 && ring) {
         if (g_vk_mm.nwm_cur < 4) {
             float *r = g_vk_mm.wm_cur[g_vk_mm.nwm_cur++];
@@ -767,7 +859,7 @@ static int vk_mm_is_world_marker(const float *mn, const float *mx, int32_t cnt) 
         }
         return 1;
     }
-    if (cnt <= 6 && fabsf(bw - bh) <= fmaxf(6.f, bw * 0.12f) && bw >= 50.f * s && bw <= 90.f * s
+    if (cnt <= 6 && fabsf(bw - bh) <= fmaxf(6.f, bw * 0.12f) && bw >= 50.f * s && bw <= 200.f * s
             && (vk_mm_near_wm_centre(g_vk_mm.wm_cur, g_vk_mm.nwm_cur, cx, cy, 28.f * s)
                 || vk_mm_near_wm_centre(g_vk_mm.wm_prev, g_vk_mm.nwm_prev, cx, cy, 28.f * s))) return 1;
     return 0;
@@ -785,11 +877,12 @@ static int vk_mm_is_lhud_draw(const float *mn, const float *mx, int32_t cnt) {
     if (!(g_vk_mm.pass_lhud_top || g_vk_mm.prev_lhud_top)) return 0;
     if (mn[0] < -w * 0.05f || mn[0] > w * 0.22f || mx[0] > w * 0.28f || mn[1] < -16.f || mx[1] > h + 16.f) return 0;
     if (bw < 6.f || bw > w * 0.32f || bh < 6.f || bh > h * 0.42f) return 0;
-    if (mn[0] > w * 0.18f && bh > bw * 6.f) return 0;
+    if (mn[0] > w * 0.18f && bh > bw * 6.f && bh > h * 0.20f) return 0;
     if (mn[1] >= h * 0.20f && mx[1] <= h * 0.845f && cnt >= 30 && mn[0] > w * 0.08f) return 0;
     if (vk_mm_on_foreign(mn, mx)) return 0;
+    vk_mm_rect lb = vk_mm_lhud_box(g_vk_mm.pass_w, g_vk_mm.pass_h);
+    if (!g_vk_mm.pass_lhud_any || g_vk_mm.hit_lhud.w < lb.w) g_vk_mm.hit_lhud = lb;
     g_vk_mm.pass_lhud_any = 1;
-    g_vk_mm.hit_lhud = vk_mm_lhud_box(g_vk_mm.pass_w, g_vk_mm.pass_h);
     return 1;
 }
 
@@ -881,13 +974,13 @@ static void vk_minimap_trace_draw(const char *vsk, const char *fsk, vk_tex *t0, 
     (void)vsk; (void)fsk; (void)t0; (void)ntex;
     if (!g_vk_mm_tr.on || !g_vk_mm_tr.valid) return;
     g_vk_mm_tr.valid = 0;
-    LOGV("mm trace f%llu d%u: cls %c vs %.16s fs %.16s cnt %d st %u ref %u bl %u m %x b %d %.0f,%.0f %.0f,%.0f tex %ux%u l%u s%llu n%d bf %u,%u,%u/%u,%u,%u fmt %u",
+    LOGV("mm trace f%llu d%u: cls %c vs %.16s fs %.16s cnt %d st %u ref %u bl %u m %x b %d %.0f,%.0f %.0f,%.0f tex %ux%u l%u s%llu n%d bf %u,%u,%u/%u,%u,%u fmt %u wid %u",
          (unsigned long long)g_vk_mm.frame_counter, g_vk_mm_tr.seq++, g_vk_mm_tr.cls, vsk ? vsk : "-", fsk ? fsk : "-",
          g_vk_mm_tr.cnt, g_vk_mm_tr.stt, g_vk_mm_tr.sref, g_vk_mm_tr.blend, g_vk_mm_tr.mask, g_vk_mm_tr.hb,
          g_vk_mm_tr.mn[0], g_vk_mm_tr.mn[1], g_vk_mm_tr.mx[0], g_vk_mm_tr.mx[1],
          t0 ? vk_tex_width(t0, 0u) : 0u, t0 ? vk_tex_height(t0, 0u) : 0u, t0 ? vk_tex_levels(t0) : 0u,
          (unsigned long long)(t0 ? vk_tex_serial(t0) : 0u), ntex,
-         g_vk_mm_tr.b_srgb, g_vk_mm_tr.b_drgb, g_vk_mm_tr.b_op, g_vk_mm_tr.b_sa, g_vk_mm_tr.b_da, g_vk_mm_tr.b_opa, (unsigned)g_vk_mm.hud_fmt);
+         g_vk_mm_tr.b_srgb, g_vk_mm_tr.b_drgb, g_vk_mm_tr.b_op, g_vk_mm_tr.b_sa, g_vk_mm_tr.b_da, g_vk_mm_tr.b_opa, (unsigned)g_vk_mm.hud_fmt, (unsigned)g_vk_mm_tr.wid);
 }
 
 static void vk_mm_note_pass_overlays(float w, float h, const float *mn, const float *mx, uint32_t st, uint32_t bl, int32_t cnt) {
@@ -909,44 +1002,217 @@ static void vk_mm_note_pass_overlays(float w, float h, const float *mn, const fl
         g_vk_mm.pass_dialog = 1;
 }
 
-static int vk_minimap_select_target(
-    VkCommandBuffer cb, const vk_mm_draw_ctx *dc, int indirect, const p_draw *dw, const p_draw_idx *di) {
-    if (!g_vk_mm.in_hud_pass) return 0;
-    int32_t cnt = dw ? dw->count : (di ? di->count : 0);
-    g_vk_mm_tr.valid = 1; g_vk_mm_tr.hb = 0; g_vk_mm_tr.cls = 'x'; g_vk_mm_tr.cnt = cnt; g_vk_mm_tr.stt = dc->st;
-    g_vk_mm_tr.sref = 0u; g_vk_mm_tr.blend = dc->blend_en; g_vk_mm_tr.mask = dc->c0_mask;
-    if (indirect || dc->dt != 0u || dc->nattr < 1) return vk_mm_switch_target(cb, 0);
-    float mn[2] = {0}, mx[2] = {0};
-    g_vk_mm_tr.cls = 'b';
-    if (cnt < 3 || cnt > 4096 || !vk_mm_attr_xy_bounds(dc, dw, di, cnt, mn, mx)) return vk_mm_switch_target(cb, 0);
-    mn[0] = dc->acx + (mn[0] - dc->acx) * dc->ax; mx[0] = dc->acx + (mx[0] - dc->acx) * dc->ax;
-    mn[1] = dc->acy + (mn[1] - dc->acy) * dc->ay; mx[1] = dc->acy + (mx[1] - dc->acy) * dc->ay;
-    g_vk_mm_tr.hb = 1; g_vk_mm_tr.cls = '-';
-    g_vk_mm_tr.mn[0] = mn[0]; g_vk_mm_tr.mn[1] = mn[1]; g_vk_mm_tr.mx[0] = mx[0]; g_vk_mm_tr.mx[1] = mx[1];
-    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h, bw = mx[0] - mn[0], bh = mx[1] - mn[1];
-    if (dc->st == 0u && !dc->blend_en && cnt <= 6
-            && ((bw >= w * 0.90f && bh >= h * 0.90f)
-                || (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f))) {
-        g_vk_mm.pass_opaque_fs = 1; g_vk_mm_tr.cls = 'F'; return vk_mm_switch_target(cb, 0);
+static void vk_mm_grow_tagged_mm(const float *mn, const float *mx) {
+    float x0 = mn[0] > 0.f ? mn[0] : 0.f, y0 = mn[1] > 0.f ? mn[1] : 0.f;
+    float x1 = mx[0] < (float)g_vk_mm.pass_w ? mx[0] : (float)g_vk_mm.pass_w;
+    float y1 = mx[1] < (float)g_vk_mm.pass_h ? mx[1] : (float)g_vk_mm.pass_h;
+    if (x1 <= x0 || y1 <= y0) return;
+    float nx0 = g_vk_mm.mm_tbox_init && g_vk_mm.mm_tbox[0] < x0 ? g_vk_mm.mm_tbox[0] : x0;
+    float ny0 = g_vk_mm.mm_tbox_init && g_vk_mm.mm_tbox[1] < y0 ? g_vk_mm.mm_tbox[1] : y0;
+    float nx1 = g_vk_mm.mm_tbox_init && g_vk_mm.mm_tbox[2] > x1 ? g_vk_mm.mm_tbox[2] : x1;
+    float ny1 = g_vk_mm.mm_tbox_init && g_vk_mm.mm_tbox[3] > y1 ? g_vk_mm.mm_tbox[3] : y1;
+    if (nx1 - nx0 > (float)VK_MM_MAX_SIDE || ny1 - ny0 > (float)VK_MM_MAX_SIDE) return;
+    g_vk_mm.mm_tbox[0] = nx0; g_vk_mm.mm_tbox[1] = ny0;
+    g_vk_mm.mm_tbox[2] = nx1; g_vk_mm.mm_tbox[3] = ny1;
+    g_vk_mm.mm_tbox_init = 1;
+    int32_t rx0 = (int32_t)floorf(nx0), ry0 = (int32_t)floorf(ny0);
+    int32_t rx1 = (int32_t)ceilf(nx1), ry1 = (int32_t)ceilf(ny1);
+    int32_t rw = rx1 - rx0 < (int32_t)VK_MM_MIN_SIDE ? (int32_t)VK_MM_MIN_SIDE : rx1 - rx0;
+    int32_t rh = ry1 - ry0 < (int32_t)VK_MM_MIN_SIDE ? (int32_t)VK_MM_MIN_SIDE : ry1 - ry0;
+    if (rw > (int32_t)g_vk_mm.pass_w) rw = (int32_t)g_vk_mm.pass_w;
+    if (rh > (int32_t)g_vk_mm.pass_h) rh = (int32_t)g_vk_mm.pass_h;
+    if (rx0 + rw > (int32_t)g_vk_mm.pass_w) rx0 = (int32_t)g_vk_mm.pass_w - rw;
+    if (ry0 + rh > (int32_t)g_vk_mm.pass_h) ry0 = (int32_t)g_vk_mm.pass_h - rh;
+    g_vk_mm.hit_mm = (vk_mm_rect){rx0, ry0, (uint32_t)rw, (uint32_t)rh};
+    g_vk_mm.pass_mm_hit = 1;
+}
+
+static int vk_mm_tagged_mm(
+    VkCommandBuffer cb, int32_t cnt, uint32_t stt, uint32_t c0_mask,
+    int hb, const float *mn, const float *mx) {
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    int can_box = hb && !vk_mm_is_center_reset(mn, mx, w)
+        && (mx[0] - mn[0]) <= w * 0.30f && (mx[1] - mn[1]) <= h * 0.50f && mx[0] >= w * 0.45f;
+    if (stt != 0u && (c0_mask & 0xfu) == 0u) {
+        g_vk_mm_tr.cls = 'S';
+        if (can_box) vk_mm_try_minimap(mn, mx);
+        return 0;
     }
-    if ((dc->c0_mask & 0xfu) != 0u) vk_mm_note_pass_overlays(w, h, mn, mx, dc->st, dc->blend_en, cnt);
-    if (dc->st != 0u && (dc->c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { g_vk_mm_tr.cls = 'S'; vk_mm_try_minimap(mn, mx); return 0; }
-    if (g_vk_mm.pass_opaque_fs || g_vk_mm.pass_modal || (dc->c0_mask & 0xfu) == 0u) { g_vk_mm_tr.cls = 'M'; return vk_mm_switch_target(cb, 0); }
+    if (!hb) {
+        g_vk_mm_tr.cls = '-';
+        return vk_mm_switch_target(cb, 0);
+    }
+    if (vk_mm_is_center_reset(mn, mx, w) || mx[0] < w * 0.45f) return -1;
+    if (can_box) {
+        vk_mm_try_minimap(mn, mx);
+        float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
+        if (stt == 0u && cnt == 12 && g_vk_mm.cur_tex && !g_vk_mm.ring_tex
+                && fabsf(bw - bh) <= fmaxf(8.f, bw * 0.20f) && bw <= 170.f * (h / 1080.f)) {
+            g_vk_mm.ring_tex = g_vk_mm.cur_tex;
+        }
+    }
+    if (!g_vk_mm.pass_mm_hit && g_vk_mm.hit_mm.w >= VK_MM_MIN_SIDE
+            && g_vk_mm.learn_mm_w == g_vk_mm.pass_w && g_vk_mm.learn_mm_h == g_vk_mm.pass_h) {
+        g_vk_mm.pass_mm_hit = 1; g_vk_mm.pass_mm_square = 1;
+    }
+    int in_corner = mx[0] >= w * 0.65f && mx[1] >= h * 0.55f;
+    if (!g_vk_mm.pass_mm_square && in_corner) vk_mm_grow_tagged_mm(mn, mx);
+    const vk_mm_rect *mr = &g_vk_mm.hit_mm;
+    int in_mm = g_vk_mm.pass_mm_hit && mr->w >= VK_MM_MIN_SIDE
+        && mx[0] >= (float)mr->x - 16.f && mn[0] <= (float)(mr->x + (int32_t)mr->w) + 16.f
+        && mx[1] >= (float)mr->y - 16.f && mn[1] <= (float)(mr->y + (int32_t)mr->h) + 16.f;
+    if (!in_mm) return -1;
+    g_vk_mm_tr.cls = 'm';
+    g_vk_mm.mm_open = 1;
+    g_vk_mm.pass_mm_tagged = 1;
+    return vk_mm_switch_target(cb, 1);
+}
+
+static int vk_mm_tagged_obj(
+    VkCommandBuffer cb, int32_t cnt, int hb, const float *mn, const float *mx) {
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    if (!hb) {
+        g_vk_mm_tr.cls = '-';
+        return vk_mm_switch_target(cb, 0);
+    }
+    if (vk_mm_is_center_reset(mn, mx, w) || mx[0] < w * 0.45f || mn[0] < w * 0.30f) return -1;
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1], cy = (mn[1] + mx[1]) * 0.5f;
+    if (cnt == 12 && fabsf(bw - bh) <= fmaxf(8.f, bw * 0.20f) && bw <= h * 0.26f) {
+        if (bw <= 170.f * (h / 1080.f) && g_vk_mm.cur_tex) g_vk_mm.ring_tex = g_vk_mm.cur_tex;
+        if (!g_vk_mm.pass_obj_hit && g_vk_mm.hit_obj.w < 64u) return -1;
+        g_vk_mm_tr.cls = 'o'; g_vk_mm.pass_obj_hit = 1; g_vk_mm.pass_obj_tagged = 1;
+        return vk_mm_switch_target(cb, 1);
+    }
+    float ux0 = g_vk_mm.obj_bounds_init && g_vk_mm.obj_umin_x < mn[0] ? g_vk_mm.obj_umin_x : mn[0];
+    float ux1 = g_vk_mm.obj_bounds_init && g_vk_mm.obj_umax_x > mx[0] ? g_vk_mm.obj_umax_x : mx[0];
+    float uy0 = g_vk_mm.obj_bounds_init && g_vk_mm.obj_umin_y < mn[1] ? g_vk_mm.obj_umin_y : mn[1];
+    float uy1 = g_vk_mm.obj_bounds_init && g_vk_mm.obj_umax_y > mx[1] ? g_vk_mm.obj_umax_y : mx[1];
+    if ((ux1 - ux0) > (float)(VK_OBJ_MAX_W - 32u) || (uy1 - uy0) > (float)(VK_OBJ_MAX_H - 24u)) return -1;
+    g_vk_mm_tr.cls = 'o';
+    g_vk_mm.pass_obj_hit = 1;
+    g_vk_mm.pass_obj_tagged = 1;
+    if (!vk_mm_obj_pill(mn, mx, cnt) && !vk_mm_obj_text(mn, mx, cnt)
+            && !(cnt <= 6 && vk_mm_obj_icon(mn, mx, cnt))) {
+        if (!g_vk_mm.pass_obj_pill && bw >= w * 0.12f && cnt <= 36) {
+            g_vk_mm.pass_obj_pill = 1; g_vk_mm.obj_pill_mn_x = mn[0]; g_vk_mm.obj_pill_cy = cy;
+        } else if (!g_vk_mm.obj_bounds_init && !g_vk_mm.pass_obj_pill) {
+            g_vk_mm.obj_pill_mn_x = mn[0]; g_vk_mm.obj_pill_cy = cy;
+        }
+        vk_mm_add_bar_bounds(mn, mx);
+    }
+    return vk_mm_switch_target(cb, 1);
+}
+
+static int vk_mm_tagged_lhud(VkCommandBuffer cb, int hb, const float *mn, const float *mx) {
+    float w = (float)g_vk_mm.pass_w;
+    vk_mm_rect base = vk_mm_lhud_box(g_vk_mm.pass_w, g_vk_mm.pass_h);
+    uint32_t w_cap = g_vk_mm.pass_w & ~3u;
+    uint32_t max_w = VK_LHUD_MAX_W < w_cap ? VK_LHUD_MAX_W : w_cap;
+    if (!hb) {
+        g_vk_mm_tr.cls = '-';
+        return vk_mm_switch_target(cb, 0);
+    }
+    if (mn[0] < -w * 0.30f || mn[0] >= (float)max_w || mx[0] > (float)max_w
+            || mx[1] < 0.f || mn[1] >= (float)base.h) return -1;
+    if (g_vk_mm.cur_wid_bg) {
+        g_vk_mm_tr.cls = 'l';
+        g_vk_mm.skip_cur_draw = 1;
+        return 0;
+    }
+    g_vk_mm_tr.cls = 'l';
+    if (!g_vk_mm.pass_lhud_any || g_vk_mm.hit_lhud.w < base.w) g_vk_mm.hit_lhud = base;
+    g_vk_mm.pass_lhud_any = 1;
+    g_vk_mm.pass_lhud_top = 1;
+    g_vk_mm.pass_lhud_tagged = 1;
+    int32_t ce = mx[0] > 0.f ? (int32_t)ceilf(mx[0]) : 0;
+    uint32_t need = ((uint32_t)ce + 7u) & ~3u;
+    if (need > max_w) need = max_w;
+    if (need > g_vk_mm.hit_lhud.w) g_vk_mm.hit_lhud.w = need;
+    g_vk_mm.hit_lhud.h = base.h;
+    return vk_mm_switch_target(cb, 1);
+}
+
+static int vk_mm_select_tagged(
+    VkCommandBuffer cb, uint8_t wid, uint8_t dest, int32_t cnt, uint32_t stt,
+    uint32_t c0_mask, uint32_t blend_en, int hb, const float *mn, const float *mx) {
+    if (dest == KTGL_DEST_TOP) {
+        if (hb && (c0_mask & 0xfu) != 0u && wid == KTGL_WID_MENU) {
+            vk_mm_note_pass_overlays((float)g_vk_mm.pass_w, (float)g_vk_mm.pass_h, mn, mx, stt, blend_en, cnt);
+        }
+        g_vk_mm_tr.cls = g_vk_mm.pass_modal ? 'M' : '-';
+        return vk_mm_switch_target(cb, 0);
+    }
+    if (dest == KTGL_DEST_HIDE) {
+        g_vk_mm_tr.cls = 'h';
+        g_vk_mm.skip_cur_draw = 1;
+        return 0;
+    }
+    if (dest == KTGL_DEST_MM) return vk_mm_tagged_mm(cb, cnt, stt, c0_mask, hb, mn, mx);
+    if (dest == KTGL_DEST_OBJ) return vk_mm_tagged_obj(cb, cnt, hb, mn, mx);
+    return vk_mm_tagged_lhud(cb, hb, mn, mx);
+}
+
+static int vk_mm_select_fallback(
+    VkCommandBuffer cb, int32_t cnt, uint32_t stt, uint32_t c0_mask, uint32_t blend_en,
+    const float *mn, const float *mx) {
+    float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
+    float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
+    if ((c0_mask & 0xfu) != 0u) vk_mm_note_pass_overlays(w, h, mn, mx, stt, blend_en, cnt);
+    if (stt != 0u && (c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { g_vk_mm_tr.cls = 'S'; vk_mm_try_minimap(mn, mx); return 0; }
+    if (g_vk_mm.pass_opaque_fs || g_vk_mm.pass_modal || (c0_mask & 0xfu) == 0u) { g_vk_mm_tr.cls = 'M'; return vk_mm_switch_target(cb, 0); }
     int prev_small = g_vk_mm.last_small;
     float pq[4] = { g_vk_mm.last_q[0], g_vk_mm.last_q[1], g_vk_mm.last_q[2], g_vk_mm.last_q[3] };
-    g_vk_mm.last_small = dc->st == 0u && cnt <= 6 && bw <= 8.f && bh <= 8.f;
+    g_vk_mm.last_small = stt == 0u && cnt <= 6 && bw <= 8.f && bh <= 8.f;
     g_vk_mm.last_q[0] = mn[0]; g_vk_mm.last_q[1] = mn[1]; g_vk_mm.last_q[2] = mx[0]; g_vk_mm.last_q[3] = mx[1];
-    if (!g_vk_mm.pass_mm_hit && dc->st == 0u && dc->blend_en && cnt <= 6 && prev_small
+    if (!g_vk_mm.pass_mm_hit && stt == 0u && blend_en && cnt <= 6 && prev_small
             && pq[0] >= mn[0] && pq[2] <= mx[0] && pq[1] >= mn[1] && pq[3] <= mx[1]) vk_mm_try_minimap(mn, mx);
-    int want = vk_mm_is_mm_draw(mn, mx, dc->st, cnt);
+    int want = vk_mm_is_mm_draw(mn, mx, stt, cnt);
+    if (want && stt == 0u && cnt == 12 && g_vk_mm.cur_tex && !g_vk_mm.ring_tex
+            && fabsf(bw - bh) <= fmaxf(8.f, bw * 0.20f) && bw <= 170.f * (h / 1080.f)) g_vk_mm.ring_tex = g_vk_mm.cur_tex;
     if (!want && g_vk_mm.last_small && !g_vk_mm.pass_mm_hit && g_vk_mm.mm_ttl > 0u
             && vk_mm_in_mm_box((mn[0] + mx[0]) * 0.5f, (mn[1] + mx[1]) * 0.5f)) want = 1;
     if (want) g_vk_mm_tr.cls = 'm';
-    int wm = !want && dc->blend_en && vk_mm_is_world_marker(mn, mx, cnt);
+    int wm = !want && blend_en && vk_mm_is_world_marker(mn, mx, cnt);
     if (!want && !wm) { want = vk_mm_is_lhud_draw(mn, mx, cnt); if (want) g_vk_mm_tr.cls = 'l'; }
-    if (!want && !wm && dc->blend_en) { want = vk_mm_is_obj_draw(mn, mx, cnt); if (want) g_vk_mm_tr.cls = 'o'; }
+    if (!want && !wm && blend_en) { want = vk_mm_is_obj_draw(mn, mx, cnt); if (want) g_vk_mm_tr.cls = 'o'; }
     if (!want) vk_mm_note_foreign(mn, mx, cnt);
     return vk_mm_switch_target(cb, want);
+}
+
+static int vk_minimap_select_target(
+    VkCommandBuffer cb, const vk_mm_draw_ctx *dc, int indirect, const p_draw *dw, const p_draw_idx *di) {
+    g_vk_mm.skip_cur_draw = 0;
+    if (!g_vk_mm.in_hud_pass) return 0;
+    uint8_t wid = g_vk_mm.cur_wid;
+    int32_t cnt = dw ? dw->count : (di ? di->count : 0);
+    g_vk_mm_tr.valid = 1; g_vk_mm_tr.hb = 0; g_vk_mm_tr.cls = 'x'; g_vk_mm_tr.wid = wid;
+    g_vk_mm_tr.cnt = cnt; g_vk_mm_tr.stt = dc->st;
+    g_vk_mm_tr.sref = 0u; g_vk_mm_tr.blend = dc->blend_en; g_vk_mm_tr.mask = dc->c0_mask;
+    if (indirect || dc->dt != 0u || dc->nattr < 1) return vk_mm_switch_target(cb, 0);
+    float mn[2] = {0}, mx[2] = {0};
+    int hb = cnt >= 3 && cnt <= 4096 && vk_mm_attr_xy_bounds(dc, dw, di, cnt, mn, mx);
+    if (hb) {
+        mn[0] = dc->acx + (mn[0] - dc->acx) * dc->ax; mx[0] = dc->acx + (mx[0] - dc->acx) * dc->ax;
+        mn[1] = dc->acy + (mn[1] - dc->acy) * dc->ay; mx[1] = dc->acy + (mx[1] - dc->acy) * dc->ay;
+        float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h, bw = mx[0] - mn[0], bh = mx[1] - mn[1];
+        g_vk_mm_tr.hb = 1; g_vk_mm_tr.cls = '-';
+        g_vk_mm_tr.mn[0] = mn[0]; g_vk_mm_tr.mn[1] = mn[1]; g_vk_mm_tr.mx[0] = mx[0]; g_vk_mm_tr.mx[1] = mx[1];
+        if (dc->st == 0u && !dc->blend_en && cnt <= 6
+                && ((bw >= w * 0.90f && bh >= h * 0.90f)
+                    || (mn[0] <= -0.95f && mx[0] >= 0.95f && mn[1] <= -0.95f && mx[1] >= 0.95f))) {
+            g_vk_mm.pass_opaque_fs = 1; g_vk_mm_tr.cls = 'F';
+            return vk_mm_switch_target(cb, 0);
+        }
+    } else {
+        g_vk_mm_tr.cls = 'b';
+    }
+    uint8_t dest = wid ? vk_mm_wid_dest(wid) : KTGL_DEST_FALLBACK;
+    if (dest != KTGL_DEST_FALLBACK) {
+        int rc = vk_mm_select_tagged(cb, wid, dest, cnt, dc->st, dc->c0_mask, dc->blend_en, hb, mn, mx);
+        if (rc >= 0) return rc;
+    }
+    if (!hb) return vk_mm_switch_target(cb, 0);
+    return vk_mm_select_fallback(cb, cnt, dc->st, dc->c0_mask, dc->blend_en, mn, mx);
 }
 
 static int vk_minimap_want_ui_tex(void) {
@@ -1049,8 +1315,9 @@ static void vk_mm_stage_ui_tex(VkCommandBuffer cb) {
 static void vk_minimap_pass_end(VkCommandBuffer cb, vk_tex *t, uint64_t serial) {
     int was = g_vk_mm.in_hud_pass, cleared = g_vk_mm.pass_hud_cleared;
     int mh = g_vk_mm.pass_mm_hit, oh = g_vk_mm.pass_obj_hit, op = g_vk_mm.pass_opaque_fs, md = g_vk_mm.pass_modal;
-    int lh = (!op && !md && !g_vk_mm.pass_dialog && g_vk_mm.pass_lhud_any
-        && g_vk_mm.pass_lhud_top && g_vk_mm.hit_lhud.w >= 64u && g_vk_mm.hit_lhud.h >= 64u);
+    int lh = (!op && g_vk_mm.hit_lhud.w >= 64u && g_vk_mm.hit_lhud.h >= 64u
+        && (g_vk_mm.pass_lhud_tagged
+            || (!md && !g_vk_mm.pass_dialog && g_vk_mm.pass_lhud_any && g_vk_mm.pass_lhud_top)));
     float oicx = g_vk_mm.obj_icon_cx;
     int obj_pair = (!op && !md && g_vk_mm.cand_obj_text && g_vk_mm.pass_obj_icon
         && fabsf(g_vk_mm.cand_text_cy - g_vk_mm.obj_icon_cy) <= (float)g_vk_mm.pass_h * 0.055f
@@ -1075,6 +1342,7 @@ static void vk_minimap_pass_end(VkCommandBuffer cb, vk_tex *t, uint64_t serial) 
         g_vk_mm.saw_mm_frame = 1; g_vk_mm.frame_got_mm = fr; g_vk_mm.saved_hit_img = im;
     }
     if (oh) {
+        if (g_vk_mm.hit_obj.w < 64u && g_vk_mm.prev_hit_obj.w >= 64u) g_vk_mm.hit_obj = g_vk_mm.prev_hit_obj;
         g_vk_mm.prev_hit_obj = g_vk_mm.hit_obj;
         vk_mm_stream_stage(&g_vk_mm.obj, copy_cb, &g_vk_mm.hit_obj);
         g_vk_mm.frame_got_obj = fr; g_vk_mm.saved_hit_img = im;

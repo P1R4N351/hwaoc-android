@@ -735,6 +735,7 @@ typedef struct {
     uint8_t tex_nz_ready;
     uint32_t img_nz[6];
     uint8_t img_nz_ready;
+    uint8_t ui_wid;
 } vk_state;
 extern vk_state S;
 int vk_prog_predict(const vk_state *state, vk_shader *out[6]);   /* borrowed ready variants only; no loads or active-state/memo changes */

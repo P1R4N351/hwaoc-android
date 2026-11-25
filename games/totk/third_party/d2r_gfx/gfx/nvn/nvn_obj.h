@@ -68,7 +68,8 @@ FITS(win_t, NVNwindow);
 
 // Command records live in host memory; finished copies are owned by guest control memory.
 typedef struct {
-    uint32_t magic, recording;
+    uint32_t magic;
+    uint8_t recording, last_wid, _pad_cmd[2];
     uint8_t *cur;
     uint64_t guest_flags;                // +0x10: NVN 55 inline code writes the dirty flag here
     uint8_t *end;
@@ -114,13 +115,17 @@ enum {
     OP_BIND_PROGRAM, OP_BIND_STATE, OP_BIND_VATTR, OP_BIND_VSTREAM, OP_BIND_VBUF,
     OP_BIND_UBO, OP_BIND_SSBO, OP_BIND_TEX, OP_BIND_SAMP,
     OP_STENCIL, OP_POLY_OFFSET, OP_DRAW, OP_DRAW_IDX, OP_DISPATCH, OP_BARRIER,
-    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_COPY_IMAGE_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_DEPTH_CLAMP, OP_RENDER_ENABLE, OP_RASTER_DISCARD, OP_RENDER_COND, OP_ALPHA_REF, OP_DRAW_INDIRECT, OP_DRAW_IDX_INDIRECT, OP_COUNT_
+    OP_SET_TEX_POOL, OP_SET_SAMP_POOL, OP_COPY_B2T, OP_COPY_STRIDE, OP_COPY_IMAGE_STRIDE, OP_BLEND_COLOR, OP_COPY_T2B, OP_BIND_IMG, OP_COPY_T2T, OP_RESET_COUNTER, OP_CLEAR_TEX, OP_DEPTH_CLAMP, OP_RENDER_ENABLE, OP_RASTER_DISCARD, OP_RENDER_COND, OP_ALPHA_REF, OP_DRAW_INDIRECT, OP_DRAW_IDX_INDIRECT, OP_UI_TAG, OP_COUNT_
 };
 // 载荷（紧跟 op_hdr）
 // Payload (immediately follows op_hdr)
 typedef struct { int32_t n; const tex_t *color[8]; view_t cview[8]; uint8_t has_cview[8]; const tex_t *depth; view_t dview; uint8_t has_dview; } p_set_rt;
 typedef struct { int32_t index, mask; float rgba[4]; } p_clear_color;
 typedef struct { float value; } p_alpha_ref;
+typedef struct { uint32_t wid, pad; } p_ui_tag;
+void totk_nvn_enable_wid(void);
+void totk_nvn_set_wid(uint8_t w);
+uint8_t totk_nvn_cur_wid(void);
 #ifdef GAME_BOTW
 /* The same texture level / layer attached at more than one colour slot: only the first slot is attached (botw.md; the
    finding and fix come from nxnative, MIT, github.com/seedds/nxnative, rt_dup_slot). Breath of the Wild's G-buffer passes

@@ -12,6 +12,7 @@
 #include "fs_host.h"
 #include "movie_host.h"
 #include "hwaoc_companion.h"
+#include "ktgl_ui_patch.h"
 #include <pthread.h>
 
 enum {
@@ -75,6 +76,20 @@ void runtime_game_patches(Module *m) {
     if (runtime_duo_main) runtime_duo_main(m);
 #endif
     patch_ktsl_heap(m);
+    const char *ktgl_env = getenv("TOTK_KTGL_TAG");
+    if (ktgl_env && !strcmp(ktgl_env, "0")) {
+        fprintf(stderr, "[hwaoc] KTGL UI tag off (TOTK_KTGL_TAG=0)\n");
+        return;
+    }
+    uint8_t bid[32] = {0};
+    if (mod_ips_build_id(m, bid) && !memcmp(bid, K_130_BUILD_ID, sizeof K_130_BUILD_ID)) {
+        uint64_t mend = m->key_off ? m->key_off : m->size;
+        if (ktgl_aoc_patch_raw(m->base, m->text_end, m->ro_off, m->data_off, mend) == 1) {
+            fprintf(stderr, "[hwaoc] KTGL UI widget tagger enabled (24 hooks)\n");
+        } else {
+            fprintf(stderr, "[hwaoc] KTGL UI widget tagger skipped (site/slack mismatch)\n");
+        }
+    }
 }
 
 

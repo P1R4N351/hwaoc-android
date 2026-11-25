@@ -290,6 +290,7 @@ public final class WarriorsCompanionDraw {
         WarriorsCompanionLayout.ClusterHold h = scene.clusters;
         for (int i = 0; i < WarriorsCompanionLayout.MAX_CLUSTERS; i++) {
             WarriorsCompanionLayout.Slot s = scene.hudParts[i];
+            if (!h.live(i) && h.overlapsLive(i)) continue;
             float a = alpha * s.alpha(now);
             if (a <= VIS_EPS) continue;
             srcRect.set(Math.round(h.left(i)), Math.round(h.top(i)),

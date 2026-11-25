@@ -4495,6 +4495,7 @@ static void pipe_predict_maybe(const uint8_t *next) {
             case OP_RENDER_ENABLE: PP_NEED(p_flag); predicted.render_disabled = !((const p_flag *)a)->value; break;
             case OP_RASTER_DISCARD: PP_NEED(p_flag); predicted.raster_discard = ((const p_flag *)a)->value; break;
             case OP_ALPHA_REF: PP_NEED(p_alpha_ref); break; /* reference bytes are not a pipeline input */
+            case OP_UI_TAG: PP_NEED(p_ui_tag); break;
             case OP_SET_RT:
                 PP_NEED(p_set_rt);
                 if (!rt_same(&predicted.rt, a)) goto predicted_done;
@@ -6389,6 +6390,22 @@ static void split_pass_check(vk_shader *const sh[6], int canvas_transfer) {
     vk_end_rendering_at(VK_PASS_END_SPLIT, n);
     g_split_submit = 1; g_split_cut = 1; g_split_count++;
 }
+static void vk_mm_trace_cur_draw(vk_shader * const *sh) {
+    if (!g_vk_mm_tr.on || !g_vk_mm_tr.valid) return;
+    vk_tex *t0_ = NULL; int nt_ = 0;
+    int n_ = sh[1] ? (sh[1]->nb < 16 ? sh[1]->nb : 16) : 0;
+    for (int i_ = 0; i_ < n_; i_++) {
+        const vk_bind *b_ = &sh[1]->b[i_];
+        if ((b_->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b_->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+                || b_->reg < 0 || b_->reg >= 128 || !S.tex[1][b_->reg]) continue;
+        int want_ = b_->target; vk_tex *x_ = NULL;
+        vk_tex_by_id((int)(S.tex[1][b_->reg] & 0xfffff), &want_, &x_);
+        if (x_) { if (!t0_) t0_ = x_; nt_++; }
+    }
+    vk_minimap_trace_blend((uint8_t)S.blend[0].src_rgb, (uint8_t)S.blend[0].dst_rgb,
+        (uint8_t)S.blend[0].eq_rgb, (uint8_t)S.blend[0].src_a, (uint8_t)S.blend[0].dst_a, (uint8_t)S.blend[0].eq_a);
+    vk_minimap_trace_draw(sh[0] ? sh[0]->key : NULL, sh[1] ? sh[1]->key : NULL, t0_, nt_);
+}
 static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
     g_load_override = 0;
     int prim = dw ? dw->prim : di->prim;
@@ -6554,8 +6571,13 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
             };
         }
         vk_minimap_note_draw_tex(mm_first_fs_tex_serial(sh[1]));
+        vk_minimap_note_draw_wid(S.ui_wid);
         if (vk_minimap_select_target(cb, &mmc, g_indirect.on, dw, di)) {
             g_bound_pipe = VK_NULL_HANDLE; g_dyn_dirty = 1; descriptor_unbind(); vk_stage_sig_invalidate(0x3fu);
+        }
+        if (vk_minimap_skip_draw()) {
+            vk_mm_trace_cur_draw(sh);
+            return;
         }
     }
     if (vk_gpuprof_pipeline_on) vk_gpuprof_pipeline_begin(cb, p, sh);
@@ -6603,21 +6625,7 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
                 if (x_) vk_minimap_note_fs_tex(x_, S.ds.dt);
             }
         }
-        if (g_vk_mm_tr.on && g_vk_mm_tr.valid) {
-            vk_tex *t0_ = NULL; int nt_ = 0;
-            int n_ = sh[1] ? (sh[1]->nb < 16 ? sh[1]->nb : 16) : 0;
-            for (int i_ = 0; i_ < n_; i_++) {
-                const vk_bind *b_ = &sh[1]->b[i_];
-                if ((b_->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b_->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
-                        || b_->reg < 0 || b_->reg >= 128 || !S.tex[1][b_->reg]) continue;
-                int want_ = b_->target; vk_tex *x_ = NULL;
-                vk_tex_by_id((int)(S.tex[1][b_->reg] & 0xfffff), &want_, &x_);
-                if (x_) { if (!t0_) t0_ = x_; nt_++; }
-            }
-            vk_minimap_trace_blend((uint8_t)S.blend[0].src_rgb, (uint8_t)S.blend[0].dst_rgb,
-                (uint8_t)S.blend[0].eq_rgb, (uint8_t)S.blend[0].src_a, (uint8_t)S.blend[0].dst_a, (uint8_t)S.blend[0].eq_a);
-            vk_minimap_trace_draw(sh[0] ? sh[0]->key : NULL, sh[1] ? sh[1]->key : NULL, t0_, nt_);
-        }
+        vk_mm_trace_cur_draw(sh);
     }
     uint32_t inst = dw ? (dw->instances > 1 ? (uint32_t)dw->instances : 1) : (di->instances > 1 ? (uint32_t)di->instances : 1);
     uint32_t base_inst = dw ? (uint32_t)dw->base_instance : (uint32_t)di->base_instance;
@@ -7441,6 +7449,7 @@ void vk_draw_exec(uint32_t op, const void *a) {
             break;
         case OP_RESET_COUNTER: { uint64_t t; memcpy(&t, a, 8); if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { g_samples_cum = 0; vk_occlusion_reset(); } break; }
         case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: break;
+        case OP_UI_TAG: S.ui_wid = (uint8_t)((const p_ui_tag *)a)->wid; break;
         default: break;
     }
 }

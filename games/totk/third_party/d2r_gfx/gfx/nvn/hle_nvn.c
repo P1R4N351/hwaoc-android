@@ -1069,10 +1069,16 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
    BindVertexAttribState 1+n words, BindVertexStreamState 16+n words, BindVertexBuffer 6 words each (address + limit). */
 static void hw_fix(cmd_t *o, size_t bytes) { o->hw_used += bytes; o->hw_used -= o->last_rec; o->last_rec = bytes; }
 static int reclog_limit(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RECLOG"); v = e ? atoi(e) : 0; } return v; }
+static _Atomic int g_totk_wid_active;
+static __thread uint8_t t_totk_cur_wid;
+void totk_nvn_enable_wid(void) { atomic_store_explicit(&g_totk_wid_active, 1, memory_order_release); }
+void totk_nvn_set_wid(uint8_t w) { t_totk_cur_wid = w; }
+uint8_t totk_nvn_cur_wid(void) { return t_totk_cur_wid; }
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     cmd_t *o = CB(c);
     if (o->recording) { LOG("【红】BeginRecording 重入"); seg_release_calls(o); }
     o->recording = 1; o->cur = o->seg;   /* the previous recording was copied at EndRecording */
+    o->last_wid = 0xffu;
 #ifdef GAME_BOTW
     cb_seen_set(o);
 #endif
@@ -1502,6 +1508,7 @@ NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcom
 #else
     for (int i = 0; i < n; i++) inline_recording(c, h[i]);
 #endif
+    CB(c)->last_wid = 0xffu;
 }
 NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
     if (cmdlog_env()) for (int i = 0; i < n; i++) LOG("[cmd] CallCommands cb=%p handle=%#llx", (void *)c, (unsigned long long)h[i]);
@@ -1511,6 +1518,7 @@ NVN(nvnCommandBufferCallCommands, void, NVNcommandBuffer *c, int n, const NVNcom
 #else
     for (int i = 0; i < n; i++) inline_recording(c, h[i]);
 #endif
+    CB(c)->last_wid = 0xffu;
 }
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
     (void)loc; (void)flags;
@@ -1558,6 +1566,15 @@ static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
     return p + 8;
 }
 #define REC(c, OP, T) ((T *)rec((c), (OP), sizeof(T)))
+static inline void rec_ui_tag(NVNcommandBuffer *c) {
+    if (!atomic_load_explicit(&g_totk_wid_active, memory_order_relaxed)) return;
+    cmd_t *o = CB(c); uint8_t w = t_totk_cur_wid;
+    if (o->last_wid == w) return;
+    o->last_wid = w;
+    *REC(c, OP_UI_TAG, p_ui_tag) = (p_ui_tag){w, 0u};
+    hw_fix(o, 0);
+}
+
 // 带数组的绑定记录按实际个数分配：前缀字段 + n 个元素（回放端只读前 n 个）。原先按最大个数定长记（绑顶点缓冲 272 字节、绑贴图 / 采样器 280 字节，
 // 实际常只有 1–2 个），空尾占每帧命令字节的四到五成；88 级法师的高级属性页每帧录 12.5 MB，把游戏自己的命令内存池（约每帧 105 段 × 128 KB）用空
 // Binding records with arrays are allocated by the actual count: prefix fields + n elements (the replay side reads only the first n). Previously they were recorded at fixed length for the maximum count (bind vertex buffers 272 bytes, bind textures / samplers 280 bytes,
@@ -2317,25 +2334,31 @@ NVN(nvnCommandBufferSetStencilRef, void, NVNcommandBuffer *c, NVNface f, int v) 
 NVN(nvnCommandBufferSetPolygonOffsetClamp, void, NVNcommandBuffer *c, float fa, float un, float cl) {
     *REC(c, OP_POLY_OFFSET, p_poly_offset) = (p_poly_offset){fa, un, cl};
 }
-NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n) { *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n, 0, 1}; }
+NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n) { rec_ui_tag(c); *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n, 0, 1}; }
 NVN(nvnCommandBufferDrawArraysInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n, int bi, int inst) {
     if (inst <= 0) return;   // NVN: zero instances draw nothing
+    rec_ui_tag(c);
     *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n, bi, inst};
 }
 NVN(nvnCommandBufferDrawElements, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib) {
+    rec_ui_tag(c);
     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, 0, 0, 1, ib}; hw_fix(CB(c), 48);
 }
 NVN(nvnCommandBufferDrawElementsBaseVertex, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib, int bv) {
+    rec_ui_tag(c);
     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, 0, 1, ib}; hw_fix(CB(c), 44);
 }
 NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
     int bv, int bi, int inst) {
+    rec_ui_tag(c);
     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, bi, inst, ib}; hw_fix(CB(c), 44);   /* assumed: same 6-parameter draw macro as the base-vertex form (unverified) */
 }
 NVN(nvnCommandBufferDrawArraysIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNbufferAddress buf) {
+    rec_ui_tag(c);
     *REC(c, OP_DRAW_INDIRECT, p_draw_indirect) = (p_draw_indirect){pr, buf}; hw_fix(CB(c), 24);
 }
 NVN(nvnCommandBufferDrawElementsIndirect, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, NVNbufferAddress ib, NVNbufferAddress buf) {
+    rec_ui_tag(c);
     *REC(c, OP_DRAW_IDX_INDIRECT, p_draw_idx_indirect) = (p_draw_idx_indirect){pr, it, ib, buf}; hw_fix(CB(c), 32);
 }
 NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, int z) {

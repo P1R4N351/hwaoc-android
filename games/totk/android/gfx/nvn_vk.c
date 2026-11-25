@@ -26,7 +26,7 @@
 #include "vk_post_fast.h"
 #include "vk_subcap_fast.h"
 #include "vk_res_samp_fast.h"
-_Static_assert(OP_COUNT_ == 47 && OP_DRAW_IDX == 26, "OP_* enum layout");
+_Static_assert(OP_COUNT_ == 48 && OP_DRAW_IDX == 26, "OP_* enum layout");
 static int subcap_fast_nvn_on(void) { static int off = -1; if (off < 0) off = vk_off("subcapfast"); return !off && totk_vk_subcap_fast_on(); }
 static int img_fast_nvn_on(void) { static int off = -1; if (off < 0) off = vk_off("imgfast"); return !off && totk_vk_img_fast_on(); }
 static int ktglmemo_nvn_on(void) { static int on = -1; if (on < 0) on = !vk_off("ktglmemo"); return on; }
@@ -235,7 +235,8 @@ static const totk_xlate_op_spec_t k_xlate_specs[OP_COUNT_] = {
     [OP_RENDER_COND] = {(uint16_t)sizeof(p_render_cond), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_render_cond, addr), 8, 0, 0},
     [OP_ALPHA_REF] = {(uint16_t)sizeof(p_alpha_ref), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0},
     [OP_DRAW_INDIRECT] = {(uint16_t)sizeof(p_draw_indirect), 0, TOTK_XL_FIXED1, 0, 1, 0, (uint16_t)offsetof(p_draw_indirect, buf), 8, 0, 0},
-    [OP_DRAW_IDX_INDIRECT] = {(uint16_t)sizeof(p_draw_idx_indirect), 0, TOTK_XL_FIXED2, 0, 1, 0, (uint16_t)offsetof(p_draw_idx_indirect, ibuf), 8, (uint16_t)offsetof(p_draw_idx_indirect, buf), 8}
+    [OP_DRAW_IDX_INDIRECT] = {(uint16_t)sizeof(p_draw_idx_indirect), 0, TOTK_XL_FIXED2, 0, 1, 0, (uint16_t)offsetof(p_draw_idx_indirect, ibuf), 8, (uint16_t)offsetof(p_draw_idx_indirect, buf), 8},
+    [OP_UI_TAG] = {(uint16_t)sizeof(p_ui_tag), 0, TOTK_XL_NONE, 0, 1, 0, 0, 0, 0, 0}
 };
 static int xlate_address_fields_slow_misc(unsigned op, size_t size) {
     switch (op) {
@@ -243,6 +244,7 @@ static int xlate_address_fields_slow_misc(unsigned op, size_t size) {
         case OP_CLEAR_COLOR: return size < sizeof(p_clear_color) ? -1 : 0;
         case OP_CLEAR_DS: return size < sizeof(p_clear_ds) ? -1 : 0;
         case OP_ALPHA_REF: return size < sizeof(p_alpha_ref) ? -1 : 0;
+        case OP_UI_TAG: return size < sizeof(p_ui_tag) ? -1 : 0;
         case OP_SCISSOR: return size < sizeof(p_scissor) ? -1 : 0;
         case OP_DEPTH_RANGE: return size < sizeof(p_depth_range) ? -1 : 0;
         case OP_BIND_STATE: return size < sizeof(p_bind_state) ? -1 : 0;
