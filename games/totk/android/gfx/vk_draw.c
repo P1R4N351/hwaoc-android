@@ -6589,6 +6589,19 @@ static void draw_inner(const p_draw *dw, const p_draw_idx *di) {
                 if (x_) vk_minimap_note_fs_tex(x_, S.ds.dt);
             }
         }
+        if (g_vk_mm_tr.on && g_vk_mm_tr.valid) {
+            vk_tex *t0_ = NULL; int nt_ = 0;
+            int n_ = sh[1] ? (sh[1]->nb < 16 ? sh[1]->nb : 16) : 0;
+            for (int i_ = 0; i_ < n_; i_++) {
+                const vk_bind *b_ = &sh[1]->b[i_];
+                if ((b_->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b_->dtype != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE)
+                        || b_->reg < 0 || b_->reg >= 128 || !S.tex[1][b_->reg]) continue;
+                int want_ = b_->target; vk_tex *x_ = NULL;
+                vk_tex_by_id((int)(S.tex[1][b_->reg] & 0xfffff), &want_, &x_);
+                if (x_) { if (!t0_) t0_ = x_; nt_++; }
+            }
+            vk_minimap_trace_draw(sh[0] ? sh[0]->key : NULL, sh[1] ? sh[1]->key : NULL, t0_, nt_);
+        }
     }
     uint32_t inst = dw ? (dw->instances > 1 ? (uint32_t)dw->instances : 1) : (di->instances > 1 ? (uint32_t)di->instances : 1);
     uint32_t base_inst = dw ? (uint32_t)dw->base_instance : (uint32_t)di->base_instance;

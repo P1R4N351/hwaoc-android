@@ -26,7 +26,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     private static final long POLL_MS = 50L;
     private static final long DEV_STAT_MS = 1000L;
     private static final int MINIMAP_MAX_BYTES = 768 * 768 * 4;
-    private static final int OBJ_MAX_BYTES = 1152 * 224 * 4;
+    private static final int OBJ_MAX_BYTES = 1152 * 288 * 4;
     private static final int LHUD_MAX_BYTES = 640 * 1440 * 4;
     private static final String PREFS = "warriors_companion";
 
@@ -120,6 +120,9 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             }
             minimapBmp.copyPixelsFromBuffer(ByteBuffer.wrap(minimapBytes, 0, rw * rh * 4));
             art.setMinimap(minimapBmp);
+        } else if (rw <= 0 || rh <= 0) {
+            minimapMeta[2] = 0;
+            art.setMinimap(null);
         }
         pollNativeObjective();
         pollNativeLeftHud();
@@ -134,7 +137,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             art.setObjective(null);
             return;
         }
-        if (got == 1 && ow > 0 && ow <= 1152 && oh > 0 && oh <= 224 && ow * oh * 4 <= objBytes.length) {
+        if (got == 1 && ow > 0 && ow <= 1152 && oh > 0 && oh <= 288 && ow * oh * 4 <= objBytes.length) {
             art.setObjective(cropObjective(objBytes, ow, oh));
         }
     }
@@ -158,21 +161,12 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     }
 
     private Bitmap cropObjective(byte[] rgba, int ow, int oh) {
-        int xMin = Math.min(ow - 1, 96), rightmost = xMin - 1;
-        for (int x = ow - 1; x >= xMin && rightmost < xMin; x--) {
-            for (int y = 0; y < oh; y += 2) {
-                int idx = (y * ow + x) * 4;
-                if ((rgba[idx + 3] & 0xFF) > 32 && ((rgba[idx] & 0xFF) > 28
-                        || (rgba[idx + 1] & 0xFF) > 28 || (rgba[idx + 2] & 0xFF) > 28)) { rightmost = x; break; }
-            }
+        if (objBmp == null || objBmp.getWidth() != ow || objBmp.getHeight() != oh) {
+            objBmp = Bitmap.createBitmap(ow, oh, Bitmap.Config.ARGB_8888);
         }
-        int cw = Math.min(ow, Math.max(Math.min(ow, 160), (rightmost + 40) & ~3));
-        if (objBmp == null || objBmp.getWidth() != cw || objBmp.getHeight() != oh) {
-            objBmp = Bitmap.createBitmap(cw, oh, Bitmap.Config.ARGB_8888);
-        }
-        int rowBytes = cw * 4, srcStride = ow * 4;
-        for (int y = 0; y < oh; y++) softenObjectiveRow(rgba, y * srcStride, objCropBytes, y * rowBytes, cw, y, oh);
-        objBmp.copyPixelsFromBuffer(ByteBuffer.wrap(objCropBytes, 0, cw * oh * 4));
+        int rowBytes = ow * 4;
+        for (int y = 0; y < oh; y++) softenObjectiveRow(rgba, y * rowBytes, objCropBytes, y * rowBytes, ow, y, oh);
+        objBmp.copyPixelsFromBuffer(ByteBuffer.wrap(objCropBytes, 0, ow * oh * 4));
         return objBmp;
     }
 
@@ -185,7 +179,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             int r = src[si] & 0xFF, g = src[si + 1] & 0xFF, b = src[si + 2] & 0xFF;
             int mx = Math.max(r, Math.max(g, b));
             int na = mx < 24 ? ((a * 112) >> 8) : a;
-            int fx = x < 16 ? (x * 16) : (x >= cw - 28 ? ((cw - 1 - x) * 255 / 27) : 255);
+            int fx = x < 16 ? (x * 16) : 255;
             int edge = Math.min(fx, fy);
             if (edge < 255) na = (na * edge) >> 8;
             if (na < a) { r = (r * na) / a; g = (g * na) / a; b = (b * na) / a; }
