@@ -585,6 +585,27 @@ static void test_aoc_depth5_btn_guide_and_snap_hash(void) {
     free(sm);
 }
 
+static void test_snap_map_rr_eviction(void) {
+    KtglSnapMap *sm = calloc(1u, sizeof *sm);
+    assert(sm != NULL);
+    ktgl_snap_reset(sm);
+    static const uint64_t rr_keys[16] = {
+        0x666aULL, 0x7178ULL, 0xccd4ULL, 0xd7bdULL,
+        0xe5ccULL, 0x15b0cULL, 0x1af7aULL, 0x1db8fULL,
+        0x20decULL, 0x2b18aULL, 0x2df24ULL, 0x33fe6ULL,
+        0x59a0bULL, 0x629ceULL, 0x64567ULL, 0x70c52ULL,
+    };
+    for (size_t i = 0; i < 16u; i++) {
+        const void *k = (const void *)(uintptr_t)(rr_keys[i] << 4);
+        ktgl_snap_put(sm, k, (uint8_t)((i % 14u) + 1u));
+    }
+    for (size_t i = 8u; i < 16u; i++) {
+        const void *k = (const void *)(uintptr_t)(rr_keys[i] << 4);
+        assert(ktgl_snap_get(sm, k) == (int)((i % 14u) + 1u));
+    }
+    free(sm);
+}
+
 int main(void) {
     test_prot_none_guard();
     test_all_widget_classes();
@@ -598,6 +619,7 @@ int main(void) {
     test_aoc_parallel_worker_submit();
     test_real_screenlayout_and_corpus_fixes();
     test_aoc_depth5_btn_guide_and_snap_hash();
+    test_snap_map_rr_eviction();
     printf("ktgl_wid_classify: PASS\n");
     return 0;
 }

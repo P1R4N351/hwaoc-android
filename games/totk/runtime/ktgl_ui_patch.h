@@ -118,6 +118,14 @@ static inline int aoc_emit_mov_x(uint8_t *b, KtglAocEmit *e, uint8_t rd, uint8_t
     return aoc_emit_w(b, e, 0xaa0003e0u | (src << 16) | (rd & 31u));
 }
 
+static inline int aoc_emit_arg_x(uint8_t *b, KtglAocEmit *e, uint8_t rd, uint8_t src) {
+    if (src >= 9u && src <= 11u) {
+        uint32_t off8 = (uint32_t)(src - 9u);
+        return aoc_emit_w(b, e, 0xf94003e0u | (off8 << 10) | (rd & 31u));
+    }
+    return aoc_emit_mov_x(b, e, rd, src);
+}
+
 static inline int aoc_emit_mov64(uint8_t *b, KtglAocEmit *e, uint8_t rd, uint64_t val) {
     uint32_t r = rd & 31u;
     const uint32_t w[4] = {
@@ -166,9 +174,9 @@ static inline int aoc_emit_site_stub(
     uint64_t stub_off = e->cur;
     if (s->post_old && !aoc_emit_w(b, e, s->old_insn)) return 0;
     if (!aoc_emit_seq(b, e, push48, 4u)) return 0;
-    if (!aoc_emit_mov_x(b, e, 9u, s->r0)) return 0;
-    if (!aoc_emit_mov_x(b, e, 10u, s->r1)) return 0;
-    if (!aoc_emit_mov_x(b, e, 11u, s->r2)) return 0;
+    if (!aoc_emit_arg_x(b, e, 9u, s->r0)) return 0;
+    if (!aoc_emit_arg_x(b, e, 10u, s->r1)) return 0;
+    if (!aoc_emit_arg_x(b, e, 11u, s->r2)) return 0;
     if (!aoc_emit_mov64(b, e, 16u, (uint64_t)hook_va)) return 0;
     if (!aoc_emit_mov64(b, e, 17u, (uint64_t)e->bridge_va)) return 0;
     if (!aoc_emit_w(b, e, 0xd63f0220u)) return 0;
