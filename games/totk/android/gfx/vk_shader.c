@@ -32,6 +32,7 @@
 #include "vk_spv_fast.h"
 #include "vk_subgroup.h"
 #include "vk_tbuf_spv.h"
+#include "vk_depth_spv.h"
 #include "vk_position.h"
 #include "vk_int_fold.h"
 #include "vk_varyings.h"
@@ -602,6 +603,20 @@ static variant_list *variants_of(const char *key);
    the slot got the all-zero dummy: skinning palettes and per-batch tables read zeros. The variant's deps name those slots
    (tex:<slot>=buffer): retype them to texel buffers (vk_tbuf_spv.h) and relabel the reflection to match.
    TOTK_VK_TBUF_RETYPE=0: off, as before. A module outside the admitted shape is left as it was, and says so. */
+/* A seed translated with depth_minus_w for a game that selects NEAR_IS_ZERO (the Age of Calamity seed builders pass true
+   unconditionally; the game calls nvnDeviceSetDepthMode with NEAR_IS_ZERO) ends every vertex shader with z = (z + w) / 2.
+   Shaders translated at run time follow the game's mode and have no such ending, so they land behind every seed shader's
+   depth. When the game's mode is NEAR_IS_ZERO that ending is made the identity (vk_depth_spv.h). A module without it is left
+   alone, so a correctly built seed costs one scan. TOTK_VK_STRIP_MINUS_W=0 turns this off. */
+static void shader_strip_minus_w(const char *variant, char *spv, size_t spv_len) {
+    static int on = -1; static _Atomic int n_done, n_refused;
+    if (on < 0) { const char *e = getenv("TOTK_VK_STRIP_MINUS_W"); on = !(e && !strcmp(e, "0")); }
+    if (!on || !totk_depth_near_minus_w || totk_depth_near_minus_w()) return;
+    int rc = vk_spirv_strip_minus_w((uint32_t *)spv, spv_len / 4);
+    if (rc == 1) { int n = atomic_fetch_add(&n_done, 1) + 1;
+        if (n <= 4 || !(n & (n - 1))) LOGV("shader %.16s: clip-depth conversion for NEAR_IS_MINUS_W removed (the game selected NEAR_IS_ZERO); %d so far", variant, n); }
+    else if (rc < 0 && atomic_fetch_add(&n_refused, 1) < 8) RED(8, "shader %.16s: a clip-depth conversion was found but not in the one form that can be removed", variant);
+}
 static void shader_retype_tbuf(vk_shader *sh, const char *variant, char **spv_p, size_t *spv_len_p) {
     static int on = -1;
     if (on < 0) { const char *e = getenv("TOTK_VK_TBUF_RETYPE"); on = !(e && !strcmp(e, "0")); }
@@ -645,6 +660,7 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     sh = calloc(1, sizeof *sh); memcpy(sh->key, key.variant, sizeof sh->key); sh->early_tests = key.early_tests & 1; sh->alpha_func = key.early_tests >> 1; sh->spv_bytes = spv_len;
     shader_parse_vk_refl(sh, txt, vk_len); free(txt);
     shader_retype_tbuf(sh, variant, &spv, &spv_len);
+    shader_strip_minus_w(variant, spv, spv_len);
     shader_classify_meta(sh, variant, (const uint32_t *)spv, spv_len / 4);
     if (!shader_rewrite_stage_spv(sh, variant, &spv, &spv_len)) return shader_fail_cleanup(spv, sh);
     VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = spv_len, .pCode = (const uint32_t *)spv};
