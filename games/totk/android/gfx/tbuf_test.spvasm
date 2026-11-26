@@ -1,0 +1,46 @@
+; Hand-written fixture for vk_tbuf_spv.h: two sampled 2D images read with texelFetch(ivec2(7, 0), 0), summed into a
+; storage block. No game shader code.
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main"
+               OpExecutionMode %main LocalSize 1 1 1
+               OpDecorate %ta DescriptorSet 0
+               OpDecorate %ta Binding 1
+               OpDecorate %tb DescriptorSet 0
+               OpDecorate %tb Binding 2
+               OpDecorate %blk Block
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %out DescriptorSet 0
+               OpDecorate %out Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %int = OpTypeInt 32 1
+      %float = OpTypeFloat 32
+         %v4 = OpTypeVector %float 4
+        %iv2 = OpTypeVector %int 2
+        %img = OpTypeImage %float 2D 0 0 0 1 Unknown
+       %simg = OpTypeSampledImage %img
+      %psimg = OpTypePointer UniformConstant %simg
+         %ta = OpVariable %psimg UniformConstant
+         %tb = OpVariable %psimg UniformConstant
+        %blk = OpTypeStruct %v4
+       %pblk = OpTypePointer StorageBuffer %blk
+        %out = OpVariable %pblk StorageBuffer
+        %pv4 = OpTypePointer StorageBuffer %v4
+         %c0 = OpConstant %int 0
+         %c7 = OpConstant %int 7
+       %main = OpFunction %void None %fn
+          %l = OpLabel
+         %sa = OpLoad %simg %ta
+         %ia = OpImage %img %sa
+         %ca = OpCompositeConstruct %iv2 %c7 %c0
+         %fa = OpImageFetch %v4 %ia %ca Lod %c0
+         %sb = OpLoad %simg %tb
+         %ib = OpImage %img %sb
+         %cb = OpCompositeConstruct %iv2 %c7 %c0
+         %fb = OpImageFetch %v4 %ib %cb Lod %c0
+        %sum = OpFAdd %v4 %fa %fb
+          %p = OpAccessChain %pv4 %out %c0
+               OpStore %p %sum
+               OpReturn
+               OpFunctionEnd
