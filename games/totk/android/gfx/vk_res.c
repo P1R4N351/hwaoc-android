@@ -2950,7 +2950,7 @@ static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *li
             if (off % V.props.limits.minTexelBufferOffsetAlignment) RED(4, "buffer texture offset %#llx is not aligned", (unsigned long long)off);
             else {
                 if (x->tbv && (x->tb_buffer != b || x->tb_offset != off || x->tb_range != size)) { retire_bview(x->tbv, x->tb_buffer); x->tbv = VK_NULL_HANDLE; if (x->tb_buffer) { x->tb_buffer = VK_NULL_HANDLE; totk_tb_note_sub(&g_tb_tracker, 1u); } }
-                if (!x->tbv) { VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f, .offset = off, .range = size}; if (!vkCreateBufferView(V.dev, &ci, NULL, &x->tbv)) { x->tb_buffer = b; x->tb_offset = off; x->tb_range = size; if (b) totk_tb_note_add(&g_tb_tracker, (uint64_t)(uintptr_t)b); } }
+                if (!x->tbv) { { static _Atomic int n_fmt_log; if (atomic_fetch_add(&n_fmt_log, 1) < 32) LOGV("buffer texture id %d: NVN format %#x, Vulkan format %d, %u texels of %d bytes, writable %d", tid, (unsigned)r->t.d.format, (int)f, (unsigned)r->t.d.width, bpb, writable); } VkBufferViewCreateInfo ci = {VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO, .buffer = b, .format = f, .offset = off, .range = size}; if (!vkCreateBufferView(V.dev, &ci, NULL, &x->tbv)) { x->tb_buffer = b; x->tb_offset = off; x->tb_range = size; if (b) totk_tb_note_add(&g_tb_tracker, (uint64_t)(uintptr_t)b); } }
                 bv = x->tbv;
             }
         }
