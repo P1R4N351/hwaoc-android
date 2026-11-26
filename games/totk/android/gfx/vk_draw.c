@@ -688,6 +688,7 @@ static float d16_clear(float v) { double t = (double)v * 65535.0; return d16tie_
 typedef struct { uint64_t img; uint32_t w, h; int fmt; vk_tex *x; } probe_in;
 static probe_in g_pin[16]; static int g_npin, g_pdummy, g_pzero; static char g_pkey[24];
 static uint64_t g_stat_dummy_tex, g_stat_dummy_tbuf, g_stat_zero_buf;
+static _Atomic uint64_t g_stat_rec_tex_lost, g_stat_rec_tex_empty, g_stat_rec_tbuf_lost, g_stat_rec_tbuf_empty;   /* recording path: bound but unresolved / nothing bound */
 typedef struct { VkBuffer b; VkDeviceSize off, n; uint64_t addr; uint8_t stage, reg, storage; } probe_buf;
 enum { PROBE_BUFS = 12, PROBE_BUF_BYTES = 256 };
 static probe_buf g_pbuf[PROBE_BUFS]; static int g_npbuf; static uint8_t g_pbuf_data[PROBE_BUFS][PROBE_BUF_BYTES];
@@ -5212,7 +5213,15 @@ static void record_stage_fill_one(vk_shader *sh, int stage, int c1off, int stats
     uint64_t texture = b->reg >= 0 ? (b->kind == RB_IMG ? (b->reg < 32 ? S.img[stage][b->reg] : 0) : (b->reg < 128 ? S.tex[stage][b->reg] : 0)) : 0;
     if (b->dtype == VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER || b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER) {
         d->t = texture ? vk_tbuf_by_id_record((int)(texture & 0xfffff), b->rw, &d->lag_range, &d->lag_reason) : VK_NULL_HANDLE;
-        if (!d->t) d->t = vk_dummy_tbuf(); return;
+        if (!d->t) {
+            if (!texture) atomic_fetch_add(&g_stat_rec_tbuf_empty, 1);
+            else { uint64_t n = atomic_fetch_add(&g_stat_rec_tbuf_lost, 1) + 1;
+                if (n <= 16) { vk_treg rg; int known = vk_treg_get((int)(texture & 0xfffff), &rg);
+                    LOGV("recording: texel buffer id %d (stage %d slot %d, shader %.16s) resolves to nothing: registered %d, target %d, format %#x, width %u: an all-zero dummy is bound (%llu so far)",
+                         (int)(texture & 0xfffff), stage, b->reg, sh->key, known, known ? (int)rg.t.d.target : -1, known ? (unsigned)rg.t.d.format : 0u, known ? (unsigned)rg.t.d.width : 0u, (unsigned long long)n); } }
+            d->t = vk_dummy_tbuf();
+        }
+        return;
     }
     if (b->dtype == VK_DESCRIPTOR_TYPE_SAMPLER) {
         int sid = b->kind == RB_SAMP && b->reg >= 0 && b->reg < 128 ? (int)((b->sreg == -2 ? S.tex[stage][b->reg] : S.samp[stage][b->reg]) >> 20) : 0;
@@ -5223,7 +5232,15 @@ static void record_stage_fill_one(vk_shader *sh, int stage, int c1off, int stats
     d->i.imageView = texture ? native_texture_by_id((int)(texture & 0xfffff), &want, &object) : VK_NULL_HANDLE;
     if (stats) xlate_texture_view(texture, object, d->i.imageView);
     if (b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE && object) vk_tex_mark_gpu_written(object);
-    if (!d->i.imageView) d->i.imageView = vk_dummy_view(b->target, b->is_int);
+    if (!d->i.imageView) {
+        if (!texture) atomic_fetch_add(&g_stat_rec_tex_empty, 1);
+        else { uint64_t n = atomic_fetch_add(&g_stat_rec_tex_lost, 1) + 1;
+            if (n <= 24) { vk_treg rg; int known = vk_treg_get((int)(texture & 0xfffff), &rg);
+                LOGV("recording: texture id %d (stage %d slot %d, shader %.16s, slot wants target %d, %s) resolves to nothing: registered %d, target %d, format %#x, %ux%ux%u: an all-zero dummy is bound (%llu so far)",
+                     (int)(texture & 0xfffff), stage, b->reg, sh->key, (int)b->target, b->dtype == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE ? "storage image" : "sampled",
+                     known, known ? (int)rg.t.d.target : -1, known ? (unsigned)rg.t.d.format : 0u, known ? (unsigned)rg.t.d.width : 0u, known ? (unsigned)rg.t.d.height : 0u, known ? (unsigned)rg.t.d.depth : 0u, (unsigned long long)n); } }
+        d->i.imageView = vk_dummy_view(b->target, b->is_int);
+    }
     if (b->dtype == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
         int sid = b->reg >= 0 && b->reg < 128 ? (int)((b->sreg >= 0 && b->sreg < 128 ? S.samp[stage][b->sreg] : texture) >> 20) : 0;
         d->i.sampler = sid ? vk_samp_by_id(sid) : VK_NULL_HANDLE;
@@ -11503,8 +11520,9 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         g_win_sync = g_win_sync_ns = g_win_prewarm_wait = g_win_prewarm_wait_ns = 0;
         { uint64_t fn, fns, fmax; vk_shader_io_take(&fn, &fns, &fmax);
           LOGV("frame %llu, shader seed files read: %llu in %.1f ms (longest %.1f ms)", (unsigned long long)n, (unsigned long long)fn, fns / 1e6, fmax / 1e6); }
-        LOGV("frame %llu, diagnostics: %llu passes split by barriers; missing textures %llu, dummy texel buffers %llu, buffers outside the pools %llu",
-             (unsigned long long)n, (unsigned long long)g_stat_inpass_barriers, (unsigned long long)g_stat_dummy_tex, (unsigned long long)g_stat_dummy_tbuf, (unsigned long long)g_stat_zero_buf);
+        LOGV("frame %llu, diagnostics: %llu passes split by barriers; missing textures %llu, dummy texel buffers %llu, buffers outside the pools %llu; recording path: textures unresolved %llu (empty slots %llu), texel buffers unresolved %llu (empty slots %llu)",
+             (unsigned long long)n, (unsigned long long)g_stat_inpass_barriers, (unsigned long long)g_stat_dummy_tex, (unsigned long long)g_stat_dummy_tbuf, (unsigned long long)g_stat_zero_buf,
+             (unsigned long long)atomic_load(&g_stat_rec_tex_lost), (unsigned long long)atomic_load(&g_stat_rec_tex_empty), (unsigned long long)atomic_load(&g_stat_rec_tbuf_lost), (unsigned long long)atomic_load(&g_stat_rec_tbuf_empty));
         double rp, wt, gp, cpu, elapsed; uint64_t ns;
         vk_rec_lock(); vk_perf_take(&rp, &wt, &gp, &cpu, &elapsed, &ns); vk_rec_unlock();
         LOGV("frame %llu, per frame: recording %.1f ms, waiting for the GPU %.1f ms, GPU %.1f ms, %.1f submissions; descriptor sets %llu written, %llu reused",
