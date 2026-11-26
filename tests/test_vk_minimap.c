@@ -550,12 +550,21 @@ static void test_zero_area_minimap_and_present_reset(void) {
     make_quad(q_edge_mm, 1550.f, 860.f, 1603.f, 913.f);
     make_quad(q_zero, 960.f, 540.f, 960.f, 540.f);
     make_quad(q_sub, 960.f, 540.f, 960.7f, 540.7f);
+    vtx_idx_pos q_bg[6], q_fs[6];
+    make_quad(q_bg, 1494.f, 652.f, 1926.f, 1084.f);
+    make_quad(q_fs, 0.f, 0.f, 1920.f, 1080.f);
     vk_minimap_enable(0); vk_minimap_enable(1);
     g_f += 2u;
     vk_minimap_pass_begin(1ULL, &im, 0u, 0u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
         (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ULL, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 1);
+    vk_minimap_note_draw_wid(KTGL_WID_MENU);
+    assert(sel_box(fb, q_fs, 6, 0u, 0u) == 0 && g_vk_mm_tr.cls == 'F' && g_vk_mm_tr.wid == KTGL_WID_MENU);
+    vk_minimap_pass_end(1ULL, &im, 4ULL);
+    vk_minimap_pass_begin(1ULL, &im, 0u, 0u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
+        (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ULL, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 1);
     vk_minimap_note_draw_wid(KTGL_WID_MINIMAP);
-    assert(sel_box(fb, q_mm, 6, 0u, 1u) == 1 && g_vk_mm.hit_mm.w == 360u);
+    assert(sel_box(fb, q_bg, 6, 0u, 1u) == 1 && g_vk_mm.hit_mm.w == 432u);
+    assert(sel_box(fb, q_mm, 6, 0u, 1u) == 0 && g_vk_mm.cur_hud == 1 && g_vk_mm.hit_mm.w == 360u);
     vk_mm_rect mm_r0 = g_vk_mm.hit_mm;
     assert(sel_box(fb, q_int, 192, 0u, 1u) == 0 && g_vk_mm.cur_hud == 1 && memcmp(&mm_r0, &g_vk_mm.hit_mm, sizeof mm_r0) == 0);
     assert(sel_box(fb, q_edge_mm, 6, 0u, 1u) == 0 && g_vk_mm.cur_hud == 1 && g_vk_mm_tr.cls == 'm');

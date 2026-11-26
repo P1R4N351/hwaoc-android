@@ -11355,7 +11355,7 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     }
     if (__builtin_expect(vk_rec_profile_on, 0)) vk_rec_profile_begin(VK_REC_O_PRESENT);
     if (every > 0 && t && n % (uint64_t)every == 0) shot(t, n, crop);
-    pp_present(n); vk_minimap_present(); pd_present(n);
+    pp_present(n); vk_minimap_present(); S.ui_wid = 0u; /* replay worker post-present reset */ pd_present(n);
     if (vk_canvas_on && t) {
         vk_canvas_image window=vk_tex_canvas_identity(vk_tex_get(t),0,0);
         vk_canvas_present(&window);

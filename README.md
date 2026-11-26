@@ -84,13 +84,13 @@ screen.
   their brightness, cutscene dimming, minimap layer, asset rescan and clear). Cutscene dimming, the AMOLED pixel orbit
   and Bifrost stick LEDs remain. The radar trail, waypoint pins, Sheikah Rune / Rod / party chords and the combo
   sequencer of earlier builds are no longer part of the companion.
-- **How a draw is attributed:** by default with positional rules in `vk_minimap.h`, ported from AoI Native and covered
-  by a host regression ([tests/test_vk_minimap.py](tests/test_vk_minimap.py)). Per-widget tagging from the game's UI
-  tree ([games/totk/runtime/ktgl_ui_patch.h](games/totk/runtime/ktgl_ui_patch.h),
-  [games/totk/runtime/ktgl_wid_classify.h](games/totk/runtime/ktgl_wid_classify.h),
-  [tests/test_ktgl_wid.py](tests/test_ktgl_wid.py)) is in the tree and is still being brought up on the device;
-  `TOTK_KTGL_TAG=0` turns it off, `TOTK_KTGL_WID_DEST` overrides a widget's destination, and `TOTK_VK_MM_TRACE=<n>`
-  logs the class of every HUD draw.
+- **How a draw is attributed:** per-widget tagging from the game's UI tree
+  ([games/totk/runtime/ktgl_ui_patch.h](games/totk/runtime/ktgl_ui_patch.h),
+  [games/totk/runtime/ktgl_wid_classify.h](games/totk/runtime/ktgl_wid_classify.h) shared byte-for-byte with AoI
+  Native, `25` hooks with TLS 4 KiB verified-page caching, covered by
+  [tests/test_ktgl_wid.c](tests/test_ktgl_wid.c)) is default-on; `TOTK_KTGL_TAG=0` falls back to positional rules in
+  `vk_minimap.h` ([tests/test_vk_minimap.c](tests/test_vk_minimap.c)), `TOTK_KTGL_WID_DEST` overrides a widget's
+  destination, and `TOTK_VK_MM_TRACE=<n>` logs the class of every HUD draw.
 - **Not done:** per-element show/hide checkboxes for either screen; a recorded device trace for this game (the rules
   were measured on Age of Imprisonment).
 

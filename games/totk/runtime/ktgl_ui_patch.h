@@ -196,14 +196,14 @@ static inline int aoc_emit_site_stub(
 
 static inline uintptr_t aoc_rd_ptr(uintptr_t base, size_t off) {
     uintptr_t v = 0;
-    if (base >= 0x10000ULL && base + off >= base && ktgl_os_read(base + off, &v, sizeof v)) return v;
-    return 0;
+    if (base < 0x10000ULL || base + off < base) return 0;
+    return ktgl_read_mem(base + off, &v, sizeof v, &g_aoc_bounds) ? v : 0;
 }
 
 static inline uint32_t aoc_rd_u32(uintptr_t base, size_t off) {
     uint32_t v = 0;
-    if (base >= 0x10000ULL && base + off >= base && ktgl_os_read(base + off, &v, sizeof v)) return v;
-    return 0;
+    if (base < 0x10000ULL || base + off < base) return 0;
+    return ktgl_read_mem(base + off, &v, sizeof v, &g_aoc_bounds) ? v : 0;
 }
 
 static uintptr_t ktgl_aoc_on_pane(uintptr_t pane, uintptr_t u1, uintptr_t u2) {
@@ -216,9 +216,13 @@ static uintptr_t ktgl_aoc_on_pane(uintptr_t pane, uintptr_t u1, uintptr_t u2) {
 static uintptr_t ktgl_aoc_on_submit(uintptr_t snap_node, uintptr_t live_node, uintptr_t mgr) {
     (void)mgr;
     if (!ktgl_aoc_live_on() || !ktgl_ptr_aligned((const void *)snap_node)) return 0u;
+    if (!t_aoc_tag.cur_pane && live_node == snap_node) {
+        ktgl_snap_del(&g_aoc_snap_map, (const void *)snap_node);
+        return 0u;
+    }
     const void *pane = (t_aoc_tag.cur_pane && ktgl_valid_pane(t_aoc_tag.cur_pane, &g_aoc_bounds))
         ? t_aoc_tag.cur_pane
-        : ktgl_resolve_live_pane((const void *)live_node, &g_aoc_bounds);
+        : ((live_node != snap_node) ? ktgl_resolve_live_pane((const void *)live_node, &g_aoc_bounds) : NULL);
     int cls = pane ? ktgl_classify_pane_cached(pane, &g_aoc_bounds, &t_aoc_cache) : 0;
     uint8_t wid = cls >= 0 ? (uint8_t)cls : 0u;
     ktgl_snap_put(&g_aoc_snap_map, (const void *)snap_node, wid);
@@ -227,6 +231,10 @@ static uintptr_t ktgl_aoc_on_submit(uintptr_t snap_node, uintptr_t live_node, ui
 
 static uintptr_t ktgl_aoc_mgr_enter(uintptr_t mgr, uintptr_t u1, uintptr_t u2) {
     (void)u1; (void)u2;
+    static _Atomic uint32_t s_aoc_enter = 0u;
+    if (((atomic_fetch_add_explicit(&s_aoc_enter, 1u, memory_order_relaxed) + 1u) & 63u) == 0u) {
+        (void)ktgl_pg_bump_epoch();
+    }
     t_aoc_tag.mgr = mgr;
     if (!ktgl_aoc_live_on()) {
         if (t_aoc_tag.wid != 0u) { t_aoc_tag.wid = 0u; totk_nvn_set_wid(0u); }
