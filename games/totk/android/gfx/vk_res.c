@@ -2631,12 +2631,32 @@ static int texgen_check(void) {
     static int on = -1; if (on < 0) { const char *e = getenv("TOTK_VK_TEXGEN_CHECK"); on = e && atoi(e); }
     return on;
 }
+static int tex3d_alias_on(void) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_VK_TEX3D_ALIAS"); on = !(e && e[0] == '0'); }
+    return on;
+}
 static VkImageView tex_by_id_slow(int tid, int want, vk_tex **x_out, tidc_t *cache) {
     vk_treg rc, *r = &rc;
     *x_out = NULL;
     if (!vk_treg_get(tid, r)) return VK_NULL_HANDLE;
+    /* A 3D slot holding a 2D texture: Vulkan has no 3D view of a 2D image, and the zero dummy is not what the console samples
+     * (it reads the 2D texels as a volume one slice deep). A CPU-backed texture gets a second host texture over the same
+     * storage: 3D, one slice, uploaded the same way, under its own serial. It is not dropped when the game releases the 2D
+     * texture (the release path does not know of it); the storage's pool going away resets it like any other.
+     * GPU-rendered 2D textures are not covered: the refusal in view_get stands. TOTK_VK_TEX3D_ALIAS=0 turns this off. */
+    int alias3d = 0;
+    if (want == 2 && r->t.d.target == 1 && r->t.d.samples <= 1 && tex3d_alias_on() && tex_mirrored(&r->t)) {
+        r->t.d.target = 2; r->t.d.depth = 1; r->t.serial ^= 1ull << 63; alias3d = 1;
+        if (r->has_v) { r->v.set_target = 0; r->v.set_layers = 0; }
+    }
     vk_tex *x = vk_tex_get(&r->t);
     if (!x || !x->im) return VK_NULL_HANDLE;
+    if (alias3d) {
+        if (x->im->type != VK_IMAGE_TYPE_3D) { RED(8, "a 3D texture slot holds a 2D texture whose storage the GPU owns: no one-slice 3D copy (id %d)", tid); return VK_NULL_HANDLE; }
+        static _Atomic int n_alias_log;
+        if (atomic_fetch_add(&n_alias_log, 1) < 8) LOGV("texture id %d: a 2D texture (%ux%u, NVN format %#x, %u levels) in a 3D slot is served by a one-slice 3D copy", tid, r->t.d.width, r->t.d.height, (unsigned)r->t.d.format, r->t.d.levels);
+    }
     pthread_mutex_lock(&g_tex_mu);
     VkImageView v = view_get(x, r->has_v ? &r->v : NULL, want == -2 ? 2 : 0, want == -2 ? -1 : want);
     /* Capture the object's own stamp, not the cell's current value: a release
