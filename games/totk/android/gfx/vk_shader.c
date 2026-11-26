@@ -31,6 +31,7 @@
 #include "vk_view_vfix_fast.h"
 #include "vk_spv_fast.h"
 #include "vk_subgroup.h"
+#include "vk_tbuf_spv.h"
 #include "vk_position.h"
 #include "vk_int_fold.h"
 #include "vk_varyings.h"
@@ -593,6 +594,41 @@ static void shader_build_bind_sum(vk_shader *sh) {
     totk_sh_ub_gw_sum_finish(&sh->ub_gw_sum, sh->nb);
 }
 
+typedef struct { char *name, *deps; } variant_t;
+typedef struct { variant_t *v; int n; uint64_t epoch; } variant_list;
+static variant_list *variants_of(const char *key);
+/* A slot the game binds a BUFFER texture to arrives from the translator as a sampled 2D image read with
+   texelFetch(sampler2D, ivec2(x, 0), 0). A buffer texture has no image (vk_res.c serves it as a VkBufferView only), so
+   the slot got the all-zero dummy: skinning palettes and per-batch tables read zeros. The variant's deps name those slots
+   (tex:<slot>=buffer): retype them to texel buffers (vk_tbuf_spv.h) and relabel the reflection to match.
+   TOTK_VK_TBUF_RETYPE=0: off, as before. A module outside the admitted shape is left as it was, and says so. */
+static void shader_retype_tbuf(vk_shader *sh, const char *variant, char **spv_p, size_t *spv_len_p) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_VK_TBUF_RETYPE"); on = !(e && !strcmp(e, "0")); }
+    if (!on) return;
+    variant_list *vl = variants_of(variant); const char *deps = NULL;
+    for (int i = 0; vl && i < vl->n; i++) if (!strcmp(vl->v[i].name, variant)) { deps = vl->v[i].deps; break; }
+    if (!deps || !strstr(deps, "=buffer")) return;
+    uint32_t bind[VK_TBUF_SPV_MAX_BINDINGS]; int idx[VK_TBUF_SPV_MAX_BINDINGS], n = 0;
+    for (int i = 0; i < sh->nb; i++) {
+        const vk_bind *b = &sh->b[i];
+        if (b->kind != RB_TEXSAMP || b->dtype != VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b->target != 1 || b->reg < 0 || b->count != 1) continue;
+        char want[32]; int len = snprintf(want, sizeof want, "tex:%d=buffer", b->reg);
+        const char *hit = NULL;
+        for (const char *q = deps; (q = strstr(q, want)) != NULL; q += len)
+            if ((q == deps || q[-1] == ';') && (!q[len] || q[len] == ';')) { hit = q; break; }
+        if (!hit) continue;
+        if (n == VK_TBUF_SPV_MAX_BINDINGS) { RED(8, "shader %s: more buffer-texture slots than the retype handles; they read zeros", variant); return; }
+        bind[n] = b->binding; idx[n++] = i;
+    }
+    if (!n) return;
+    uint32_t *words = (uint32_t *)*spv_p; size_t nw = *spv_len_p / 4;
+    int r = vk_spirv_tbuf(&words, &nw, bind, n);
+    if (r != n) { RED(16, "shader %s: %d buffer-texture slot(s) are not in the shape the retype admits (%d); they read zeros", variant, n, r); return; }
+    *spv_p = (char *)words; *spv_len_p = nw * 4;
+    for (int i = 0; i < n; i++) { vk_bind *b = &sh->b[idx[i]]; b->kind = RB_TBUF; b->dtype = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER; b->target = 10; }
+    static int logged; if (logged < 8) { logged++; LOGV("shader %.16s (stage %d): %d buffer-texture slot(s) retyped to texel buffers", variant, sh->stage, n); }
+}
 static vk_shader *shader_load(const char *variant, int early_tests) {
     pthread_once(&g_position_once, position_init); pthread_once(&g_int_fold_once, int_fold_init);
     shader_key key = {0}; snprintf(key.variant, sizeof key.variant, "%s", variant);
@@ -608,6 +644,7 @@ static vk_shader *shader_load(const char *variant, int early_tests) {
     }
     sh = calloc(1, sizeof *sh); memcpy(sh->key, key.variant, sizeof sh->key); sh->early_tests = key.early_tests & 1; sh->alpha_func = key.early_tests >> 1; sh->spv_bytes = spv_len;
     shader_parse_vk_refl(sh, txt, vk_len); free(txt);
+    shader_retype_tbuf(sh, variant, &spv, &spv_len);
     shader_classify_meta(sh, variant, (const uint32_t *)spv, spv_len / 4);
     if (!shader_rewrite_stage_spv(sh, variant, &spv, &spv_len)) return shader_fail_cleanup(spv, sh);
     VkShaderModuleCreateInfo mci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, .codeSize = spv_len, .pCode = (const uint32_t *)spv};
@@ -657,8 +694,6 @@ vk_shader *vk_shader_seed(const char *variant, int stage, int early_tests) {
 }
 
 /* ---------- variants of a shader ---------- */
-typedef struct { char *name, *deps; } variant_t;
-typedef struct { variant_t *v; int n; uint64_t epoch; } variant_list;
 static nvn_hmap g_variants = {.klen = 64};   /* shader key (hex) -> variant_list */
 static variant_list *variants_of(const char *key) {
     char k[64]; memcpy(k, key, 64);
