@@ -151,7 +151,17 @@ public final class WarriorsCompanionModel {
         int m = streamMode[stream];
         return m == ON_SECOND ? "2ND SCREEN" : m == ON_FIRST ? "TOP SCREEN" : "HIDDEN";
     }
-    public boolean dimmed() { return autoDim && moviePlaying; }
+    public boolean hasLiveContent() {
+        return (hasLiveMinimap && onSecond(STREAM_MINIMAP))
+                || (hasLiveObjective && onSecond(STREAM_OBJECTIVE))
+                || (hasLiveLeftHud && onSecond(STREAM_HUD));
+    }
+
+    public boolean dimmed() {
+        if (!autoDim || tab != TAB_TACTICAL) return false;
+        return moviePlaying || hostPaused || !inGame || !hasLiveContent();
+    }
+
     public boolean touchBlocked() { return dimmed(); }
 
     /** Pure #000000 OLED black unless filled by a harvested game asset. */

@@ -68,10 +68,12 @@ public final class WarriorsCompanionDraw {
         c.translate(ox, oy);
         c.scale(sc, sc, 0f, 0f);
         drawChrome(c, m, filter, borderFrieze, borderEdge, borderSide);
-        drawHeader(c, m, glyph, nowMs);
         drawPages(c, m, nowMs);
+        alpha = 1f;
         float dim = scene.dimT(nowMs);
         if (dim > VIS_EPS) drawDimVeil(c, m, glyph, dim);
+        drawHeader(c, m, glyph, nowMs, 1f - 0.35f * dim);
+        alpha = 1f;
         c.restore();
         return moving;
     }
@@ -121,6 +123,8 @@ public final class WarriorsCompanionDraw {
         s.finish();
         scene.ingestHud(now);
     }
+
+    private static final float BLEED = 400f;
 
     private void syncBackdropShader(Bitmap tex) {
         if (tex == lastBackdrop) return;
@@ -200,18 +204,21 @@ public final class WarriorsCompanionDraw {
         c.restore();
     }
 
-    private void drawHeader(Canvas c, WarriorsCompanionModel m, Bitmap glyph, long now) {
+    private void drawHeader(Canvas c, WarriorsCompanionModel m, Bitmap glyph, long now, float navAlpha) {
         boolean padSel = m.activeTab() == WarriorsCompanionModel.TAB_TACTICAL;
         float cx = WarriorsCompanionLayout.TAB0_CX, cy = WarriorsCompanionLayout.NAV_CY;
+        int navA = Math.round(255f * Math.max(0f, Math.min(1f, navAlpha)));
         if (glyph != null && !glyph.isRecycled()) {
             tintPaint.setColorFilter(padSel ? navOnTint : navOffTint);
+            tintPaint.setAlpha(navA);
             dstF.set(cx - 18f, cy - 18f, cx + 18f, cy + 18f);
             c.drawBitmap(glyph, null, dstF, tintPaint);
+            tintPaint.setAlpha(255);
         } else {
-            drawDiamond(c, cx, cy, 11f, padSel ? m.primaryColor() : 0xAA7FA39E);
+            drawDiamond(c, cx, cy, 11f, fade(padSel ? m.primaryColor() : 0xAA7FA39E, navAlpha));
         }
-        drawStatusIcon(c, WarriorsCompanionLayout.TAB1_CX, cy, !padSel ? m.primaryColor() : 0xAA7FA39E);
-        drawNavRules(c, m.secondaryColor(), now);
+        drawStatusIcon(c, WarriorsCompanionLayout.TAB1_CX, cy, fade(!padSel ? m.primaryColor() : 0xAA7FA39E, navAlpha));
+        drawNavRules(c, fade(m.secondaryColor(), navAlpha), now);
     }
 
     /** The selected-tab rule cross-fades between the two header glyphs instead of jumping. */
@@ -424,7 +431,7 @@ public final class WarriorsCompanionDraw {
     private void drawDimVeil(Canvas c, WarriorsCompanionModel m, Bitmap glyph, float d) {
         p.setStyle(Paint.Style.FILL);
         p.setColor(fade(0xD4000000, d));
-        c.drawRect(0f, 0f, LOGIC_W, LOGIC_H, p);
+        c.drawRect(-BLEED, -BLEED, LOGIC_W + BLEED, LOGIC_H + BLEED, p);
         if (glyph != null && !glyph.isRecycled()) {
             tintPaint.setColorFilter(dimGlyphTint);
             tintPaint.setAlpha(Math.round(255f * d));

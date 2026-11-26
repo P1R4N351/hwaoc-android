@@ -352,7 +352,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         int hit = WarriorsCompanionLayout.headerTabAt(lx, ly);
         if (hit < 0) return false;
         model.selectTab(hit);
-        CompanionNative.warriorsMinimapEnable(hit == WarriorsCompanionModel.TAB_TACTICAL);
+        CompanionNative.warriorsMinimapEnable(model.inGame && !model.moviePlaying && !model.hostPaused);
         if (source != null) source.page(hit);
         return true;
     }

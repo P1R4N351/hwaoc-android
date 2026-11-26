@@ -158,7 +158,8 @@ public class View {
     public void setBackgroundColor(int c) { } public void setFocusable(boolean f) { } public void setContentDescription(CharSequence d) { }
     public void invalidate() { invalidated++; } public void postInvalidateOnAnimation() { }
     public boolean postDelayed(Runnable r, long ms) { return true; } public boolean removeCallbacks(Runnable r) { return true; }
-    public int getWidth() { return 0; } public int getHeight() { return 0; }
+    public static int testWidth, testHeight;
+    public int getWidth() { return testWidth; } public int getHeight() { return testHeight; }
     public boolean performClick() { return true; } public boolean onTouchEvent(MotionEvent e) { return false; }
     protected void onAttachedToWindow() { } protected void onDetachedFromWindow() { } protected void onDraw(android.graphics.Canvas c) { }
     protected void onSizeChanged(int w, int h, int ow, int oh) { } protected void onConfigurationChanged(android.content.res.Configuration c) { }
@@ -300,6 +301,34 @@ public final class ScreenProbe {
                 WarriorsCompanionModel wm = new WarriorsCompanionModel();
                 require(wm.stickLights && wm.stickSync, "stick lights and sync default ON");
                 require(wm.bgColor() == 0xFF000000 && wm.borderColor() == 0x00000000, "pure black borderless Purah theme");
+                wm.inGame = true; wm.hasLiveMinimap = false;
+                require(wm.dimmed() && wm.touchBlocked(), "empty live content auto-dims");
+                wm.hasLiveMinimap = true; wm.hostPaused = true;
+                require(wm.dimmed() && wm.touchBlocked(), "menu / hostPaused auto-dims");
+                wm.hostPaused = false; wm.inGame = false;
+                require(wm.dimmed() && wm.touchBlocked(), "not in-game auto-dims");
+                wm.inGame = true; wm.moviePlaying = true;
+                require(wm.dimmed() && wm.touchBlocked(), "movie auto-dims");
+                wm.selectTab(WarriorsCompanionModel.TAB_LEDGER);
+                require(!wm.dimmed() && !wm.touchBlocked(), "status tab lifts dim veil");
+                wm.selectTab(WarriorsCompanionModel.TAB_TACTICAL);
+                android.view.View.testWidth = 1240; android.view.View.testHeight = 1080;
+                WarriorsCompanionView tapProbe = (WarriorsCompanionView) screen;
+                tapProbe.setPage(WarriorsCompanionModel.TAB_TACTICAL);
+                android.view.MotionEvent tapStatus = new android.view.MotionEvent() {
+                    @Override public float getX() { return WarriorsCompanionLayout.TAB1_CX; }
+                    @Override public float getY() { return WarriorsCompanionLayout.NAV_CY; }
+                };
+                tapProbe.onTouchEvent(tapStatus);
+                require(tapProbe.page() == WarriorsCompanionModel.TAB_LEDGER, "tab taps through dim overlay to STATUS");
+                android.view.MotionEvent tapPad = new android.view.MotionEvent() {
+                    @Override public float getX() { return WarriorsCompanionLayout.TAB0_CX; }
+                    @Override public float getY() { return WarriorsCompanionLayout.NAV_CY; }
+                };
+                tapProbe.onTouchEvent(tapPad);
+                require(tapProbe.page() == WarriorsCompanionModel.TAB_TACTICAL, "tab taps back to PAD");
+                tapProbe.setPage(initial);
+                android.view.View.testWidth = 0; android.view.View.testHeight = 0;
             }
             String wantClass = duo ? "DuoSurfaceView" : warriors ? "WarriorsCompanionView" : "CompanionView";
             require(screen.getClass().getSimpleName().equals(wantClass), "this build's screen");
