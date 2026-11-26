@@ -2911,6 +2911,26 @@ static int tbuf_fast_try(totk_tbuf_memo4 *m, int tid, uint64_t ep, int writable,
     if (live && *reason) *live = (VkDescriptorBufferInfo){(VkBuffer)(uintptr_t)ent.buf_u, ent.off, ent.size};
     *out_bv = (VkBufferView)(uintptr_t)ent.bv_u; return 1;
 }
+/* The translated shaders declare every buffer texture as a float image and bit-cast the fetch where the game wanted integers.
+ * Vulkan requires the view's numeric type to match the image's sampled type, so a 32-bit integer buffer is viewed through the
+ * float format of the same width: the bits pass through unchanged. Narrower integer formats have no such view: 0 (refused).
+ * TOTK_VK_TBUF_FLOATVIEW=0 keeps the game's own format. */
+static int tbuf_float_view(VkFormat *f) {
+    static int on = -1;
+    if (on < 0) { const char *e = getenv("TOTK_VK_TBUF_FLOATVIEW"); on = !(e && e[0] == '0'); }
+    if (!on) return 1;
+    switch (*f) {
+    case VK_FORMAT_R32_UINT: case VK_FORMAT_R32_SINT: *f = VK_FORMAT_R32_SFLOAT; return 1;
+    case VK_FORMAT_R32G32_UINT: case VK_FORMAT_R32G32_SINT: *f = VK_FORMAT_R32G32_SFLOAT; return 1;
+    case VK_FORMAT_R32G32B32_UINT: case VK_FORMAT_R32G32B32_SINT: *f = VK_FORMAT_R32G32B32_SFLOAT; return 1;
+    case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_R32G32B32A32_SINT: *f = VK_FORMAT_R32G32B32A32_SFLOAT; return 1;
+    case VK_FORMAT_R8_UINT: case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8_SINT:
+    case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16_UINT: case VK_FORMAT_R16_SINT:
+    case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R16G16B16A16_SINT:
+    case VK_FORMAT_A2B10G10R10_UINT_PACK32: return 0;
+    default: return 1;
+    }
+}
 static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *live, uint32_t *reason) {
     int fast_on = totk_tbuf_fast_on() && tid > 0 && tid < TID_GEN_N;
     totk_tbuf_memo4 *m = fast_on ? T_tbuf_memo : NULL;
@@ -2939,6 +2959,7 @@ static VkBufferView tbuf_by_id(int tid, int writable, VkDescriptorBufferInfo *li
         int bw, bh, bpb = nvn_fmt_bpb(r->t.d.format, &bw, &bh); VkFormat f;
         size = (uint64_t)r->t.d.width * bpb;
         if (!vk_fmt(r->t.d.format, &f, NULL) || !f || !bpb) RED(4, "buffer texture format %#x has no Vulkan format", r->t.d.format);
+        else if (!tbuf_float_view(&f)) RED(4, "buffer texture format %#x is an integer format with no float view of the same width: the float image the shaders declare cannot read it", r->t.d.format);
         else if (!vk_resolve(address, size, &b, &off)) RED(4, "buffer texture storage is outside the memory pools");
         else {
             size = MINV(size, (uint64_t)V.props.limits.maxTexelBufferElements * bpb);
