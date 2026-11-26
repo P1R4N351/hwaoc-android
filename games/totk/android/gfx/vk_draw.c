@@ -687,7 +687,7 @@ static float d16_clear(float v) { double t = (double)v * 65535.0; return d16tie_
    is bound as an all-zero dummy, a buffer outside the pools as zeros (both counted, and logged the first times) */
 typedef struct { uint64_t img; uint32_t w, h; int fmt; vk_tex *x; } probe_in;
 static probe_in g_pin[16]; static int g_npin, g_pdummy, g_pzero; static char g_pkey[24];
-static uint64_t g_stat_dummy_tex, g_stat_zero_buf;
+static uint64_t g_stat_dummy_tex, g_stat_dummy_tbuf, g_stat_zero_buf;
 typedef struct { VkBuffer b; VkDeviceSize off, n; uint64_t addr; uint8_t stage, reg, storage; } probe_buf;
 enum { PROBE_BUFS = 12, PROBE_BUF_BYTES = 256 };
 static probe_buf g_pbuf[PROBE_BUFS]; static int g_npbuf; static uint8_t g_pbuf_data[PROBE_BUFS][PROBE_BUF_BYTES];
@@ -5376,7 +5376,13 @@ static inline __attribute__((always_inline)) int bind_stage_body(VkCommandBuffer
                 int slot = b->kind == RB_IMG ? b->reg : b->reg;
                 uint64_t h = slot >= 0 ? (b->kind == RB_IMG ? (slot < 32 ? S.img[stage][slot] : 0) : (slot < 128 ? S.tex[stage][slot] : 0)) : 0;
                 d->t = h ? vk_tbuf_by_id((int)(h & 0xfffff), b->rw) : VK_NULL_HANDLE;
-                if (!d->t) d->t = vk_dummy_tbuf();
+                if (!d->t) {   /* counted and described: this fallback used to be silent */
+                    uint64_t n = ++g_stat_dummy_tbuf;
+                    if (n <= 16) { vk_treg rg; int known = h ? vk_treg_get((int)(h & 0xfffff), &rg) : 0;
+                        LOGV("texel buffer id %d (stage %d slot %d, shader %.16s) resolves to nothing: slot %s, registered %d, target %d, format %#x, width %u: an all-zero dummy is bound (%llu so far)",
+                             (int)(h & 0xfffff), stage, slot, sh->key, h ? "bound" : "empty", known, known ? (int)rg.t.d.target : -1, known ? (unsigned)rg.t.d.format : 0u, known ? (unsigned)rg.t.d.width : 0u, (unsigned long long)n); }
+                    d->t = vk_dummy_tbuf();
+                }
                 continue;
             }
             /* images and samplers */
@@ -11497,8 +11503,8 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
         g_win_sync = g_win_sync_ns = g_win_prewarm_wait = g_win_prewarm_wait_ns = 0;
         { uint64_t fn, fns, fmax; vk_shader_io_take(&fn, &fns, &fmax);
           LOGV("frame %llu, shader seed files read: %llu in %.1f ms (longest %.1f ms)", (unsigned long long)n, (unsigned long long)fn, fns / 1e6, fmax / 1e6); }
-        LOGV("frame %llu, diagnostics: %llu passes split by barriers; missing textures %llu, buffers outside the pools %llu",
-             (unsigned long long)n, (unsigned long long)g_stat_inpass_barriers, (unsigned long long)g_stat_dummy_tex, (unsigned long long)g_stat_zero_buf);
+        LOGV("frame %llu, diagnostics: %llu passes split by barriers; missing textures %llu, dummy texel buffers %llu, buffers outside the pools %llu",
+             (unsigned long long)n, (unsigned long long)g_stat_inpass_barriers, (unsigned long long)g_stat_dummy_tex, (unsigned long long)g_stat_dummy_tbuf, (unsigned long long)g_stat_zero_buf);
         double rp, wt, gp, cpu, elapsed; uint64_t ns;
         vk_rec_lock(); vk_perf_take(&rp, &wt, &gp, &cpu, &elapsed, &ns); vk_rec_unlock();
         LOGV("frame %llu, per frame: recording %.1f ms, waiting for the GPU %.1f ms, GPU %.1f ms, %.1f submissions; descriptor sets %llu written, %llu reused",
