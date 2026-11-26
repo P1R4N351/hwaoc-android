@@ -78,6 +78,27 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         boolean sync = sp.getBoolean("stick_screen_sync", true);
         model.stickSync = sync;
         BifrostBridge.syncScreenBrightness = sync;
+        for (int i = 0; i < WarriorsCompanionModel.STREAM_COUNT; i++) {
+            int mode = sp.getInt("stream_mode_" + i, WarriorsCompanionModel.ON_SECOND);
+            model.streamMode[i] = mode >= 0 && mode <= WarriorsCompanionModel.ON_NEITHER ? mode : WarriorsCompanionModel.ON_SECOND;
+        }
+        streamModesPushed = false;
+    }
+
+    private boolean streamModesPushed;
+
+    /** Tells the native capture where each module goes; repeated only after a change. */
+    private void pushStreamModes() {
+        if (streamModesPushed) return;
+        for (int i = 0; i < WarriorsCompanionModel.STREAM_COUNT; i++) CompanionNative.warriorsStreamMode(i, model.streamMode[i]);
+        streamModesPushed = true;
+    }
+
+    private void cycleStream(SharedPreferences sp, int stream) {
+        if (stream < 0 || stream >= WarriorsCompanionModel.STREAM_COUNT) return;
+        model.streamMode[stream] = WarriorsCompanionModel.nextStreamMode(model.streamMode[stream]);
+        sp.edit().putInt("stream_mode_" + stream, model.streamMode[stream]).apply();
+        streamModesPushed = false;
     }
 
     private void tickFrame(long now) {
@@ -108,6 +129,14 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
             return;
         }
         CompanionNative.warriorsMinimapEnable(true);
+        pushStreamModes();
+        if (!model.onSecond(WarriorsCompanionModel.STREAM_MINIMAP)) {
+            minimapMeta[2] = 0;
+            art.setMinimap(null);
+            pollNativeObjective();
+            pollNativeLeftHud();
+            return;
+        }
         int got = CompanionNative.warriorsMinimap(minimapBytes, minimapMeta);
         int rw = minimapMeta[0], rh = minimapMeta[1];
         model.minimapW = rw;
@@ -129,6 +158,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     }
 
     private void pollNativeObjective() {
+        if (!model.onSecond(WarriorsCompanionModel.STREAM_OBJECTIVE)) { objMeta[2] = 0; art.setObjective(null); return; }
         int got = CompanionNative.warriorsObjective(objBytes, objMeta);
         int ow = objMeta[0], oh = objMeta[1], active = objMeta[3];
         model.objectiveW = ow;
@@ -143,6 +173,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
     }
 
     private void pollNativeLeftHud() {
+        if (!model.onSecond(WarriorsCompanionModel.STREAM_HUD)) { lhudMeta[2] = 0; art.setLeftHud(null); return; }
         int got = CompanionNative.warriorsLeftHud(lhudBytes, lhudMeta);
         int lw = lhudMeta[0], lh = lhudMeta[1], active = lhudMeta[3];
         model.leftHudW = lw;
@@ -347,6 +378,7 @@ public final class WarriorsCompanionView extends View implements CompanionScreen
         if (row == 4) { cycleRt(); return true; }
         if (row == 5) { triggerArtRescan(); return true; }
         if (row == 6) { art.clearCache(getContext()); syncArtFlags(); return true; }
+        if (row >= 7 && row <= 9) { cycleStream(sp, row - 7); return true; }
         return false;
     }
 

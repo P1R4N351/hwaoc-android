@@ -70,13 +70,14 @@ static struct {
     int hud_ready, hud_failed, has_depth, has_stencil_att, cur_hud, pass_hud_cleared;
     vk_mm_cand cand[VK_MM_MAX_CAND];
     _Atomic int cand_count, want_active;
+    _Atomic int stream_mode[3];   // per module (0 minimap, 1 objective, 2 left HUD): 0 second screen, 1 first screen, 2 neither
     _Atomic uint32_t cand_idx;
     uint32_t frame_counter, mm_ttl, obj_ttl, lhud_ttl;
     uint32_t hud_cleared_frame, hud_state_frame, frame_got_mm, frame_got_obj, frame_got_lhud;
     int saw_mm_frame, saw_obj_frame, saw_lhud_frame;
     int in_hud_pass, pass_opaque_fs, pass_modal, pass_dialog;
     int pass_mm_hit, pass_obj_hit, obj_bounds_init, pass_obj_icon, pass_obj_pill, pass_obj_text, cand_obj_text;
-    int pass_lhud_any, pass_lhud_top, prev_lhud_top, nfp, fr_modal, mm_open, nwm_cur, nwm_prev;
+    int pass_lhud_any, pass_lhud_top, prev_lhud_top, nfp, fr_modal, pass_modal_late, mm_open, nwm_cur, nwm_prev;
     float fp[8][4], wm_cur[4][4], wm_prev[4][4];
     uint64_t cur_tex, ring_tex;
     float last_q[4]; int last_small;
@@ -346,7 +347,7 @@ static void vk_minimap_pass_begin(
     vk_mm_wid_dest_init();
     g_vk_mm.in_hud_pass = 0; g_vk_mm.cur_hud = 0; g_vk_mm.pass_hud_cleared = 0;
     g_vk_mm.skip_cur_draw = 0;
-    g_vk_mm.pass_opaque_fs = 0; g_vk_mm.pass_modal = 0; g_vk_mm.pass_dialog = 0;
+    g_vk_mm.pass_opaque_fs = 0; g_vk_mm.pass_modal = 0; g_vk_mm.pass_dialog = 0; g_vk_mm.pass_modal_late = 0;
     g_vk_mm.pass_lhud_tagged = 0; g_vk_mm.pass_obj_tagged = 0; g_vk_mm.pass_mm_tagged = 0;
     g_vk_mm.ui_cand.img = VK_NULL_HANDLE; g_vk_mm.ui_cand.score = -1;
     if (!ok || !cb || !t || !V.dev || !vk_tex_image(t) || !main_cview || !sp || !sp->imageView) return;
@@ -402,7 +403,19 @@ static void vk_mm_clear_hud_img(VkCommandBuffer cb) {
     g_vk_mm.hud_cleared_im = g_vk_mm.pass_im;
 }
 
+enum { VK_MM_ON_SECOND = 0, VK_MM_ON_FIRST = 1, VK_MM_ON_NEITHER = 2 };
+
+static int vk_mm_cls_mode(char cls) {
+    int i = (cls == 'm' || cls == 'S') ? 0 : cls == 'o' ? 1 : cls == 'l' ? 2 : -1;
+    return i < 0 ? VK_MM_ON_SECOND : atomic_load_explicit(&g_vk_mm.stream_mode[i], memory_order_relaxed);
+}
+
 static int vk_mm_switch_target(VkCommandBuffer cb, int want_hud) {
+    if (want_hud) {   // a module the player moved back to the first screen, or hid, is not sent to the HUD image
+        int mode = vk_mm_cls_mode(g_vk_mm_tr.cls);
+        if (mode == VK_MM_ON_NEITHER) g_vk_mm.skip_cur_draw = 1;
+        if (mode != VK_MM_ON_SECOND) want_hud = 0;
+    }
     if (!g_vk_mm.in_hud_pass || !g_vk_mm.hud_ready || g_vk_mm.cur_hud == want_hud) return 0;
     vk_occlusion_end(cb);
     vkCmdEndRendering(cb);
@@ -442,6 +455,15 @@ static int vk_mm_switch_target(VkCommandBuffer cb, int want_hud) {
     vkCmdBeginRendering(cb, &ri);
     g_vk_mm.cur_hud = want_hud;
     return 1;
+}
+
+// The minimap's stencil masks are drawn where the minimap is drawn: left alone when it is captured (as before), on the
+// first screen's target when the player keeps the minimap there, and not at all when it is hidden.
+static int vk_mm_mask_target(VkCommandBuffer cb) {
+    int mode = vk_mm_cls_mode('S');
+    if (mode == VK_MM_ON_SECOND) return 0;
+    if (mode == VK_MM_ON_NEITHER) g_vk_mm.skip_cur_draw = 1;
+    return vk_mm_switch_target(cb, 0);
 }
 
 static int vk_minimap_bind_main(VkCommandBuffer cb) {
@@ -1011,8 +1033,11 @@ static void vk_mm_note_pass_overlays(float w, float h, const float *mn, const fl
         g_vk_mm.nwm_cur = 0; g_vk_mm.nwm_prev = 0; g_vk_mm.pass_lhud_top = 0; g_vk_mm.prev_lhud_top = 0;
     }
     if (cnt >= 4 && bw >= w * 0.28f && bw <= w * 0.88f && bh >= h * 0.12f && bh <= h * 0.88f
-            && fabsf(cx - w * 0.5f) < w * 0.16f && mn[1] < h * 0.66f && mx[1] > h * 0.20f)
-        g_vk_mm.pass_modal = 1;
+            && fabsf(cx - w * 0.5f) < w * 0.16f && mn[1] < h * 0.66f && mx[1] > h * 0.20f) {
+        // after HUD draws were captured in this pass, the panel stops capture of what follows it and no more
+        if (g_vk_mm.pass_lhud_any || g_vk_mm.pass_mm_hit || g_vk_mm.pass_obj_hit) g_vk_mm.pass_modal_late = 1;
+        else g_vk_mm.pass_modal = 1;
+    }
     if (cnt >= 4 && bw >= w * 0.34f && bw <= w * 0.88f && bh <= h * 0.45f && cy > h * 0.62f && fabsf(cx - w * 0.5f) < w * 0.18f)
         g_vk_mm.pass_dialog = 1;
 }
@@ -1051,13 +1076,21 @@ static int vk_mm_tagged_mm(
     if (stt != 0u && (c0_mask & 0xfu) == 0u) {
         g_vk_mm_tr.cls = 'S';
         if (can_box) vk_mm_try_minimap(mn, mx);
-        return 0;
+        return vk_mm_mask_target(cb);
     }
     if (!hb) {
         g_vk_mm_tr.cls = '-';
         return vk_mm_switch_target(cb, 0);
     }
-    if (vk_mm_is_center_reset(mn, mx, w) || mx[0] < w * 0.45f) return -1;
+    if (vk_mm_is_center_reset(mn, mx, w)) {
+        if ((mx[0] - mn[0]) <= 0.5f && (mx[1] - mn[1]) <= 0.5f) {
+            g_vk_mm_tr.cls = 'm';
+            g_vk_mm.skip_cur_draw = 1;
+            return 0;
+        }
+        return -1;
+    }
+    if (mx[0] < w * 0.45f) return -1;
     if (can_box) {
         vk_mm_try_minimap(mn, mx);
         float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
@@ -1173,8 +1206,8 @@ static int vk_mm_select_fallback(
     float w = (float)g_vk_mm.pass_w, h = (float)g_vk_mm.pass_h;
     float bw = mx[0] - mn[0], bh = mx[1] - mn[1];
     if ((c0_mask & 0xfu) != 0u) vk_mm_note_pass_overlays(w, h, mn, mx, stt, blend_en, cnt);
-    if (stt != 0u && (c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { g_vk_mm_tr.cls = 'S'; vk_mm_try_minimap(mn, mx); return 0; }
-    if (g_vk_mm.pass_opaque_fs || g_vk_mm.pass_modal || (c0_mask & 0xfu) == 0u) { g_vk_mm_tr.cls = 'M'; return vk_mm_switch_target(cb, 0); }
+    if (stt != 0u && (c0_mask & 0xfu) == 0u && cnt >= 4 && cnt <= 12) { g_vk_mm_tr.cls = 'S'; vk_mm_try_minimap(mn, mx); return vk_mm_mask_target(cb); }
+    if (g_vk_mm.pass_opaque_fs || g_vk_mm.pass_modal || g_vk_mm.pass_modal_late || (c0_mask & 0xfu) == 0u) { g_vk_mm_tr.cls = 'M'; return vk_mm_switch_target(cb, 0); }
     int prev_small = g_vk_mm.last_small;
     float pq[4] = { g_vk_mm.last_q[0], g_vk_mm.last_q[1], g_vk_mm.last_q[2], g_vk_mm.last_q[3] };
     g_vk_mm.last_small = stt == 0u && cnt <= 6 && bw <= 8.f && bh <= 8.f;
@@ -1376,7 +1409,7 @@ static void vk_minimap_pass_end(VkCommandBuffer cb, vk_tex *t, uint64_t serial) 
 
 static void vk_minimap_pass_abort(void) {
     g_vk_mm.in_hud_pass = 0; g_vk_mm.cur_hud = 0; g_vk_mm.pass_hud_cleared = 0;
-    g_vk_mm.pass_opaque_fs = 0; g_vk_mm.pass_modal = 0; g_vk_mm.pass_dialog = 0;
+    g_vk_mm.pass_opaque_fs = 0; g_vk_mm.pass_modal = 0; g_vk_mm.pass_dialog = 0; g_vk_mm.pass_modal_late = 0;
 }
 
 static void vk_mm_stream_present(vk_mm_stream *st, uint32_t fr, uint64_t fence) {
@@ -1421,7 +1454,7 @@ static void vk_minimap_present(void) {
     memcpy(g_vk_mm.wm_prev, g_vk_mm.wm_cur, sizeof g_vk_mm.wm_prev);
     g_vk_mm.nwm_prev = g_vk_mm.nwm_cur; g_vk_mm.nwm_cur = 0;
     g_vk_mm.prev_lhud_top = g_vk_mm.pass_lhud_top; g_vk_mm.pass_lhud_top = 0;
-    g_vk_mm.stale_wid = 0u;
+    g_vk_mm.stale_wid = 0u; g_vk_mm.cur_wid = 0u; g_vk_mm.cur_wid_bg = 0u;
 }
 
 static _Atomic int g_vk_srgb_lut_ready;
@@ -1584,6 +1617,11 @@ int vk_minimap_ui_tex_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4], in
     meta[2] = (int32_t)g_vk_mm.ui_seq; meta[3] = st;
     pthread_mutex_unlock(&g_vk_mm.mu);
     return updated;
+}
+
+void vk_minimap_stream_mode(int stream, int mode) {
+    if (stream < 0 || stream > 2 || mode < VK_MM_ON_SECOND || mode > VK_MM_ON_NEITHER) return;
+    atomic_store_explicit(&g_vk_mm.stream_mode[stream], mode, memory_order_release);
 }
 
 int vk_minimap_cycle(void) {

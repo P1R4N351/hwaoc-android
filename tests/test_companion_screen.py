@@ -38,9 +38,11 @@ public class Context {
 public class SharedPreferences {
     public static class Editor {
         public Editor putBoolean(String k, boolean v) { return this; }
+        public Editor putInt(String k, int v) { return this; }
         public void apply() { }
     }
     public boolean getBoolean(String k, boolean d) { return d; }
+    public int getInt(String k, int d) { return d; }
     public Editor edit() { return new Editor(); }
 }''',
     'android/os/BatteryManager.java': '''package android.os;
@@ -236,6 +238,8 @@ public final class CompanionNative {
     public static int warriorsMinimap(byte[] rgbaOut, int[] meta) { return 0; }
     public static int warriorsMinimapCycle() { return ++cycleCount; }
     public static void warriorsMinimapEnable(boolean on) { enabledRt = on; }
+    public static final int[] streamModes = new int[3];
+    public static void warriorsStreamMode(int stream, int mode) { if (stream >= 0 && stream < 3) streamModes[stream] = mode; }
     public static int warriorsObjective(byte[] rgbaOut, int[] meta) { return 0; }
     public static int warriorsLeftHud(byte[] rgbaOut, int[] meta) { return 0; }
     public static int warriorsUiTex(byte[] rgbaOut, int[] meta, boolean request) { return 0; }

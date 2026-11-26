@@ -53,6 +53,7 @@ public final class CompanionNative implements DataSource {
     private static native int warriorsMinimapNative(byte[] rgbaOut, int[] meta);
     private static native int warriorsMinimapCycleNative();
     private static native void warriorsMinimapEnableNative(boolean on);
+    private static native void warriorsStreamModeNative(int stream, int mode);
     private static native int warriorsObjectiveNative(byte[] rgbaOut, int[] meta);
     private static native int warriorsLeftHudNative(byte[] rgbaOut, int[] meta);
     private static native int warriorsUiTexNative(byte[] rgbaOut, int[] meta, boolean request);
@@ -122,6 +123,12 @@ public final class CompanionNative implements DataSource {
         if (!loaded) return 0;
         try { return warriorsMinimapCycleNative(); }
         catch (UnsatisfiedLinkError unavailable) { loaded = false; return 0; }
+    }
+    /** Where a captured module is shown: stream 0 minimap, 1 objective bar, 2 HUD column; mode 0 second screen, 1 first screen, 2 neither. */
+    public static void warriorsStreamMode(int stream, int mode) {
+        if (!loaded) return;
+        try { warriorsStreamModeNative(stream, mode); }
+        catch (UnsatisfiedLinkError unavailable) { loaded = false; }
     }
     public static void warriorsMinimapEnable(boolean on) {
         if (!loaded) return;

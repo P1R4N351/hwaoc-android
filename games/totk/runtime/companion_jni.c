@@ -58,6 +58,7 @@ extern int vk_overlay_set_mode(int mode) __attribute__((weak));
 extern int vk_minimap_read(uint8_t *rgba_out, int max_bytes, int32_t meta[5]) __attribute__((weak));
 extern int vk_minimap_cycle(void) __attribute__((weak));
 extern void vk_minimap_enable(int on) __attribute__((weak));
+extern void vk_minimap_stream_mode(int stream, int mode) __attribute__((weak));
 extern int vk_minimap_objective_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]) __attribute__((weak));
 extern int vk_minimap_lhud_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]) __attribute__((weak));
 extern int vk_minimap_ui_tex_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request) __attribute__((weak));
@@ -66,6 +67,7 @@ extern int vk_overlay_set_mode(int mode);
 extern int vk_minimap_read(uint8_t *rgba_out, int max_bytes, int32_t meta[5]);
 extern int vk_minimap_cycle(void);
 extern void vk_minimap_enable(int on);
+extern void vk_minimap_stream_mode(int stream, int mode);
 extern int vk_minimap_objective_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
 extern int vk_minimap_lhud_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4]);
 extern int vk_minimap_ui_tex_read(uint8_t *rgba_out, int max_bytes, int32_t meta[4], int request);
@@ -353,6 +355,10 @@ static jint JNICALL native_warriors_minimap_cycle(JNIEnv *env, jclass cls) {
     (void)env; (void)cls;
     return vk_minimap_cycle ? (jint)vk_minimap_cycle() : 0;
 }
+static void JNICALL native_warriors_stream_mode(JNIEnv *env, jclass cls, jint stream, jint mode) {
+    (void)env; (void)cls;
+    if (vk_minimap_stream_mode) vk_minimap_stream_mode((int)stream, (int)mode);
+}
 static void JNICALL native_warriors_minimap_enable(JNIEnv *env, jclass cls, jboolean on) {
     (void)env; (void)cls;
     if (vk_minimap_enable) vk_minimap_enable(on ? 1 : 0);
@@ -415,6 +421,7 @@ __attribute__((visibility("default"))) jint JNI_OnLoad(JavaVM *vm, void *reserve
         {"warriorsMinimapNative", "([B[I)I", (void *)native_warriors_minimap},
         {"warriorsMinimapCycleNative", "()I", (void *)native_warriors_minimap_cycle},
         {"warriorsMinimapEnableNative", "(Z)V", (void *)native_warriors_minimap_enable},
+        {"warriorsStreamModeNative", "(II)V", (void *)native_warriors_stream_mode},
         {"warriorsObjectiveNative", "([B[I)I", (void *)native_warriors_objective},
         {"warriorsLeftHudNative", "([B[I)I", (void *)native_warriors_lhud},
         {"warriorsUiTexNative", "([B[IZ)I", (void *)native_warriors_ui_tex},

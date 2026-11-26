@@ -289,6 +289,69 @@ static void test_backing_edge_and_unknown_ring(void) {
     g_vk_mm.ring_tex = 0ULL;
 }
 
+static void test_late_centre_plate_keeps_staging(void) {
+    float fb[64]; init_fb_ortho(fb);
+    vk_tex im = {55ULL, VK_FORMAT_R8G8B8A8_UNORM, 4ULL, 1920u, 1080u, 1u, 1u, 1u, VK_IMAGE_ASPECT_COLOR_BIT};
+    VkRenderingAttachmentInfo sp = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, 30ULL, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u};
+    vtx_idx_pos q_heart[6], q_plate[6], q_after[6];
+    make_quad(q_heart, 50.f, 25.f, 94.f, 69.f);
+    make_quad(q_plate, 859.f, 374.f, 1439.f, 587.f);
+    make_quad(q_after, 80.f, 25.f, 124.f, 69.f);
+    vk_minimap_enable(0); vk_minimap_enable(1);
+    g_f += 2u;
+    vk_minimap_pass_begin(1ULL, &im, 0u, 0u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
+        (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ULL, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 1);
+    vk_minimap_note_draw_wid(KTGL_WID_NONE);
+    sel_box(fb, q_heart, 6, 0u, 1u);
+    assert(g_vk_mm_tr.cls == 'l' && vk_minimap_on_hud_target());
+    sel_box(fb, q_plate, 6, 0u, 1u);                       /* the plate itself stays on the first screen */
+    assert(!vk_minimap_on_hud_target());
+    sel_box(fb, q_after, 6, 0u, 1u);                       /* and what follows it in the pass is refused */
+    assert(g_vk_mm_tr.cls == 'M' && !vk_minimap_on_hud_target());
+    g_vk_mm.saw_lhud_frame = 0;
+    vk_minimap_pass_end(1ULL, &im, 4ULL);
+    assert(g_vk_mm.saw_lhud_frame == 1);                   /* what was captured before the plate is still staged */
+    vk_minimap_present();
+}
+
+static void test_stream_modes(void) {
+    float fb[64]; init_fb_ortho(fb);
+    vk_tex im = {55ULL, VK_FORMAT_R8G8B8A8_UNORM, 4ULL, 1920u, 1080u, 1u, 1u, 1u, VK_IMAGE_ASPECT_COLOR_BIT};
+    VkRenderingAttachmentInfo sp = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, 30ULL, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u};
+    vtx_idx_pos q_combo[6], q_bar[18];
+    make_quad(q_combo, -60.f, 514.f, 396.f, 626.f);
+    make_quad(&q_bar[0], 1420.f, 468.f, 1920.f, 524.f);
+    make_quad(&q_bar[6], 1440.f, 472.f, 1920.f, 520.f);
+    make_quad(&q_bar[12], 1460.f, 476.f, 1920.f, 516.f);
+    vk_minimap_enable(0); vk_minimap_enable(1);
+    g_f += 2u;
+    vk_minimap_pass_begin(1ULL, &im, 0u, 0u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
+        (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ULL, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 1);
+    vk_minimap_note_draw_wid(KTGL_WID_COMBO);              /* default: the HUD column is captured */
+    sel_box(fb, q_combo, 6, 0u, 1u);
+    assert(vk_minimap_on_hud_target() && vk_minimap_skip_draw() == 0);
+    vk_minimap_stream_mode(2, 1);                          /* kept on the first screen: drawn there, not skipped */
+    sel_box(fb, q_combo, 6, 0u, 1u);
+    assert(!vk_minimap_on_hud_target() && vk_minimap_skip_draw() == 0);
+    vk_minimap_stream_mode(2, 2);                          /* hidden: drawn on neither */
+    sel_box(fb, q_combo, 6, 0u, 1u);
+    assert(!vk_minimap_on_hud_target() && vk_minimap_skip_draw() == 1);
+    vk_minimap_note_draw_wid(KTGL_WID_OBJECTIVE);          /* the objective bar is a separate module */
+    sel_box(fb, q_bar, 18, 0u, 1u);
+    assert(vk_minimap_on_hud_target() && vk_minimap_skip_draw() == 0);
+    vk_minimap_stream_mode(1, 1);
+    sel_box(fb, q_bar, 18, 0u, 1u);
+    assert(!vk_minimap_on_hud_target() && vk_minimap_skip_draw() == 0);
+    vk_minimap_stream_mode(3, 1); vk_minimap_stream_mode(0, 7);   /* out of range: no change */
+    vk_minimap_stream_mode(1, 0); vk_minimap_stream_mode(2, 0);
+    vk_minimap_note_draw_wid(KTGL_WID_COMBO);
+    sel_box(fb, q_combo, 6, 0u, 1u);
+    assert(vk_minimap_on_hud_target() && vk_minimap_skip_draw() == 0);
+    vk_minimap_note_draw_wid(KTGL_WID_NONE);
+    vk_minimap_pass_end(1ULL, &im, 4ULL);
+    vk_minimap_present();
+}
+
 static void test_wid_routing_and_stability(void) {
     float fb[64]; init_fb_ortho(fb);
     vk_tex im = {55ULL, VK_FORMAT_R8G8B8A8_UNORM, 4ULL, 1920u, 1080u, 1u, 1u, 1u, VK_IMAGE_ASPECT_COLOR_BIT};
@@ -477,12 +540,38 @@ static void test_travel_safely_subtitle_stays(void) {
     vk_minimap_present();
 }
 
+static void test_zero_area_minimap_and_present_reset(void) {
+    float fb[64]; init_fb_ortho(fb);
+    vk_tex im = {55ULL, VK_FORMAT_R8G8B8A8_UNORM, 4ULL, 1920u, 1080u, 1u, 1u, 1u, VK_IMAGE_ASPECT_COLOR_BIT};
+    VkRenderingAttachmentInfo sp = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, NULL, 30ULL, VK_IMAGE_LAYOUT_GENERAL, 0u, 0u};
+    vtx_idx_pos q_mm[6], q_zero[6];
+    make_quad(q_mm, 1540.f, 698.f, 1880.f, 1038.f);
+    make_quad(q_zero, 960.f, 540.f, 960.f, 540.f);
+    vk_minimap_enable(0); vk_minimap_enable(1);
+    g_f += 2u;
+    vk_minimap_pass_begin(1ULL, &im, 0u, 0u, 1920u, 1080u, VK_FORMAT_R8G8B8A8_UNORM,
+        (VkRect2D){{0, 0}, {1920u, 1080u}}, 10ULL, VK_IMAGE_LAYOUT_GENERAL, NULL, &sp, 1, 1);
+    vk_minimap_note_draw_wid(KTGL_WID_MINIMAP);
+    assert(sel_box(fb, q_mm, 6, 0u, 1u) == 1);
+    vk_mm_rect mm_r0 = g_vk_mm.hit_mm;
+    assert(sel_box(fb, q_zero, 6, 0u, 1u) == 0 && vk_minimap_skip_draw() == 1);
+    assert(g_vk_mm_tr.cls == 'm' && memcmp(&mm_r0, &g_vk_mm.hit_mm, sizeof mm_r0) == 0);
+    vk_minimap_note_draw_wid((uint8_t)(KTGL_WID_COMBO | KTGL_WID_FLAG_BG));
+    assert(g_vk_mm.cur_wid == KTGL_WID_COMBO && g_vk_mm.cur_wid_bg == 1u);
+    vk_minimap_pass_end(1ULL, &im, 4ULL);
+    vk_minimap_present();
+    assert(g_vk_mm.cur_wid == 0u && g_vk_mm.cur_wid_bg == 0u);
+}
+
 int main(void) {
     test_obj_and_subtitle();
     test_world_ring_known_by_texture();
     test_minimap_variant_without_stencil();
     test_backing_edge_and_unknown_ring();
     test_wid_routing_and_stability();
+    test_zero_area_minimap_and_present_reset();
+    test_stream_modes();
+    test_late_centre_plate_keeps_staging();
     test_left_world_marker_stays();
     test_travel_safely_subtitle_stays();
     {

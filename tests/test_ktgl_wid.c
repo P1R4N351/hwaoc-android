@@ -524,6 +524,67 @@ static void test_real_screenlayout_and_corpus_fixes(void) {
     assert(ktgl_classify_pane(&item_win, &g_tb) == KTGL_WID_ITEMS);
 }
 
+static void test_aoc_depth5_btn_guide_and_snap_hash(void) {
+    _Alignas(16) uint8_t sl[0x380] = {0};
+    uintptr_t vt = 0x20000ULL;
+    SynPane r_p, d1, d2, d3, d4, ally_p, leaf;
+    const void *rp = &r_p;
+    memcpy(sl, &vt, sizeof vt);
+    memcpy(sl + KTGL_SL_OFF_ROOT_PANE, &rp, sizeof rp);
+    syn_init(&r_p, "NULL_root", NULL, sl);
+    syn_init(&d1, "NULL_l1", &r_p, sl);
+    syn_init(&d2, "NULL_l2", &d1, sl);
+    syn_init(&d3, "NULL_l3", &d2, sl);
+    syn_init(&d4, "NULL_l4", &d3, sl);
+    syn_init(&ally_p, "btl_plt_player_2p", &d4, sl);
+    syn_init(&leaf, "PIC_00", &r_p, sl);
+    syn_add_child(&r_p, &d1); syn_add_child(&d1, &d2); syn_add_child(&d2, &d3);
+    syn_add_child(&d3, &d4); syn_add_child(&d4, &ally_p); syn_add_child(&r_p, &leaf);
+    assert(ktgl_classify_pane(&leaf, &g_tb) == KTGL_WID_ALLIES);
+
+    static const char *const bg_toks[] = {
+        "tb_text_operation_00", "TEXT24_keyguide_flare_0", "btl_parts_action_arrow_l",
+        "btl_parts_action_x2", "icon_keyguide_longpress", "icon_keyguide_mash",
+    };
+    for (size_t i = 0; i < sizeof bg_toks / sizeof bg_toks[0]; i++) {
+        SynPane p; syn_init(&p, bg_toks[i], NULL, NULL);
+        assert(ktgl_classify_pane(&p, &g_tb) == KTGL_WID_BTN_GUIDE);
+    }
+    SynPane sp_sc, mr, c1, c2, cm;
+    syn_init(&sp_sc, "still_speech_scale", NULL, NULL);
+    assert(ktgl_classify_pane(&sp_sc, &g_tb) == KTGL_WID_NONE);
+    _Alignas(16) uint8_t msl[0x380] = {0}, sub_sl[0x380] = {0};
+    const void *mrp = &mr;
+    memcpy(msl, &vt, sizeof vt); memcpy(msl + KTGL_SL_OFF_ROOT_PANE, &mrp, sizeof mrp);
+    memcpy(sub_sl, &vt, sizeof vt); memcpy(sub_sl + KTGL_SL_OFF_ROOT_PANE, &mrp, sizeof mrp);
+    syn_init(&mr, "NULL_root", NULL, msl);
+    syn_init(&c1, "player_info", &mr, msl);
+    syn_init(&cm, "pause_menu", &mr, msl);
+    syn_add_child(&mr, &c1); syn_add_child(&mr, &cm);
+    assert(ktgl_is_master_hud(sub_sl, &g_tb) == 0 && ktgl_root_sl_has_menu(sub_sl, &g_tb) == 1);
+    syn_init(&c2, "MINIMAP", &mr, msl);
+    syn_add_child(&mr, &c2);
+    assert(ktgl_is_master_hud(msl, &g_tb) == 1 && ktgl_root_sl_has_menu(msl, &g_tb) == 0);
+
+    KtglSnapMap *sm = calloc(1u, sizeof *sm);
+    assert(sm != NULL);
+    uintptr_t stride = (uintptr_t)KTGL_SNAP_SETS * 16u;
+    uint32_t sets[16];
+    for (size_t i = 0; i < 16u; i++) {
+        const void *k = (const void *)(0x100000ULL + i * stride);
+        sets[i] = ktgl_snap_set_idx((uint64_t)(uintptr_t)k);
+        ktgl_snap_put(sm, k, (uint8_t)((i % 14u) + 1u));
+    }
+    int diff = 0;
+    for (size_t i = 1; i < 16u; i++) if (sets[i] != sets[0]) diff++;
+    assert(diff >= 8);
+    for (size_t i = 0; i < 16u; i++) {
+        const void *k = (const void *)(0x100000ULL + i * stride);
+        assert(ktgl_snap_get(sm, k) == (int)((i % 14u) + 1u));
+    }
+    free(sm);
+}
+
 int main(void) {
     test_prot_none_guard();
     test_all_widget_classes();
@@ -536,6 +597,7 @@ int main(void) {
     test_aoc_snapshot_map_and_cur_pane_priority();
     test_aoc_parallel_worker_submit();
     test_real_screenlayout_and_corpus_fixes();
+    test_aoc_depth5_btn_guide_and_snap_hash();
     printf("ktgl_wid_classify: PASS\n");
     return 0;
 }

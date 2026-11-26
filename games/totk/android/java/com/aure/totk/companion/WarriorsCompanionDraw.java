@@ -400,15 +400,18 @@ public final class WarriorsCompanionDraw {
         drawSettingRow(c, 4, "Minimap Layer", m.rtCandLabel(), m.minimapCandCount > 0, m);
         drawSettingRow(c, 5, "Rescan Assets", "", false, m);
         drawSettingRow(c, 6, "Clear Assets", "", false, m);
+        drawSettingRow(c, 7, "Minimap", m.streamModeLabel(WarriorsCompanionModel.STREAM_MINIMAP), m.onSecond(WarriorsCompanionModel.STREAM_MINIMAP), m);
+        drawSettingRow(c, 8, "Objective", m.streamModeLabel(WarriorsCompanionModel.STREAM_OBJECTIVE), m.onSecond(WarriorsCompanionModel.STREAM_OBJECTIVE), m);
+        drawSettingRow(c, 9, "HUD Column", m.streamModeLabel(WarriorsCompanionModel.STREAM_HUD), m.onSecond(WarriorsCompanionModel.STREAM_HUD), m);
     }
 
     private void drawSettingRow(
         Canvas c, int row, String label, String val, boolean active, WarriorsCompanionModel m) {
         float ry = WarriorsCompanionLayout.rowTop(row);
-        drawDiamond(c, WarriorsCompanionLayout.ROW_DIAMOND_X, ry + 48f, 7f, active ? m.primaryColor() : 0xFF475C58);
-        drawText(c, label, WarriorsCompanionLayout.ROW_LABEL_X, ry + 55f, 20f, 0xFFE9E5D5, true, Paint.Align.LEFT);
+        drawDiamond(c, WarriorsCompanionLayout.ROW_DIAMOND_X, ry + WarriorsCompanionLayout.ROW_MID, 7f, active ? m.primaryColor() : 0xFF475C58);
+        drawText(c, label, WarriorsCompanionLayout.ROW_LABEL_X, ry + WarriorsCompanionLayout.ROW_BASELINE, 20f, 0xFFE9E5D5, true, Paint.Align.LEFT);
         if (val != null && !val.isEmpty()) {
-            drawText(c, val, WarriorsCompanionLayout.ROW_X1, ry + 55f, 18f,
+            drawText(c, val, WarriorsCompanionLayout.ROW_X1, ry + WarriorsCompanionLayout.ROW_BASELINE, 18f,
                     active ? m.primaryColor() : m.secondaryColor(), true, Paint.Align.RIGHT);
         }
         p.setStyle(Paint.Style.STROKE);
