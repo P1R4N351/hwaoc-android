@@ -595,9 +595,9 @@ static void pd_draw(int prim, uint32_t count, uint32_t inst, int indexed, vk_sha
         ns += snprintf(sb + ns, sizeof sb - (size_t)ns, " %ct%d=%#llx", st ? 'f' : 'v', b->reg, (unsigned long long)h);
         if (ok && (size_t)ns < sizeof sb) ns += snprintf(sb + ns, sizeof sb - (size_t)ns, "(fmt %#x %ux%ux%u target %d @%p)", r.t.d.format, r.t.d.width, r.t.d.height, r.t.d.depth, r.t.d.target, (const void *)r.t.mem);
     }
-    int n = snprintf(line, sizeof line, "  draw prim %d count %u inst %u%s%.0d cull %d front %d depth test %d write %d func %d clamp %d fs depth %d blend %#x vp %.0f,%.0f %.0fx%.0f vs %s fs %s%s\n",
+    int n = snprintf(line, sizeof line, "  draw prim %d count %u inst %u%s%.0d cull %d front %d depth test %d write %d func %d clamp %d fs depth %d blend %#x vp %.0f,%.0f %.0fx%.0f dr %g,%g vs %s fs %s%s\n",
                      prim, count, inst, indexed ? " idx-bytes " : "", indexed == 1 ? 1 : indexed == 2 ? 2 : indexed ? 4 : 0, (int)S.poly.cull, (int)S.poly.front, S.ds.dt, S.ds.dw, (int)S.ds.df, S.depth_clamp, sh[1] ? sh[1]->writes_depth : 0,
-                     (unsigned)S.color.blend_en, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], sh[0]->key, sh[1] ? sh[1]->key : "-", sb);
+                     (unsigned)S.color.blend_en, S.vp[0][0], S.vp[0][1], S.vp[0][2], S.vp[0][3], (double)S.dr[0], (double)S.dr[1], sh[0]->key, sh[1] ? sh[1]->key : "-", sb);
     pd_note(line, n < (int)sizeof line ? n : (int)sizeof line - 1);
     if (g_pd_cap) {   /* TOTK_VK_PASS_DUMP_VSTEX's draw: its vertex-stage textures (every layer of level 0) and its bound uniform ranges */
         g_pd_cap = 0; g_pd_vstex_done = 1; vk_end_rendering_at(VK_PASS_END_DIAGNOSTIC, 2); VkCommandBuffer cb = vk_cb();
