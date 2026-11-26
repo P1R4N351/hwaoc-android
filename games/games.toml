@@ -233,8 +233,8 @@ release_asset = "BotW-Native-"
 [flavour.hwaoc.release]
 package = "io.github.p1r4n351.hwaoc"
 label = "AoC Native"
-version_name = "0.1.0-beta.1"
-version_code = 101
+version_name = "0.1.0-beta.2"
+version_code = 102
 key = "hwaoc-release.pem"
 debuggable = false
 repository = "https://github.com/P1R4N351/hwaoc-android"

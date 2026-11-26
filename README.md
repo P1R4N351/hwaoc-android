@@ -11,7 +11,7 @@ layer. It is built on [TotK Native](https://github.com/AurelioB/totk-android), t
 and shares its Horizon runtime, graphics layer and controller menu. The app contains **no game files**: you supply your
 own dump of the game.
 
-**Beta, developer route only.** The release flavour is `0.1.0-beta.1`. The app's own setup cannot import this game yet
+**Beta, developer route only.** The release flavour is `0.1.0-beta.2` (`versionCode` `102`). The app's own setup cannot import this game yet
 (`ondevice_setup = false`): the game folder is prepared on a computer and staged by hand.
 
 - [Status](#status)
@@ -29,11 +29,11 @@ own dump of the game.
 Milestones M0–M7 are verified on `1.3.0` (`v327680`), as recorded in [games/hwaoc/README.md](games/hwaoc/README.md):
 
 - All three code modules (`subsdk0`, `sdk`, `main`) pass `patch_nso.py`, `structck.py` and `equiv.py`.
-- Vulkan graphics are verified through VP9 cutscenes and 3D battle rendering, with `0` unimplemented NVN symbols.
+- Vulkan graphics are verified through VP9 cutscenes and 3D battle rendering, with `0` unimplemented NVN symbols, buffer-texture slot retyping (`sampler2D` -> `UNIFORM_TEXEL_BUFFER` + `R32_UINT`/`R32_SINT` float view), one-slice 3D texture aliasing for CPU-backed 2D textures, and `NEAR_IS_ZERO` depth-range correction on seed shaders.
 - `53` shader rows are harvested into [games/hwaoc/assets/shader_list.tsv](games/hwaoc/assets/shader_list.tsv), with
   `0` warm misses on the covered scenes.
 - Save management for the game's flat `svdt` save is wired (`SaveManager.FLAT_SAVE`).
-- The `AoC Native` APK flavours (`0.1.0-beta.1` release, `0.1.0-dev` debuggable) build with `tools/build_app.sh`, with procedural Calamity star-gear main-menu emblem (`b5bb6f3`), AYN handheld Controller style detection (`6e6a5c1`, staged upstream on `P1R4N351/totk-android:ayn-controller-style`), and Vulkan fast-path optimizations (Opts 45–60).
+- The `AoC Native` APK flavours (`0.1.0-beta.2` release, `0.1.0-dev` debuggable) build with `tools/build_app.sh`, with procedural Calamity star-gear main-menu emblem (`b5bb6f3`), AYN handheld Controller style detection (`6e6a5c1`, staged upstream on `P1R4N351/totk-android:ayn-controller-style`), and Vulkan fast-path optimizations (Opts 45–60).
 - **Milestone M7 (Second Screen):** on a dual-screen handheld the game's own HUD is drawn on the second screen and
   removed from the first; see [Second screen](#second-screen). The code is shared with
   [AoI Native](https://github.com/P1R4N351/hwaoi-android).
@@ -70,7 +70,7 @@ save manager exports, imports and backs it up through `SaveManager.FLAT_SAVE`.
 
 ## Second screen
 
-Status 2026-11-25. On a dual-screen handheld such as the AYN Thor (Display 4, `1240x1080`) the game's own HUD is drawn
+Status 2026-11-26. On a dual-screen handheld such as the AYN Thor (Display 4, `1240x1080`) the game's own HUD is drawn
 on the second screen and removed from the first. The Vulkan layer redirects the HUD's draws as they are recorded into
 an offscreen image ([games/totk/android/gfx/vk_minimap.h](games/totk/android/gfx/vk_minimap.h)); the companion
 (`WarriorsCompanion*.java`, MIT, shared with [AoI Native](https://github.com/P1R4N351/hwaoi-android)) reads it back and
@@ -80,8 +80,8 @@ screen.
 - **Moved to the second screen:** the minimap as one module, the objective bar, hearts, gauges, d-pad and item icons,
   ally pills, combo row, button guide and KO counter.
 - **Kept on the first screen:** dialogue and speech pop-ups, markers and text drawn over the 3D world, and every menu.
-- **Two tabs:** the live HUD, and a status page with frame-rate telemetry and settings (corner HUD, stick lights and
-  their brightness, cutscene dimming, minimap layer, asset rescan and clear). Cutscene dimming, the AMOLED pixel orbit
+- **Two tabs:** the live HUD (`PAD`) and status/settings (`STATUS` with frame-rate telemetry and settings: corner HUD, stick lights and
+  their brightness, cutscene dimming, minimap layer, asset rescan and clear). The darkened cutscene veil now shows during cutscenes, all menus, and empty states while keeping both header tabs visible and tappable through the overlay (switching to `STATUS` lifts the veil). Cutscene dimming, the AMOLED pixel orbit
   and Bifrost stick LEDs remain. The radar trail, waypoint pins, Sheikah Rune / Rod / party chords and the combo
   sequencer of earlier builds are no longer part of the companion.
 - **How a draw is attributed:** per-widget tagging from the game's UI tree

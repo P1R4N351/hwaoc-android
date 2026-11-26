@@ -50,7 +50,7 @@ Flavours (`build_release.py --game <game> --flavour <flavour>`):
 | `totk` | `dev` | `io.github.p1r4n351.totk.dev` | TotK Native (dev) | `1.0.1-dev` | clock | `totk-dev.pem` | P1R4N351/totk-android | `v<version>`, `TotK-Native-<version>.apk` |
 | `botw` | `release` | `io.github.p1r4n351.botw` | BotW Native | `0.2.0-pre.1` | 200 | `botw-release.pem` | P1R4N351/botw-android | `botw-v<version>`, `BotW-Native-<version>.apk` |
 | `botw` | `dev` | `io.github.p1r4n351.botw` | BotW Native | `0.2.0-dev` | clock | `botw-dev.pem` | P1R4N351/botw-android | `botw-v<version>`, `BotW-Native-<version>.apk` |
-| `hwaoc` | `release` | `io.github.p1r4n351.hwaoc` | AoC Native | `0.1.0-beta.1` | 101 | `hwaoc-release.pem` | P1R4N351/hwaoc-android | `hwaoc-v<version>`, `AoC-Native-<version>.apk` |
+| `hwaoc` | `release` | `io.github.p1r4n351.hwaoc` | AoC Native | `0.1.0-beta.2` | 102 | `hwaoc-release.pem` | P1R4N351/hwaoc-android | `hwaoc-v<version>`, `AoC-Native-<version>.apk` |
 | `hwaoc` | `dev` | `io.github.p1r4n351.hwaoc.dev` | AoC Native (dev) | `0.1.0-dev` | clock | `hwaoc-dev.pem` | P1R4N351/hwaoc-android | `hwaoc-v<version>`, `AoC-Native-<version>.apk` |
 
 Code that branches on the game itself is listed under `[branches]` in `games/games.toml`: today the C runtime and
